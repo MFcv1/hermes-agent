@@ -335,9 +335,10 @@ def cmd_setup(args: argparse.Namespace) -> int:
     # and surface a clear error rather than silently substituting the
     # default.
     if args.tunnel_port is not None:
-        if args.tunnel_port == 0:
+        if args.tunnel_port < 1 or args.tunnel_port > 65534:
             console.print(
-                "  [red]✗ --tunnel-port=0 is not a valid TCP port.[/red]"
+                "  [red]✗ --tunnel-port must be between 1 and 65534 "
+                "(the plain-HTTP listener uses port+1).[/red]"
             )
             return 1
         tunnel_port = int(args.tunnel_port)
@@ -420,6 +421,15 @@ def cmd_setup(args: argparse.Namespace) -> int:
         proxy_cfg["credential_source"] = "env"
     proxy_cfg.setdefault("fail_on_uncovered_providers", False)
     save_config(cfg)
+
+    live_status = ip.get_status()
+    if live_status.pid is not None:
+        ip.stop_proxy()
+        console.print(
+            "  [yellow]⚠ stopped the running iron-proxy; config or tokens changed, "
+            "so restart it with `hermes egress start` before launching new "
+            "Docker sandboxes.[/yellow]"
+        )
 
     console.print()
     console.print(
@@ -551,6 +561,7 @@ def cmd_start(args: argparse.Namespace) -> int:
 
     try:
         status = ip.start_proxy(
+            install_if_missing=bool(proxy_cfg.get("auto_install", True)),
             refresh_secrets_from_bitwarden=refresh_bw,
             bitwarden_config=bw_cfg,
         )
@@ -580,6 +591,55 @@ def cmd_stop(args: argparse.Namespace) -> int:
     else:
         console.print("[dim]iron-proxy was not running[/dim]")
     return 0
+
+
+def format_status_text(*, show_tokens: bool = False) -> str:
+    """Plain-text egress status for slash commands, Dashboard, and Desktop."""
+    cfg = load_config()
+    proxy_cfg = cfg.get("proxy") or {}
+    status = ip.get_status()
+
+    def yn(value: bool) -> str:
+        return "yes" if value else "no"
+
+    lines = [
+        "Egress proxy status",
+        "",
+        f"Enabled: {yn(bool(proxy_cfg.get('enabled')))}",
+        f"Binary: {status.binary_path or '(missing)'}",
+        f"Binary version: {status.binary_version or '(unknown)'}",
+        f"Config: {status.config_path or '(not generated)'}",
+        f"CA cert: {status.ca_cert_path or '(not generated)'}",
+        f"Tunnel port: {status.tunnel_port}",
+        f"Process: pid {status.pid}" if status.pid else "Process: (stopped)",
+        f"Listening: {yn(status.listening)}",
+        f"Credential src: {proxy_cfg.get('credential_source', 'env')}",
+        f"Docker enforce: {yn(bool(proxy_cfg.get('enforce_on_docker', True)))}",
+        "Scope: Docker backend only in this release",
+    ]
+
+    mappings = ip.load_mappings()
+    if mappings:
+        lines.extend(["", "Token mappings:"])
+        for m in mappings:
+            tok = m.proxy_token if show_tokens else _redact_token(m.proxy_token)
+            lines.append(f"  - {m.real_env_name}: {tok} ({', '.join(m.upstream_hosts)})")
+
+    uncovered = ip.discover_uncovered_providers()
+    if uncovered:
+        lines.extend([
+            "",
+            "Uncovered providers (real credentials still visible inside the sandbox):",
+        ])
+        for name in uncovered:
+            lines.append(f"  - {name}")
+
+    if bool(proxy_cfg.get("enabled")) and not status.configured:
+        lines.extend(["", "Next: run `hermes egress setup` to mint tokens and write proxy.yaml."])
+    elif bool(proxy_cfg.get("enabled")) and not (status.pid and status.listening):
+        lines.extend(["", "Next: run `hermes egress start` before launching Docker sandboxes."])
+
+    return "\n".join(lines)
 
 
 def cmd_status(args: argparse.Namespace) -> int:

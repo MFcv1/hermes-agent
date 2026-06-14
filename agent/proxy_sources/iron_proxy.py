@@ -1410,6 +1410,7 @@ def start_proxy(
     binary: Optional[Path] = None,
     config_path: Optional[Path] = None,
     extra_env: Optional[Dict[str, str]] = None,
+    install_if_missing: bool = True,
     refresh_secrets_from_bitwarden: bool = False,
     bitwarden_config: Optional[Dict] = None,
 ) -> ProxyStatus:
@@ -1432,7 +1433,7 @@ def start_proxy(
     if existing and _pid_alive(existing):
         return get_status()
 
-    bin_path = binary or find_iron_proxy(install_if_missing=True)
+    bin_path = binary or find_iron_proxy(install_if_missing=install_if_missing)
     if bin_path is None:
         raise RuntimeError(
             "iron-proxy binary not available — run `hermes egress install`."

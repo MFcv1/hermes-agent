@@ -5,6 +5,7 @@ configurable resource limits (CPU, memory, disk), and optional filesystem
 persistence via bind mounts.
 """
 
+import hashlib
 import json
 import logging
 import os
@@ -33,6 +34,7 @@ _DOCKER_SEARCH_PATHS = [
 
 _docker_executable: Optional[str] = None  # resolved once, cached
 _ENV_VAR_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_EGRESS_LABEL_KEY = "hermes-egress"
 
 
 def _normalize_forward_env_names(forward_env: list[str] | None) -> list[str]:
@@ -493,10 +495,11 @@ def _egress_proxy_args_for_docker() -> tuple[list[str], dict[str, str], list[str
         "_HERMES_EGRESS_NODE_OPTIONS_APPEND": "--use-openssl-ca",
     }
 
-    # Surface the per-provider proxy tokens.  The sandbox can swap these into
-    # its provider config (or its env, if it reads the standard names) and the
-    # proxy translates them to the real secrets on egress.
+    # Surface the per-provider proxy tokens under the standard provider env
+    # names so existing SDKs and provider clients work unchanged inside the
+    # sandbox.  Keep the HERMES_PROXY_TOKEN_* aliases for diagnostics.
     for m in mappings:
+        env_overrides[m.real_env_name] = m.proxy_token
         env_overrides[f"HERMES_PROXY_TOKEN_{m.real_env_name}"] = m.proxy_token
 
     # On Linux, host.docker.internal isn't populated by default — Docker Desktop
@@ -505,6 +508,86 @@ def _egress_proxy_args_for_docker() -> tuple[list[str], dict[str, str], list[str
     host_args: list[str] = ["--add-host", "host.docker.internal:host-gateway"]
 
     return (volume_args, env_overrides, host_args)
+
+
+def _egress_reuse_fingerprint(
+    volume_args: list[str],
+    env_overrides: dict[str, str],
+    host_args: list[str],
+) -> str:
+    """Stable Docker-label value for the egress posture of a container."""
+    if not (volume_args or env_overrides or host_args):
+        return "off"
+    payload = json.dumps(
+        {
+            "volume_args": volume_args,
+            "env_overrides": env_overrides,
+            "host_args": host_args,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:24]
+
+
+def _egress_enforce_on_docker(default: bool = True) -> bool:
+    """Read proxy.enforce_on_docker with fail-safe defaulting."""
+    try:
+        from hermes_cli.config import load_config as _load_cfg
+
+        return bool((_load_cfg().get("proxy") or {}).get("enforce_on_docker", default))
+    except (ImportError, OSError):
+        return default
+    except Exception:
+        return default
+
+
+def _critical_egress_env_names(env_overrides: dict[str, str]) -> set[str]:
+    """Env names that would weaken or bypass enforced egress if overridden."""
+    critical = {
+        "HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy",
+        "NO_PROXY", "no_proxy",
+        "REQUESTS_CA_BUNDLE", "SSL_CERT_FILE", "CURL_CA_BUNDLE",
+        "NODE_EXTRA_CA_CERTS", "NODE_OPTIONS",
+    }
+    critical.update(
+        key for key in env_overrides
+        if key.endswith("_API_KEY") or key.endswith("_TOKEN")
+    )
+    return critical
+
+
+def _extra_args_egress_collisions(
+    extra_args: list[str], critical_names: set[str],
+) -> list[str]:
+    """Return docker_extra_args entries that can override egress controls."""
+    collisions: list[str] = []
+    env_flags = {"-e", "--env", "--env-file"}
+    network_flags = {"--network", "--net"}
+    i = 0
+    while i < len(extra_args):
+        arg = extra_args[i]
+        nxt = extra_args[i + 1] if i + 1 < len(extra_args) else ""
+        if arg in env_flags:
+            if arg == "--env-file":
+                collisions.append(arg)
+            else:
+                name = nxt.split("=", 1)[0]
+                if name in critical_names:
+                    collisions.append(name)
+            i += 2
+            continue
+        if any(arg.startswith(f"{flag}=") for flag in env_flags):
+            if arg.startswith("--env-file="):
+                collisions.append("--env-file")
+            else:
+                name = arg.split("=", 1)[1].split("=", 1)[0]
+                if name in critical_names:
+                    collisions.append(name)
+        elif arg in network_flags or any(arg.startswith(f"{flag}=") for flag in network_flags):
+            collisions.append(arg)
+        i += 1
+    return sorted(set(collisions))
 
 
 def _build_security_args(run_as_host_user: bool, run_exec: bool = False) -> list[str]:
@@ -878,6 +961,30 @@ class DockerEnvironment(BaseEnvironment):
         egress_volume_args, egress_env_overrides, egress_host_args = (
             _egress_proxy_args_for_docker()
         )
+        egress_label = _egress_reuse_fingerprint(
+            egress_volume_args, egress_env_overrides, egress_host_args,
+        )
+        _enforce_egress = _egress_enforce_on_docker()
+        _critical_egress_names = _critical_egress_env_names(egress_env_overrides)
+        if egress_env_overrides:
+            _forward_collisions = sorted(
+                key for key in self._forward_env if key in _critical_egress_names
+            )
+            if _forward_collisions:
+                _msg = (
+                    f"docker_forward_env would inject real egress-protected "
+                    f"variables {_forward_collisions}; enforce_on_docker is "
+                    f"{'enabled' if _enforce_egress else 'disabled'}."
+                )
+                if _enforce_egress:
+                    raise RuntimeError(
+                        f"{_msg}  Remove these names from docker_forward_env "
+                        "or disable enforce_on_docker to opt out of egress isolation."
+                    )
+                logger.warning(
+                    "%s  Explicit docker_forward_env values will override egress tokens.",
+                    _msg,
+                )
         volume_args.extend(egress_volume_args)
         # egress env overrides are merged in further below alongside the
         # other env_args computation.
@@ -1071,6 +1178,24 @@ class DockerEnvironment(BaseEnvironment):
                 logger.warning("Ignoring non-string docker_extra_args entry: %r", arg)
                 continue
             validated_extra.append(arg)
+        if egress_env_overrides:
+            _extra_collisions = _extra_args_egress_collisions(
+                validated_extra, _critical_egress_names,
+            )
+            if _extra_collisions:
+                _msg = (
+                    f"docker_extra_args would override egress-proxy controls "
+                    f"{_extra_collisions}; enforce_on_docker is "
+                    f"{'enabled' if _enforce_egress else 'disabled'}."
+                )
+                if _enforce_egress:
+                    raise RuntimeError(
+                        f"{_msg}  Remove these args or disable enforce_on_docker "
+                        "to opt out of egress isolation."
+                    )
+                logger.warning(
+                    "%s  Extra Docker args may bypass egress isolation.", _msg,
+                )
 
         all_run_args = (
             security_args
@@ -1099,6 +1224,7 @@ class DockerEnvironment(BaseEnvironment):
             "--label", "hermes-agent=1",
             "--label", f"hermes-task-id={task_label}",
             "--label", f"hermes-profile={profile_name}",
+            "--label", f"{_EGRESS_LABEL_KEY}={egress_label}",
         ]
         # Save args for container recreation on "No such container" recovery.
         self._image = image
@@ -1110,6 +1236,7 @@ class DockerEnvironment(BaseEnvironment):
             "hermes-agent": "1",
             "hermes-task-id": task_label,
             "hermes-profile": profile_name,
+            _EGRESS_LABEL_KEY: egress_label,
         }
 
         # Cross-process container reuse (issue #20561 — docs claim "ONE long-lived
@@ -1119,14 +1246,15 @@ class DockerEnvironment(BaseEnvironment):
         # restores the documented contract; opt out via
         # ``terminal.docker_persist_across_processes: false``.
         #
-        # Reuse matches on labels only — we deliberately do NOT compare image
-        # / mounts / resources.  Operators who need a fresh container after
-        # changing those settings should set ``docker_persist_across_processes:
-        # false`` (or run ``docker rm -f`` against the labeled container) to
-        # force a clean start.
+        # Reuse matches on labels only.  The egress posture gets its own label
+        # because env vars, CA mounts, and host mappings are immutable after
+        # container creation — reusing a pre-egress or pre-rotation container
+        # would silently bypass the credential firewall.
         reused = False
         if persist_across_processes:
-            existing = self._find_reusable_container(task_label, profile_name)
+            existing = self._find_reusable_container(
+                task_label, profile_name, egress_label,
+            )
             if existing is not None:
                 container_id, state = existing
                 self._container_id = container_id
@@ -1294,7 +1422,9 @@ class DockerEnvironment(BaseEnvironment):
         # 1. Try label-based reuse (another process may have recreated it).
         task_label = self._labels.get("hermes-task-id", "")
         profile_label = self._labels.get("hermes-profile", "")
-        existing = self._find_reusable_container(task_label, profile_label)
+        existing = self._find_reusable_container(
+            task_label, profile_label, self._labels.get(_EGRESS_LABEL_KEY, "off"),
+        )
         if existing is not None:
             cid, state = existing
             if state == "running":
@@ -1419,7 +1549,12 @@ class DockerEnvironment(BaseEnvironment):
         logger.debug("Docker --storage-opt support: %s", _storage_opt_ok)
         return _storage_opt_ok
 
-    def _find_reusable_container(self, task_label: str, profile_label: str) -> Optional[tuple[str, str]]:
+    def _find_reusable_container(
+        self,
+        task_label: str,
+        profile_label: str,
+        egress_label: str,
+    ) -> Optional[tuple[str, str]]:
         """Look for an existing container labeled for this (task, profile).
 
         Returns ``(container_id, state)`` on hit, ``None`` on miss / on any
@@ -1433,12 +1568,17 @@ class DockerEnvironment(BaseEnvironment):
         started by some other tool.
         """
         try:
+            filters = [
+                "--filter", "label=hermes-agent=1",
+                "--filter", f"label=hermes-task-id={task_label}",
+                "--filter", f"label=hermes-profile={profile_label}",
+            ]
+            if egress_label != "off":
+                filters.extend(["--filter", f"label={_EGRESS_LABEL_KEY}={egress_label}"])
             result = subprocess.run(
                 [
                     self._docker_exe, "ps", "-a",
-                    "--filter", "label=hermes-agent=1",
-                    "--filter", f"label=hermes-task-id={task_label}",
-                    "--filter", f"label=hermes-profile={profile_label}",
+                    *filters,
                     "--format", "{{.ID}}\t{{.State}}",
                 ],
                 capture_output=True,

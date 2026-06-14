@@ -177,6 +177,24 @@ def test_cmd_setup_rejects_tunnel_port_zero(hermes_home, monkeypatch):
     assert rc == 1
 
 
+@pytest.mark.parametrize("bad_port", [-1, 65535, 65536])
+def test_cmd_setup_rejects_invalid_tunnel_port_range(hermes_home, monkeypatch, bad_port):
+    """The egress wizard owns the derived HTTP listener at tunnel_port+1,
+    so both listener ports must fit in the TCP range."""
+
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-test")
+    monkeypatch.setattr(ip, "find_iron_proxy", lambda **kw: hermes_home / "iron-proxy")
+    monkeypatch.setattr(ip, "iron_proxy_version", lambda b: "test")
+    monkeypatch.setattr(
+        ip,
+        "ensure_ca_cert",
+        lambda **kw: (hermes_home / "ca.crt", hermes_home / "ca.key"),
+    )
+
+    rc = proxy_cli.cmd_setup(_args(tunnel_port=bad_port))
+    assert rc == 1
+
+
 # ---------------------------------------------------------------------------
 # cmd_start — fail_on_uncovered_providers + Bitwarden rotation wire-up
 # ---------------------------------------------------------------------------
@@ -205,6 +223,30 @@ def test_cmd_start_refuses_on_uncovered_provider_when_strict(hermes_home, monkey
 
     rc = proxy_cli.cmd_start(_args())
     assert rc == 1
+
+
+def test_cmd_start_honors_auto_install_false(hermes_home, monkeypatch):
+    from hermes_cli.config import load_config, save_config
+
+    cfg = load_config()
+    cfg.setdefault("proxy", {})["enabled"] = True
+    cfg["proxy"]["auto_install"] = False
+    save_config(cfg)
+
+    captured: dict = {}
+
+    def fake_start_proxy(**kw):
+        captured.update(kw)
+        s = ip.ProxyStatus(pid=4242, listening=True, tunnel_port=9090)
+        return s
+
+    monkeypatch.setattr(ip, "start_proxy", fake_start_proxy)
+    monkeypatch.setattr(ip, "discover_uncovered_providers", lambda **kw: [])
+    monkeypatch.setattr(ip, "discover_blocked_providers", lambda **kw: [])
+
+    rc = proxy_cli.cmd_start(_args())
+    assert rc == 0
+    assert captured.get("install_if_missing") is False
 
 
 def test_cmd_start_passes_bitwarden_refresh_flag_when_credential_source_is_bitwarden(

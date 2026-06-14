@@ -622,13 +622,13 @@ hermes egress setup --no-bitwarden         # bitwarden → env
 
 # Rotating all tokens (e.g. after a suspected token leak)
 hermes egress setup --rotate-tokens
-hermes egress stop && hermes egress start  # restart daemon to pick up new mappings
+hermes egress start                    # setup stops a stale daemon; start it again
 # (running sandboxes still hold old tokens; restart them too)
 
 # Adding a new upstream
 # Edit ~/.hermes/config.yaml proxy.extra_allowed_hosts: [api.example.com]
 hermes egress setup
-hermes egress stop && hermes egress start
+hermes egress start
 ```
 
 ### Diagnostic shortcuts

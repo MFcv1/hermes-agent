@@ -39,11 +39,13 @@ def _make_dummy_env(**kwargs):
         persistent_filesystem=kwargs.get("persistent_filesystem", False),
         task_id=kwargs.get("task_id", "test-task"),
         volumes=kwargs.get("volumes", []),
+        forward_env=kwargs.get("forward_env"),
         network=kwargs.get("network", True),
         host_cwd=kwargs.get("host_cwd"),
         auto_mount_cwd=kwargs.get("auto_mount_cwd", False),
         env=kwargs.get("env"),
         run_as_host_user=kwargs.get("run_as_host_user", False),
+        extra_args=kwargs.get("extra_args", []),
         persist_across_processes=kwargs.get("persist_across_processes", True),
     )
 
@@ -673,6 +675,7 @@ def test_labels_attribute_populated_after_init(monkeypatch):
         "hermes-agent": "1",
         "hermes-task-id": "abc",
         "hermes-profile": "default",
+        "hermes-egress": "off",
     }
 
 
@@ -746,6 +749,95 @@ def test_reuse_attaches_to_running_container_without_docker_run(monkeypatch):
     assert not start_invocations, (
         f"docker start should be skipped when container already running, got: {start_invocations}"
     )
+
+
+def test_egress_enabled_does_not_reuse_pre_egress_container(monkeypatch):
+    """A container created before egress was enabled lacks the proxy env vars
+    and CA mount.  Reusing it would silently bypass the credential firewall."""
+
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    monkeypatch.setattr(docker_env, "_get_active_profile_name", lambda: "default")
+    monkeypatch.setattr(
+        docker_env,
+        "_egress_proxy_args_for_docker",
+        lambda: (
+            ["-v", "/tmp/ca:/etc/ssl/certs/hermes-egress-ca.crt:ro"],
+            {"HTTPS_PROXY": "http://host.docker.internal:9090"},
+            ["--add-host", "host.docker.internal:host-gateway"],
+        ),
+    )
+    calls = []
+
+    def _run(cmd, **kwargs):
+        calls.append((list(cmd) if isinstance(cmd, list) else cmd, kwargs))
+        if isinstance(cmd, list) and len(cmd) >= 2:
+            sub = cmd[1]
+            if sub == "version":
+                return subprocess.CompletedProcess(cmd, 0, stdout="Docker version", stderr="")
+            if sub == "ps":
+                # Simulate an old pre-egress container: without the egress label
+                # filter it would match; with the filter Docker returns no match.
+                assert any(str(part).startswith("label=hermes-egress=") for part in cmd)
+                return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+            if sub == "run":
+                return subprocess.CompletedProcess(cmd, 0, stdout="fresh-cid\n", stderr="")
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(docker_env.subprocess, "run", _run)
+
+    env = _make_dummy_env(task_id="reuse-egress")
+
+    assert env._container_id == "fresh-cid"
+    run_invocations = [
+        c for c in calls
+        if isinstance(c[0], list) and len(c[0]) >= 2 and c[0][1] == "run"
+    ]
+    assert run_invocations, "egress-enabled containers require a fresh docker run"
+
+
+def test_forward_env_provider_key_collision_refuses_under_egress(monkeypatch):
+    """docker_forward_env is explicit, but it still must not smuggle real
+    provider keys into an enforced egress sandbox."""
+
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-real")
+    monkeypatch.setattr(
+        docker_env,
+        "_egress_proxy_args_for_docker",
+        lambda: (
+            [],
+            {
+                "HTTPS_PROXY": "http://host.docker.internal:9090",
+                "OPENROUTER_API_KEY": "hermes-proxy-openrouter-token",
+                "HERMES_PROXY_TOKEN_OPENROUTER_API_KEY": "hermes-proxy-openrouter-token",
+            },
+            [],
+        ),
+    )
+    _mock_subprocess_run(monkeypatch)
+
+    with pytest.raises(RuntimeError, match="docker_forward_env.*OPENROUTER_API_KEY"):
+        _make_dummy_env(forward_env=["OPENROUTER_API_KEY"])
+
+
+def test_extra_args_proxy_override_refuses_under_egress(monkeypatch):
+    """docker_extra_args are appended after Hermes args, so egress enforcement
+    must reject critical overrides before Docker sees them."""
+
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    monkeypatch.setattr(
+        docker_env,
+        "_egress_proxy_args_for_docker",
+        lambda: (
+            [],
+            {"HTTPS_PROXY": "http://host.docker.internal:9090"},
+            [],
+        ),
+    )
+    _mock_subprocess_run(monkeypatch)
+
+    with pytest.raises(RuntimeError, match="docker_extra_args.*HTTPS_PROXY"):
+        _make_dummy_env(extra_args=["-e", "HTTPS_PROXY="])
 
 
 def test_reuse_starts_stopped_container_before_attaching(monkeypatch):

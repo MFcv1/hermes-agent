@@ -807,10 +807,36 @@ def test_docker_egress_args_full_path(hermes_home, monkeypatch):
     assert env["NODE_EXTRA_CA_CERTS"] == env["REQUESTS_CA_BUNDLE"]
     # NO_PROXY excludes loopback
     assert "127.0.0.1" in env["NO_PROXY"]
-    # Per-mapping proxy token surfaced
+    # Per-mapping proxy token is surfaced under both the standard provider env
+    # name (so existing SDKs work without egress-specific code) and the
+    # introspection name.
+    assert env["OPENROUTER_API_KEY"] == mapping.proxy_token
     assert env["HERMES_PROXY_TOKEN_OPENROUTER_API_KEY"] == mapping.proxy_token
     # Linux host-gateway mapping
     assert host == ["--add-host", "host.docker.internal:host-gateway"]
+
+
+def test_docker_egress_fingerprint_changes_with_tokens(hermes_home, monkeypatch):
+    """Persistent Docker container reuse must not attach to a container that
+    was created before egress, before a token rotation, or with a different CA
+    mount.  The label hash is what forces a fresh container in those cases."""
+
+    from tools.environments.docker import _egress_reuse_fingerprint
+
+    first = _egress_reuse_fingerprint(
+        ["-v", "/tmp/ca:/etc/ssl/certs/hermes-egress-ca.crt:ro"],
+        {"OPENROUTER_API_KEY": "token-a", "HTTPS_PROXY": "http://h:9090"},
+        ["--add-host", "host.docker.internal:host-gateway"],
+    )
+    second = _egress_reuse_fingerprint(
+        ["-v", "/tmp/ca:/etc/ssl/certs/hermes-egress-ca.crt:ro"],
+        {"OPENROUTER_API_KEY": "token-b", "HTTPS_PROXY": "http://h:9090"},
+        ["--add-host", "host.docker.internal:host-gateway"],
+    )
+
+    assert first
+    assert second
+    assert first != second
 
 
 # ---------------------------------------------------------------------------
