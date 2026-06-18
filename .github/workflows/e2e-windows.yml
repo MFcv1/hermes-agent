@@ -267,12 +267,77 @@ jobs:
             }
           }
 
+      - name: Burn debug overlay into recording
+        if: always()
+        shell: pwsh
+        run: |
+          $logPath = 'ahk.log'
+          $x = $y = $w = $h = $null
+          if (Test-Path $logPath) {
+            $line = Get-Content $logPath -Raw | Select-String -Pattern 'Window found at x=(\d+) y=(\d+) w=(\d+) h=(\d+)' -AllMatches | Select-Object -Last 1
+            if ($line) {
+              $x = [int]$line.Matches[0].Groups[1].Value
+              $y = [int]$line.Matches[0].Groups[2].Value
+              $w = [int]$line.Matches[0].Groups[3].Value
+              $h = [int]$line.Matches[0].Groups[4].Value
+              Write-Host "Parsed window rect: x=$x y=$y w=$w h=$h"
+            } else {
+              Write-Host "no window rect found in ahk.log; only timestamp will be burned"
+            }
+          } else {
+            Write-Host "ahk.log not found; only timestamp will be burned"
+          }
+
+          # Build the timestamp overlay
+          $vf = "drawtext=text='%{pts\:hms}':fontfile='C:/Windows/Fonts/arial.ttf':fontsize=20:fontcolor=white:box=1:boxcolor=black@0.5:x=8:y=8"
+
+          if ($x -ne $null -and $y -ne $null -and $w -ne $null -and $h -ne $null) {
+            # Window border + 16px grid only over the window + axis labels every 64px
+            $grid = "drawbox=x=$x`:y=$y`:w=$w`:h=$h`:color=red@0.9:t=2,split=2[box][win];[win]crop=$w`:$h`:$x`:$y,drawgrid=w=16:h=16:t=1:c=red@0.4[grid];[box][grid]overlay=$x`:$y"
+
+            # Label the X and Y axes at 64px intervals
+            $labelStep = 64
+            $txt = "fontfile='C:/Windows/Fonts/arial.ttf':fontsize=14:fontcolor=white:box=1:boxcolor=black@0.6"
+            $labels = @()
+
+            for ($i = 0; $i * $labelStep -le $w; $i++) {
+              $val = $i * $labelStep
+              $lx = $x + $val
+              $ly = if ($y -ge 18) { $y - 18 } else { $y + 4 }
+              $labels += "drawtext=text='$val':$txt`:x=$lx`:y=$ly"
+            }
+
+            for ($j = 0; $j * $labelStep -le $h; $j++) {
+              $val = $j * $labelStep
+              $lx = if ($x -ge 40) { $x - 40 } else { $x + 4 }
+              $ly = $y + $val
+              $labels += "drawtext=text='$val':$txt`:x=$lx`:y=$ly"
+            }
+
+            if ($labels) {
+              $vf = "$grid,$($labels -join ','),$vf"
+            } else {
+              $vf = "$grid,$vf"
+            }
+          }
+
+          Write-Host "Overlay filter: $vf"
+
+          ffmpeg -y -i recording.mkv -vf "$vf" -c:v libx264 -preset veryfast -pix_fmt yuv420p recording-overlay.mkv
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "ffmpeg overlay failed"
+          }
+
+          Move-Item -Path recording-overlay.mkv -Destination recording.mkv -Force
+          Write-Host "Overlayed recording saved as recording.mkv"
+
       - name: Convert screen recording to compact GIF
         if: always()
         shell: pwsh
         run: |
           ffmpeg -y -i recording.mkv `
-            -vf "fps=10,scale=480:-1:flags=lanczos,drawtext=text='%{pts\:hms}':fontfile='C\:/Windows/Fonts/arial.ttf':fontsize=20:fontcolor=white:box=1:boxcolor=black@0.5:x=8:y=8,split=2[s0][s1];[s0]palettegen=max_colors=64[p];[s1][p]paletteuse=dither=bayer" `
+            -vf "fps=10,scale=480:-1:flags=lanczos,split=2[s0][s1];[s0]palettegen=max_colors=64[p];[s1][p]paletteuse=dither=bayer" `
             recording.gif
 
       - name: Upload screen recording

@@ -33,7 +33,7 @@ try {
     ExitApp(1)
 }
 
-Sleep(1000)
+Sleep(5000)
 
 WinGetPos(&x, &y, &w, &h, winTitle)
 FileAppend(Format("Window found at x={1} y={2} w={3} h={4}`n", x, y, w, h), "ahk.log")
