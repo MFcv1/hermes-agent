@@ -4036,13 +4036,9 @@ class TelegramAdapter(BasePlatformAdapter):
             self._repo_new_chat_choices.pop(caller_id, None)
             try:
                 await query.edit_message_text(
-                    "<b>✅ Repo sélectionné</b>\n\n"
-                    f"Repo : <code>{_html.escape(repo)}</code>\n"
-                    f"Mode : <b>{_html.escape(self._mode_title(mode))}</b>\n"
-                    f"Conversation : <code>{_html.escape(str(result.get('thread_id') or ''))}</code>\n\n"
-                    "Tu peux maintenant écrire la tâche à réaliser dans ce chat.",
+                    self._repo_selected_text(repo, mode, str(result.get("thread_id") or "")),
                     parse_mode=ParseMode.HTML,
-                    reply_markup=None,
+                    reply_markup=self._repo_selected_keyboard(mode),
                 )
             except Exception:
                 pass
@@ -6282,6 +6278,33 @@ class TelegramAdapter(BasePlatformAdapter):
             InlineKeyboardButton("Annuler", callback_data="rcn:cancel"),
         ])
         return InlineKeyboardMarkup(rows)
+
+    def _repo_selected_text(self, repo: str, mode: str, thread_id: str | None = None) -> str:
+        lines = [
+            "<b>✅ Repo sélectionné</b>",
+            "",
+            f"Repo : <code>{_html.escape(repo)}</code>",
+            f"Mode : <b>{_html.escape(self._mode_title(mode))}</b>",
+        ]
+        if thread_id:
+            lines.append(f"Conversation : <code>{_html.escape(str(thread_id))}</code>")
+        lines.extend([
+            "",
+            "Prochaine étape : envoie ta tâche directement dans ce chat.",
+        ])
+        return "\n".join(lines)
+
+    def _repo_selected_keyboard(self, mode: str) -> InlineKeyboardMarkup:
+        other_mode = "autopilot" if mode == "ask_review" else "ask_review"
+        return InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("Changer repo", callback_data=f"rcn:existing:{mode}"),
+                InlineKeyboardButton("Changer mode", callback_data=f"rcn:mode:{other_mode}"),
+            ],
+            [
+                InlineKeyboardButton("Annuler", callback_data="rcn:cancel"),
+            ],
+        ])
 
     def _new_chat_text(self, mode: str, selected_repo: str | None = None) -> str:
         repo_line = f"Repo actuel : <code>{_html.escape(selected_repo)}</code>" if selected_repo else "Repo actuel : <i>aucun repo sélectionné</i>"

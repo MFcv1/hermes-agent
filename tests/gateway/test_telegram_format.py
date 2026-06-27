@@ -228,6 +228,7 @@ async def test_final_send_does_not_retrigger_typing(adapter):
 
     assert result.success is True
     adapter._bot.send_chat_action.assert_not_called()
+    assert "disable_notification" not in adapter._bot.send_message.await_args.kwargs
 
 
 @pytest.mark.asyncio
@@ -244,6 +245,7 @@ async def test_intermediate_send_still_retriggers_typing(adapter):
 
     assert result.success is True
     adapter._bot.send_chat_action.assert_awaited()
+    assert adapter._bot.send_message.await_args.kwargs["disable_notification"] is True
 
 
 # =========================================================================

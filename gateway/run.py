@@ -90,6 +90,44 @@ _TELEGRAM_NOISY_STATUS_RE = re.compile(
     re.IGNORECASE | re.DOTALL,
 )
 
+
+def build_busy_ack_message(
+    mode: str,
+    *,
+    activity: Optional[dict] = None,
+    elapsed_seconds: int = 0,
+    model: Optional[str] = None,
+    demoted_for_subagents: bool = False,
+) -> str:
+    """Build the user-facing busy-session acknowledgement text."""
+    status_detail = ""
+    if activity or elapsed_seconds:
+        status_detail = "\n" + render_from_activity(
+            elapsed_seconds=elapsed_seconds,
+            activity=activity,
+            model=model,
+        )
+
+    if mode == "steer":
+        return (
+            f"⏩ Message ajoute a la tache en cours.{status_detail}\n"
+            f"Ton message sera pris en compte au prochain point de controle."
+        )
+    if mode == "queue" and demoted_for_subagents:
+        return (
+            f"⏳ Une sous-tache est en cours.{status_detail}\n"
+            f"Ton message est mis en file; utilise /stop pour tout annuler."
+        )
+    if mode == "queue":
+        return (
+            f"⏳ Message mis en file pour le prochain tour.{status_detail}\n"
+            f"Je repondrai des que la tache en cours sera terminee."
+        )
+    return (
+        f"⚡ J'interromps la tache en cours.{status_detail}\n"
+        f"Je vais traiter ton nouveau message dans un instant."
+    )
+
 _GATEWAY_PROVIDER_ERROR_RE = re.compile(
     r"("  # infrastructure/provider error preambles, not ordinary assistant prose
     r"api\s+(?:call\s+)?failed"
@@ -4394,36 +4432,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 or getattr(running_agent, "model_name", None)
                 or getattr(running_agent, "_model", None)
             )
-        status_detail = ""
-        if activity or elapsed_seconds:
-            status_detail = "\n" + render_from_activity(
-                elapsed_seconds=elapsed_seconds,
-                activity=activity,
-                model=model_label,
-            )
-        if is_steer_mode:
-            message = (
-                f"⏩ Message ajoute a la tache en cours.{status_detail}\n"
-                f"Ton message sera pris en compte au prochain point de controle."
-            )
-        elif is_queue_mode and demoted_for_subagents:
-            # #30170 — explain the demotion so the user knows their
-            # follow-up didn't accidentally kill the subagent and
-            # discovers `/stop` as the explicit escape hatch.
-            message = (
-                f"⏳ Une sous-tache est en cours.{status_detail}\n"
-                f"Ton message est mis en file; utilise /stop pour tout annuler."
-            )
-        elif is_queue_mode:
-            message = (
-                f"⏳ Message mis en file pour le prochain tour.{status_detail}\n"
-                f"Je repondrai des que la tache en cours sera terminee."
-            )
-        else:
-            message = (
-                f"⚡ J'interromps la tache en cours.{status_detail}\n"
-                f"Je vais traiter ton nouveau message dans un instant."
-            )
+        # #30170: when interrupt was demoted to queue for active subagents,
+        # explain why the follow-up did not cancel the child work.
+        message = build_busy_ack_message(
+            "steer" if is_steer_mode else ("queue" if is_queue_mode else "interrupt"),
+            activity=activity,
+            elapsed_seconds=elapsed_seconds,
+            model=model_label,
+            demoted_for_subagents=demoted_for_subagents,
+        )
 
         # First-touch onboarding: the very first time a user sends a message
         # while the agent is busy, append a one-time hint explaining the

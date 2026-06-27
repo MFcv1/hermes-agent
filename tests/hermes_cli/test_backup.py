@@ -1435,6 +1435,45 @@ class TestQuickSnapshot:
         assert copied.exists()
         assert "120363408391911677@g.us" in copied.read_text()
 
+    def test_copies_kanban_state_without_board_workspaces(self, hermes_home):
+        from hermes_cli.backup import create_quick_snapshot
+
+        default_db = hermes_home / "kanban.db"
+        conn = sqlite3.connect(str(default_db))
+        conn.execute("CREATE TABLE tasks (id TEXT PRIMARY KEY)")
+        conn.execute("INSERT INTO tasks VALUES ('default-task')")
+        conn.commit()
+        conn.close()
+
+        board = hermes_home / "kanban" / "boards" / "mf-cockpit"
+        board.mkdir(parents=True)
+        (hermes_home / "kanban" / "current").write_text("mf-cockpit\n")
+        (board / "board.json").write_text('{"slug": "mf-cockpit"}\n')
+        conn = sqlite3.connect(str(board / "kanban.db"))
+        conn.execute("CREATE TABLE tasks (id TEXT PRIMARY KEY)")
+        conn.execute("INSERT INTO tasks VALUES ('board-task')")
+        conn.commit()
+        conn.close()
+        (board / "workspaces" / "t_1").mkdir(parents=True)
+        (board / "workspaces" / "t_1" / "scratch.txt").write_text("do not snapshot")
+
+        snap_id = create_quick_snapshot(hermes_home=hermes_home)
+        snap_dir = hermes_home / "state-snapshots" / snap_id
+
+        assert (snap_dir / "kanban.db").exists()
+        assert (snap_dir / "kanban" / "current").read_text() == "mf-cockpit\n"
+        assert (snap_dir / "kanban" / "boards" / "mf-cockpit" / "board.json").exists()
+        assert (snap_dir / "kanban" / "boards" / "mf-cockpit" / "kanban.db").exists()
+        assert not (snap_dir / "kanban" / "boards" / "mf-cockpit" / "workspaces").exists()
+
+        with open(snap_dir / "manifest.json", encoding="utf-8") as f:
+            meta = json.load(f)
+        assert "kanban.db" in meta["files"]
+        assert "kanban/current" in meta["files"]
+        assert "kanban/boards/mf-cockpit/board.json" in meta["files"]
+        assert "kanban/boards/mf-cockpit/kanban.db" in meta["files"]
+        assert not any("/workspaces/" in path for path in meta["files"])
+
     def test_missing_files_skipped(self, hermes_home):
         from hermes_cli.backup import create_quick_snapshot
         snap_id = create_quick_snapshot(hermes_home=hermes_home)

@@ -155,6 +155,30 @@ class TestBlockingGatewayApproval:
         assert not e2.event.is_set()
         assert len(_gateway_queues[session_key]) == 1
 
+    def test_resolve_one_session_does_not_cross_resolve_another(self):
+        """Concurrent session approvals must stay isolated by session_key."""
+        from tools.approval import (
+            resolve_gateway_approval,
+            _ApprovalEntry, _gateway_queues,
+        )
+
+        session_a = "telegram:chat-a"
+        session_b = "telegram:chat-b"
+        entry_a = _ApprovalEntry({"command": "rm a"})
+        entry_b = _ApprovalEntry({"command": "rm b"})
+        _gateway_queues[session_a] = [entry_a]
+        _gateway_queues[session_b] = [entry_b]
+
+        count = resolve_gateway_approval(session_a, "once")
+
+        assert count == 1
+        assert entry_a.event.is_set()
+        assert entry_a.result == "once"
+        assert not entry_b.event.is_set()
+        assert entry_b.result is None
+        assert session_a not in _gateway_queues
+        assert _gateway_queues[session_b] == [entry_b]
+
     def test_unregister_signals_all_entries(self):
         """unregister_gateway_notify signals all waiting entries to prevent hangs."""
         from tools.approval import (

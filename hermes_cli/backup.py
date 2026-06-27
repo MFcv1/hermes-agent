@@ -754,10 +754,12 @@ def run_import(args) -> None:
 # are recoverable if anything goes wrong (issue #15733).
 _QUICK_STATE_FILES = (
     "state.db",
+    "kanban.db",
     "config.yaml",
     ".env",
     "auth.json",
     "cron/jobs.json",
+    "kanban/current",
     "gateway_state.json",
     "channel_directory.json",
     "channel_aliases.json",
@@ -768,6 +770,11 @@ _QUICK_STATE_FILES = (
     "feishu_comment_pairing.json",      # Feishu comment subscription pairings
 )
 
+_QUICK_STATE_GLOBS = (
+    "kanban/boards/*/board.json",
+    "kanban/boards/*/kanban.db",
+)
+
 _QUICK_SNAPSHOTS_DIR = "state-snapshots"
 _QUICK_DEFAULT_KEEP = 20
 
@@ -775,6 +782,28 @@ _QUICK_DEFAULT_KEEP = 20
 def _quick_snapshot_root(hermes_home: Optional[Path] = None) -> Path:
     home = hermes_home or get_hermes_home()
     return home / _QUICK_SNAPSHOTS_DIR
+
+
+def _iter_quick_state_sources(home: Path) -> List[Path]:
+    """Return quick-snapshot source paths relative to HERMES_HOME."""
+    out: List[Path] = []
+    seen: set[str] = set()
+
+    def add(rel: Path) -> None:
+        rel_s = rel.as_posix()
+        if rel_s not in seen:
+            seen.add(rel_s)
+            out.append(rel)
+
+    for rel in _QUICK_STATE_FILES:
+        add(Path(rel))
+    for pattern in _QUICK_STATE_GLOBS:
+        for src in sorted(home.glob(pattern)):
+            try:
+                add(src.relative_to(home))
+            except ValueError:
+                continue
+    return out
 
 
 def create_quick_snapshot(
@@ -800,7 +829,8 @@ def create_quick_snapshot(
 
     manifest: Dict[str, int] = {}  # rel_path -> file size
 
-    for rel in _QUICK_STATE_FILES:
+    for rel_path in _iter_quick_state_sources(home):
+        rel = rel_path.as_posix()
         src = home / rel
         if not src.exists():
             continue
