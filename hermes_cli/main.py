@@ -286,6 +286,7 @@ from hermes_cli.subcommands.import_cmd import build_import_cmd_parser
 from hermes_cli.subcommands.config import build_config_parser
 from hermes_cli.subcommands.version import build_version_parser
 from hermes_cli.subcommands.update import build_update_parser
+from hermes_cli.subcommands.updatecheck import build_updatecheck_parser
 from hermes_cli.subcommands.uninstall import build_uninstall_parser
 from hermes_cli.subcommands.dashboard import build_dashboard_parser
 from hermes_cli.subcommands.gui import build_gui_parser
@@ -4362,6 +4363,13 @@ def _print_version_info(*, check_updates: bool = True) -> None:
 def cmd_version(args):
     """Show version."""
     _print_version_info(check_updates=True)
+
+
+def cmd_updatecheck(args):
+    """Run a read-only update readiness check."""
+    from hermes_cli.updatecheck import run_updatecheck
+
+    return run_updatecheck(args)
 
 
 def cmd_uninstall(args):
@@ -12789,6 +12797,11 @@ def main():
     # update command  (parser built in hermes_cli/subcommands/update.py)
     # =========================================================================
     build_update_parser(subparsers, cmd_update=cmd_update)
+
+    # =========================================================================
+    # updatecheck command  (parser built in hermes_cli/subcommands/updatecheck.py)
+    # =========================================================================
+    build_updatecheck_parser(subparsers, cmd_updatecheck=cmd_updatecheck)
 
     # =========================================================================
     # uninstall command  (parser built in hermes_cli/subcommands/uninstall.py)

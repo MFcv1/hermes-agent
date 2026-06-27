@@ -61,6 +61,20 @@ class TestScheduleResolution:
         )
         assert spec["schedule"] == "0 18 * * 0"
 
+    def test_weekly_updatecheck_is_readonly_ops_schedule(self):
+        spec = fill_blueprint(
+            get_blueprint("weekly-updatecheck"),
+            {"time": "09:30", "day": "saturday", "timeout_seconds": "20", "deliver": "telegram"},
+        )
+
+        assert spec["schedule"] == "30 9 * * 6"
+        assert spec["deliver"] == "telegram"
+        assert spec["script"] == "weekly_updatecheck.py"
+        assert spec["no_agent"] is True
+        assert "hermes updatecheck --timeout 20 --stateful --silent-unchanged" in spec["prompt"]
+        assert "Do not run `hermes update`" in spec["prompt"]
+        assert "[SILENT]" in spec["prompt"]
+
     def test_weekday_preset_to_dow(self):
         spec = fill_blueprint(
             get_blueprint("custom-reminder"),

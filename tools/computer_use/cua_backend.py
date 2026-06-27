@@ -44,7 +44,18 @@ logger = logging.getLogger(__name__)
 
 PINNED_CUA_DRIVER_VERSION = os.environ.get("HERMES_CUA_DRIVER_VERSION", "0.5.0")
 
-_CUA_DRIVER_CMD = os.environ.get("HERMES_CUA_DRIVER_CMD", "cua-driver")
+
+def _default_cua_driver_cmd() -> str:
+    override = os.environ.get("HERMES_CUA_DRIVER_CMD", "").strip()
+    if override:
+        return override
+    local_bin = os.path.expanduser("~/.local/bin/cua-driver")
+    if os.path.exists(local_bin):
+        return local_bin
+    return "cua-driver"
+
+
+_CUA_DRIVER_CMD = _default_cua_driver_cmd()
 _CUA_DRIVER_ARGS = ["mcp"]  # stdio MCP transport
 
 # Regex to parse list_windows text output lines:

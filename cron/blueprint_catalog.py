@@ -96,6 +96,8 @@ class AutomationBlueprint:
     slots: List[BlueprintSlot] = field(default_factory=list)
     deliver_default: str = "origin"
     skills: tuple = ()        # skills the job loads before running
+    script_template: Optional[str] = None
+    no_agent: bool = False
     tags: tuple = ()
 
 
@@ -186,6 +188,42 @@ CATALOG: List[AutomationBlueprint] = [
             _DELIVER,
         ],
         tags=("weekly", "review"),
+    ),
+    AutomationBlueprint(
+        key="weekly-updatecheck",
+        title="Weekly Hermes updatecheck",
+        description="Run a read-only Hermes update readiness check and notify "
+        "only when the VPS needs attention.",
+        category="ops",
+        schedule_template="{minute} {hour} * * {dow}",
+        prompt_template=(
+            "Run a read-only Hermes VPS update readiness check. Use the "
+            "`hermes updatecheck --timeout {timeout_seconds} --stateful "
+            "--silent-unchanged` command if available. Do not run "
+            "`hermes update`, do not pull, do not restart services, and do not "
+            "mutate files. Deliver a short message only if the result is "
+            "RED/YELLOW, a new update is available, or the status changed since "
+            "the previous run; otherwise respond with [SILENT]. "
+            "Include the top blockers, cache/freshness signal, disk free space, "
+            "service status, and the safest next manual action."
+        ),
+        slots=[
+            _TIME("09:30"),
+            BlueprintSlot(
+                name="day", type="enum", label="Which day?",
+                default="saturday",
+                options=("sunday", "monday", "friday", "saturday"),
+            ),
+            BlueprintSlot(
+                name="timeout_seconds", type="enum", label="Fetch timeout?",
+                default="20", options=("10", "20", "45"),
+                help="seconds allowed for the scoped git fetch",
+            ),
+            _DELIVER,
+        ],
+        script_template="weekly_updatecheck.py",
+        no_agent=True,
+        tags=("ops", "updates", "vps"),
     ),
     AutomationBlueprint(
         key="workday-start",
@@ -706,6 +744,13 @@ def fill_blueprint(
         "name": blueprint.title,
         "deliver": resolved.get("deliver", blueprint.deliver_default),
     }
+    if blueprint.script_template:
+        try:
+            spec["script"] = blueprint.script_template.format(**resolved)
+        except KeyError as e:
+            raise BlueprintFillError(f"blueprint script missing value for {e}") from e
+    if blueprint.no_agent:
+        spec["no_agent"] = True
     if blueprint.skills:
         spec["skills"] = list(blueprint.skills)
     if origin is not None:

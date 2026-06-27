@@ -166,9 +166,17 @@ class InProcessCronScheduler(CronScheduler):
     def start(self, stop_event, *, adapters=None, loop=None, interval=60):
         import logging
         from cron.scheduler import tick as cron_tick
-        from cron.jobs import record_ticker_heartbeat
 
         logger = logging.getLogger("cron.scheduler_provider")
+        try:
+            from cron.jobs import record_ticker_heartbeat
+        except ImportError:
+            def record_ticker_heartbeat(*args, **kwargs):
+                return None
+
+            logger.debug(
+                "cron.jobs.record_ticker_heartbeat unavailable; continuing without ticker heartbeat"
+            )
         logger.info("In-process cron scheduler started (interval=%ds)", interval)
         # Heartbeat once before the first sleep so `hermes cron status` sees a
         # live ticker immediately after startup, not only after the first tick.

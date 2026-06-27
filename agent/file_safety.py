@@ -88,6 +88,37 @@ def get_safe_write_root() -> Optional[str]:
         return None
 
 
+def get_safe_write_roots() -> list[str]:
+    """Return resolved write-safe roots.
+
+    ``HERMES_WRITE_SAFE_ROOT`` is kept for compatibility.  ``HERMES_WRITE_SAFE_ROOTS``
+    accepts multiple roots separated by ``:`` or ``,`` so a gateway profile can
+    safely cover Hermes state and an adjacent app/workspace tree without
+    widening to the user's whole home directory.
+    """
+    raw_multi = os.getenv("HERMES_WRITE_SAFE_ROOTS", "")
+    raw_values: list[str]
+    if raw_multi.strip():
+        raw_values = [
+            item.strip()
+            for item in raw_multi.replace(",", os.pathsep).split(os.pathsep)
+            if item.strip()
+        ]
+    else:
+        single = get_safe_write_root()
+        raw_values = [single] if single else []
+
+    roots: list[str] = []
+    for root in raw_values:
+        try:
+            resolved = os.path.realpath(os.path.expanduser(root))
+        except Exception:
+            continue
+        if resolved and resolved not in roots:
+            roots.append(resolved)
+    return roots
+
+
 def is_write_denied(path: str) -> bool:
     """Return True if path is blocked by the write denylist or safe root."""
     home = os.path.realpath(os.path.expanduser("~"))
@@ -124,8 +155,11 @@ def is_write_denied(path: str) -> bool:
         except Exception:
             pass
 
-    safe_root = get_safe_write_root()
-    if safe_root and not (resolved == safe_root or resolved.startswith(safe_root + os.sep)):
+    safe_roots = get_safe_write_roots()
+    if safe_roots and not any(
+        resolved == safe_root or resolved.startswith(safe_root + os.sep)
+        for safe_root in safe_roots
+    ):
         return True
 
     return False

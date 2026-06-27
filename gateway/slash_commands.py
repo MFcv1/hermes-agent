@@ -947,6 +947,18 @@ class GatewaySlashCommandsMixin:
 
         return format_banner_version_label()
 
+    async def _handle_updatecheck_command(self, event: MessageEvent) -> str:
+        """Handle /updatecheck — read-only update readiness report."""
+        import asyncio
+
+        def _collect() -> str:
+            from hermes_cli.updatecheck import collect_updatecheck, format_updatecheck
+
+            return format_updatecheck(collect_updatecheck(fresh=True, fetch_timeout=20))
+
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, _collect)
+
     async def _handle_help_command(self, event: MessageEvent) -> str:
         """Handle /help command - list available commands."""
         from gateway.run import _telegramize_command_mentions

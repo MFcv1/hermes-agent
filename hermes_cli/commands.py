@@ -233,6 +233,8 @@ COMMAND_REGISTRY: list[CommandDef] = [
     CommandDef("image", "Attach a local image file for your next prompt", "Info",
                cli_only=True, args_hint="<path>"),
     CommandDef("update", "Update Hermes Agent to the latest version", "Info"),
+    CommandDef("updatecheck", "Read-only Hermes update readiness report", "Info",
+               aliases=("update-check",)),
     CommandDef("version", "Show Hermes Agent version", "Info", aliases=("v",)),
     CommandDef("debug", "Upload debug report (system info + logs) and get shareable links", "Info"),
 
@@ -367,6 +369,7 @@ ACTIVE_SESSION_BYPASS_COMMANDS: frozenset[str] = frozenset(
         "steer",
         "stop",
         "update",
+        "updatecheck",
         "version",
     }
 )

@@ -8023,6 +8023,20 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         elif canonical == "update":
             if self._handle_update_command():
                 return False
+        elif canonical == "updatecheck":
+            from types import SimpleNamespace
+            from hermes_cli.updatecheck import run_updatecheck
+
+            run_updatecheck(
+                SimpleNamespace(
+                    cached=False,
+                    json=False,
+                    timeout=20,
+                    stateful=False,
+                    silent_unchanged=False,
+                    state_path=None,
+                )
+            )
         elif canonical == "version":
             from hermes_cli.main import _print_version_info
 

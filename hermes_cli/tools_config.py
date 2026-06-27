@@ -576,7 +576,13 @@ TOOLSET_ENV_REQUIREMENTS = {
 
 def _cua_driver_cmd() -> str:
     """Return the cua-driver executable name/path, honoring non-empty overrides."""
-    return os.environ.get("HERMES_CUA_DRIVER_CMD", "").strip() or "cua-driver"
+    override = os.environ.get("HERMES_CUA_DRIVER_CMD", "").strip()
+    if override:
+        return override
+    local_bin = os.path.expanduser("~/.local/bin/cua-driver")
+    if os.path.exists(local_bin):
+        return local_bin
+    return "cua-driver"
 
 
 def _pip_install(

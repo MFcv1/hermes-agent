@@ -205,7 +205,7 @@ class TestBusySessionAck:
         if not content and call_kwargs.args:
             # positional args
             content = str(call_kwargs)
-        assert "Interrupting" in content or "respond" in content
+        assert "J'interromps la tache en cours" in content
         assert "/stop" not in content  # no need — we ARE interrupting
 
         # Verify agent interrupt was called
@@ -235,9 +235,9 @@ class TestBusySessionAck:
         adapter._send_with_retry.assert_called_once()
         call_kwargs = adapter._send_with_retry.call_args
         content = call_kwargs.kwargs.get("content") or call_kwargs[1].get("content", "")
-        assert "Queued for the next turn" in content
-        assert "respond once the current task finishes" in content
-        assert "Interrupting" not in content
+        assert "Message mis en file pour le prochain tour" in content
+        assert "Je repondrai des que la tache en cours sera terminee" in content
+        assert "J'interromps" not in content
 
     @pytest.mark.asyncio
     async def test_busy_text_mode_queue_delegates_to_adapter_handle_message(self):
@@ -294,8 +294,8 @@ class TestBusySessionAck:
         adapter._send_with_retry.assert_called_once()
         call_kwargs = adapter._send_with_retry.call_args
         content = call_kwargs.kwargs.get("content") or call_kwargs[1].get("content", "")
-        assert "Steered" in content or "steer" in content.lower()
-        assert "Interrupting" not in content
+        assert "Message ajoute a la tache en cours" in content
+        assert "J'interromps" not in content
 
     @pytest.mark.asyncio
     async def test_steer_mode_falls_back_to_queue_when_agent_rejects(self):
@@ -324,8 +324,8 @@ class TestBusySessionAck:
         # Ack uses queue-mode wording (not steer, not interrupt)
         call_kwargs = adapter._send_with_retry.call_args
         content = call_kwargs.kwargs.get("content") or call_kwargs[1].get("content", "")
-        assert "Queued for the next turn" in content
-        assert "Steered" not in content
+        assert "Message mis en file pour le prochain tour" in content
+        assert "Message ajoute" not in content
 
     @pytest.mark.asyncio
     async def test_steer_mode_falls_back_to_queue_when_agent_pending(self):
@@ -348,7 +348,7 @@ class TestBusySessionAck:
 
         call_kwargs = adapter._send_with_retry.call_args
         content = call_kwargs.kwargs.get("content") or call_kwargs[1].get("content", "")
-        assert "Queued for the next turn" in content
+        assert "Message mis en file pour le prochain tour" in content
 
     @pytest.mark.asyncio
     async def test_interrupt_mode_text_followups_fifo_not_merged(self):
@@ -474,15 +474,8 @@ class TestBusySessionAck:
         assert adapter._send_with_retry.call_count == 2
 
     @pytest.mark.asyncio
-    async def test_includes_status_detail_when_opted_in(self, monkeypatch):
-        """Ack message should include iteration and tool info when available."""
-        import gateway.run as _gr
-
-        monkeypatch.setattr(
-            _gr,
-            "_load_gateway_config",
-            lambda: {"display": {"platforms": {"telegram": {"busy_ack_detail": True}}}},
-        )
+    async def test_busy_ack_renders_human_progress_without_internal_jargon(self, monkeypatch):
+        """Ack message should include useful progress without raw iteration/tool noise."""
         runner, sentinel = _make_runner()
         runner._busy_input_mode = "interrupt"
         adapter = _make_adapter()
@@ -494,11 +487,12 @@ class TestBusySessionAck:
         agent.get_activity_summary.return_value = {
             "api_call_count": 21,
             "max_iterations": 60,
-            "current_tool": "terminal",
+            "current_tool": "waiting for non-streaming API response",
             "last_activity_ts": time.time(),
-            "last_activity_desc": "terminal",
+            "last_activity_desc": "waiting for non-streaming API response",
             "seconds_since_activity": 0.5,
         }
+        agent.model = "gpt-5.5-high"
         runner._running_agents[sk] = agent
         runner._running_agents_ts[sk] = time.time() - 600  # 10 min
         runner.adapters[event.source.platform] = adapter
@@ -507,13 +501,17 @@ class TestBusySessionAck:
 
         call_kwargs = adapter._send_with_retry.call_args
         content = call_kwargs.kwargs.get("content", "")
-        assert "21/60" in content  # iteration
-        assert "terminal" in content  # current tool
+        assert "Hermes travaille" in content
+        assert "Phase : Analyse" in content
+        assert "GPT-5.5" in content
         assert "10 min" in content  # elapsed
+        assert "21/60" not in content
+        assert "iteration" not in content.lower()
+        assert "non-streaming" not in content.lower()
 
     @pytest.mark.asyncio
-    async def test_telegram_omits_status_detail_by_default(self):
-        """Telegram busy acks stay concise unless busy_ack_detail is enabled."""
+    async def test_telegram_busy_ack_uses_french_action_text(self):
+        """Telegram busy acks use concise user-facing wording."""
         runner, sentinel = _make_runner()
         runner._busy_input_mode = "interrupt"
         adapter = _make_adapter()
@@ -537,10 +535,10 @@ class TestBusySessionAck:
         await runner._handle_active_session_busy_message(event, sk)
 
         content = adapter._send_with_retry.call_args.kwargs.get("content", "")
-        assert "Interrupting current task" in content
+        assert "J'interromps la tache en cours" in content
+        assert "Hermes travaille" in content
         assert "21/60" not in content
-        assert "terminal" not in content
-        assert "10 min" not in content
+        assert "iteration" not in content.lower()
 
     @pytest.mark.asyncio
     async def test_draining_still_works(self):
@@ -635,7 +633,7 @@ class TestBusySessionOnboardingHint:
         content = call_kwargs.kwargs.get("content", "")
 
         # Normal ack body
-        assert "Interrupting" in content
+        assert "J'interromps la tache en cours" in content
         # First-touch hint appended
         assert "First-time tip" in content
         assert "/busy queue" in content
@@ -683,7 +681,7 @@ class TestBusySessionOnboardingHint:
         call_kwargs = adapter._send_with_retry.call_args
         content = call_kwargs.kwargs.get("content", "")
 
-        assert "Interrupting" in content
+        assert "J'interromps la tache en cours" in content
         assert "First-time tip" not in content
         assert "/busy queue" not in content
 
@@ -710,7 +708,7 @@ class TestBusySessionOnboardingHint:
             await runner._handle_active_session_busy_message(event, sk)
 
         content = adapter._send_with_retry.call_args.kwargs.get("content", "")
-        assert "Queued for the next turn" in content
+        assert "Message mis en file pour le prochain tour" in content
         assert "First-time tip" in content
         assert "/busy interrupt" in content
         # Must NOT tell the user to /busy queue when they're already on queue.

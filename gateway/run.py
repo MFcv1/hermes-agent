@@ -54,6 +54,7 @@ from typing import Dict, Optional, Any, List, Union
 from agent.account_usage import fetch_account_usage, render_account_usage_lines
 from agent.async_utils import safe_schedule_threadsafe
 from agent.i18n import t
+from gateway.human_heartbeat import render_from_activity
 from hermes_cli.config import cfg_get
 from hermes_cli.fallback_config import get_fallback_chain
 
@@ -76,6 +77,8 @@ _TELEGRAM_NOISY_STATUS_RE = re.compile(
     r"|configured\s+compression\s+model\s+.+\s+failed"
     r"|no\s+auxiliary\s+llm\s+provider\s+configured"
     r"|auto-lowered\s+compression\s+threshold"
+    r"|.+caps\s+context\s+at\s+.+auto-compaction\s+was\s+raised"
+    r"|opt\s+back\s+out:.*compression\."
     r"|compacting\s+context\s+[—-]\s+summarizing\s+earlier\s+conversation"
     r"|preflight\s+compression"
     r"|rate\s+limited\.\s+waiting\s+\d"
@@ -324,7 +327,10 @@ def _gateway_provider_error_reply(text: str) -> str:
             "error out of chat; check gateway logs for details or try rephrasing."
         )
     if _GATEWAY_RATE_LIMIT_RE.search(text):
-        return "⏱️ The model provider is rate-limiting requests. Please wait a moment and try again."
+        return (
+            "⏱️ Le modèle est temporairement limité par le provider. "
+            "Hermes a bien reçu ton message; attends quelques instants puis relance."
+        )
     return (
         "⚠️ The model provider failed after retries. I kept raw provider details "
         "out of chat; check gateway logs for diagnostics."
@@ -4372,61 +4378,51 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         self._busy_ack_ts[session_key] = now
 
-        # Build a status-rich acknowledgment. Mobile chat defaults keep this
-        # terse; detailed iteration/tool state is still available in logs and
-        # can be opted in per platform via display.platforms.<platform>.busy_ack_detail.
-        from gateway.display_config import resolve_display_setting
-        status_parts = []
-        busy_ack_detail_enabled = bool(
-            resolve_display_setting(
-                _load_gateway_config(),
-                _platform_config_key(event.source.platform),
-                "busy_ack_detail",
-                True,
-            )
-        )
-
-        if busy_ack_detail_enabled and running_agent and running_agent is not _AGENT_PENDING_SENTINEL:
+        activity = None
+        elapsed_seconds = 0
+        model_label = None
+        if running_agent and running_agent is not _AGENT_PENDING_SENTINEL:
             try:
-                summary = running_agent.get_activity_summary()
-                iteration = summary.get("api_call_count", 0)
-                max_iter = summary.get("max_iterations", 0)
-                current_tool = summary.get("current_tool")
-                start_ts = self._running_agents_ts.get(session_key, 0)
-                if start_ts:
-                    elapsed_min = int((now - start_ts) / 60)
-                    if elapsed_min > 0:
-                        status_parts.append(f"{elapsed_min} min elapsed")
-                if max_iter:
-                    status_parts.append(f"iteration {iteration}/{max_iter}")
-                if current_tool:
-                    status_parts.append(f"running: {current_tool}")
+                activity = running_agent.get_activity_summary()
             except Exception:
-                pass
-
-        status_detail = f" ({', '.join(status_parts)})" if status_parts else ""
+                activity = None
+            start_ts = self._running_agents_ts.get(session_key, 0)
+            if start_ts:
+                elapsed_seconds = max(0, int(now - start_ts))
+            model_label = (
+                getattr(running_agent, "model", None)
+                or getattr(running_agent, "model_name", None)
+                or getattr(running_agent, "_model", None)
+            )
+        status_detail = ""
+        if activity or elapsed_seconds:
+            status_detail = "\n" + render_from_activity(
+                elapsed_seconds=elapsed_seconds,
+                activity=activity,
+                model=model_label,
+            )
         if is_steer_mode:
             message = (
-                f"⏩ Steered into current run{status_detail}. "
-                f"Your message arrives after the next tool call."
+                f"⏩ Message ajoute a la tache en cours.{status_detail}\n"
+                f"Ton message sera pris en compte au prochain point de controle."
             )
         elif is_queue_mode and demoted_for_subagents:
             # #30170 — explain the demotion so the user knows their
             # follow-up didn't accidentally kill the subagent and
             # discovers `/stop` as the explicit escape hatch.
             message = (
-                f"⏳ Subagent working{status_detail} — your message is queued for "
-                f"when it finishes (use /stop to cancel everything)."
+                f"⏳ Une sous-tache est en cours.{status_detail}\n"
+                f"Ton message est mis en file; utilise /stop pour tout annuler."
             )
         elif is_queue_mode:
             message = (
-                f"⏳ Queued for the next turn{status_detail}. "
-                f"I'll respond once the current task finishes."
+                f"⏳ Message mis en file pour le prochain tour.{status_detail}\n"
+                f"Je repondrai des que la tache en cours sera terminee."
             )
         else:
             message = (
-                f"⚡ Interrupting current task{status_detail}. "
-                f"I'll respond to your message shortly."
+                f"⚡ J'interromps la tache en cours.{status_detail}\n"
+                f"Je vais traiter ton nouveau message dans un instant."
             )
 
         # First-touch onboarding: the very first time a user sends a message
@@ -4525,6 +4521,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """
         active = self._snapshot_running_agents()
         restart_source = self._restart_command_source if self._restart_requested else None
+        if not self._restart_requested:
+            logger.info(
+                "Skipping chat shutdown notification for technical gateway stop "
+                "(active_sessions=%d)",
+                len(active),
+            )
+            return
 
         action = "restarting" if self._restart_requested else "shutting down"
         hint = (
@@ -5507,8 +5510,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             from gateway.relay import (
                 register_relay_adapter,
                 relay_url,
-                self_provision_relay,
             )
+            try:
+                from gateway.relay import self_provision_relay
+            except ImportError:
+                from gateway.relay import self_provision_if_managed as self_provision_relay
 
             # Boot-time relay self-provision: resolve the agent's NAS token ->
             # POST /relay/provision -> set GATEWAY_RELAY_* in os.environ BEFORE
@@ -7152,6 +7158,35 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             logger.debug("Platform registry lookup for '%s' failed: %s", platform.value, e)
         # Fall through to built-in adapters below
 
+        if platform == Platform.TELEGRAM:
+            from gateway.platforms.telegram import TelegramAdapter, check_telegram_requirements
+            if not check_telegram_requirements():
+                logger.warning("Telegram: python-telegram-bot not installed")
+                return None
+            adapter = TelegramAdapter(config)
+            # Apply Telegram notification mode from config. Controls whether
+            # intermediate messages (tool progress, streaming, status) trigger
+            # push notifications. Supports ENV override for quick testing.
+            _notify_mode = os.getenv("HERMES_TELEGRAM_NOTIFICATIONS", "")
+            if not _notify_mode:
+                try:
+                    _gw_cfg = _load_gateway_config()
+                    _raw = cfg_get(_gw_cfg, "display", "platforms", "telegram", "notifications")
+                    if _raw not in {None, ""}:
+                        _notify_mode = str(_raw).strip().lower()
+                except Exception:
+                    pass
+            _notify_mode = _notify_mode or "important"
+            if _notify_mode not in {"all", "important"}:
+                logger.warning(
+                    "Unknown telegram notifications mode '%s', "
+                    "defaulting to 'important' (valid: all, important)",
+                    _notify_mode,
+                )
+                _notify_mode = "important"
+            adapter._notifications_mode = _notify_mode
+            return adapter
+
         if platform == Platform.WHATSAPP_CLOUD:
             from gateway.platforms.whatsapp_cloud import (
                 WhatsAppCloudAdapter,
@@ -7681,8 +7716,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     self._enqueue_fifo(_quick_key, queued_event, adapter)
                 depth = self._queue_depth(_quick_key, adapter=self.adapters.get(source.platform))
                 if depth <= 1:
-                    return "Queued for the next turn."
-                return f"Queued for the next turn. ({depth} queued)"
+                    return "Message mis en file pour le prochain tour."
+                return f"Message mis en file pour le prochain tour. ({depth} en attente)"
 
             # /steer <prompt> — inject mid-run after the next tool call.
             # Unlike /queue (turn boundary), /steer lands BETWEEN tool-call
@@ -7812,6 +7847,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     return await self._handle_profile_command(event)
                 if _cmd_def_inner.name == "update":
                     return await self._handle_update_command(event)
+                if _cmd_def_inner.name == "updatecheck":
+                    return await self._handle_updatecheck_command(event)
                 if _cmd_def_inner.name == "version":
                     return await self._handle_version_command(event)
 
@@ -8212,6 +8249,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         if canonical == "update":
             return await self._handle_update_command(event)
+
+        if canonical == "updatecheck":
+            return await self._handle_updatecheck_command(event)
 
         if canonical == "version":
             return await self._handle_version_command(event)
@@ -16405,37 +16445,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     session_key, agent_holder[0], _exec_ref
                 ):
                     break
-                _elapsed_mins = int((time.time() - _notify_start) // 60)
-                # Include agent activity context if available. Default
-                # heartbeat is terse: elapsed + current tool. Verbose
-                # iteration counter is gated on busy_ack_detail so users
-                # who want it can opt in per platform.
+                _elapsed_seconds = max(0, int(time.time() - _notify_start))
                 _agent_ref = agent_holder[0]
-                _status_detail = ""
-                _want_iteration_detail = bool(
-                    resolve_display_setting(
-                        user_config,
-                        platform_key,
-                        "busy_ack_detail",
-                        True,
-                    )
-                )
+                _activity = None
+                _model_label = None
                 if _agent_ref and hasattr(_agent_ref, "get_activity_summary"):
                     try:
-                        _a = _agent_ref.get_activity_summary()
-                        _parts = []
-                        if _want_iteration_detail:
-                            _parts.append(
-                                f"iteration {_a['api_call_count']}/{_a['max_iterations']}"
-                            )
-                        _action = _a.get("current_tool") or _a.get("last_activity_desc")
-                        if _action:
-                            _parts.append(str(_action))
-                        if _parts:
-                            _status_detail = " — " + ", ".join(_parts)
+                        _activity = _agent_ref.get_activity_summary()
+                        _model_label = (
+                            getattr(_agent_ref, "model", None)
+                            or getattr(_agent_ref, "model_name", None)
+                            or getattr(_agent_ref, "_model", None)
+                        )
                     except Exception:
                         pass
-                _heartbeat_text = f"⏳ Working — {_elapsed_mins} min{_status_detail}"
+                _heartbeat_text = render_from_activity(
+                    elapsed_seconds=_elapsed_seconds,
+                    activity=_activity,
+                    model=_model_label,
+                )
                 try:
                     _notify_res = None
                     if _heartbeat_msg_id:
@@ -16610,25 +16638,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
                 # Construct a user-facing message with diagnostic context.
                 _diag_lines = [
-                    f"⏱️ Agent inactive for {_timeout_mins} min — no tool calls "
-                    f"or API responses."
+                    f"⏱️ Hermes est bloque depuis environ {_timeout_mins} min."
                 ]
                 if _cur_tool:
                     _diag_lines.append(
-                        f"The agent appears stuck on tool `{_cur_tool}` "
-                        f"({_secs_ago:.0f}s since last activity, "
-                        f"iteration {_iter_n}/{_iter_max})."
+                        f"Phase : Execution\n"
+                        f"Etat : l'action `{_cur_tool}` ne repond plus depuis {_secs_ago:.0f}s."
                     )
                 else:
                     _diag_lines.append(
-                        f"Last activity: {_last_desc} ({_secs_ago:.0f}s ago, "
-                        f"iteration {_iter_n}/{_iter_max}). "
-                        "The agent may have been waiting on an API response."
+                        f"Phase : Analyse\n"
+                        f"Etat : derniere activite il y a {_secs_ago:.0f}s. "
+                        "Le modele ou le provider ne repondait probablement plus."
                     )
                 _diag_lines.append(
-                    "To increase the limit, set agent.gateway_timeout in config.yaml "
-                    "(value in seconds, 0 = no limit) and restart the gateway.\n"
-                    "Try again, or use /reset to start fresh."
+                    "J'ai interrompu proprement la tache pour eviter un blocage long.\n"
+                    "Relance ton message, ou utilise /reset si tu veux repartir proprement."
                 )
 
                 response = {

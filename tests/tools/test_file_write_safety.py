@@ -52,6 +52,36 @@ class TestSafeWriteRoot:
         monkeypatch.setenv("HERMES_WRITE_SAFE_ROOT", str(safe_root))
         assert _is_write_denied(str(outside)) is True
 
+    def test_writes_inside_any_multi_safe_root_are_allowed(self, tmp_path: Path, monkeypatch):
+        hermes_root = tmp_path / ".hermes"
+        cockpit_root = tmp_path / "repo-cockpit"
+        inside_hermes = hermes_root / "reports" / "status.json"
+        inside_cockpit = cockpit_root / "workspaces" / "repo" / "file.txt"
+        outside = tmp_path / "other" / "file.txt"
+        for path in (inside_hermes.parent, inside_cockpit.parent, outside.parent):
+            os.makedirs(path, exist_ok=True)
+
+        monkeypatch.setenv("HERMES_WRITE_SAFE_ROOTS", f"{hermes_root}:{cockpit_root}")
+        monkeypatch.delenv("HERMES_WRITE_SAFE_ROOT", raising=False)
+
+        assert _is_write_denied(str(inside_hermes)) is False
+        assert _is_write_denied(str(inside_cockpit)) is False
+        assert _is_write_denied(str(outside)) is True
+
+    def test_multi_safe_root_takes_precedence_over_single_root(self, tmp_path: Path, monkeypatch):
+        single_root = tmp_path / "single"
+        multi_root = tmp_path / "multi"
+        inside_single = single_root / "file.txt"
+        inside_multi = multi_root / "file.txt"
+        for path in (inside_single.parent, inside_multi.parent):
+            os.makedirs(path, exist_ok=True)
+
+        monkeypatch.setenv("HERMES_WRITE_SAFE_ROOT", str(single_root))
+        monkeypatch.setenv("HERMES_WRITE_SAFE_ROOTS", str(multi_root))
+
+        assert _is_write_denied(str(inside_multi)) is False
+        assert _is_write_denied(str(inside_single)) is True
+
     def test_safe_root_env_ignores_empty_value(self, tmp_path: Path, monkeypatch):
         target = tmp_path / "regular.txt"
         monkeypatch.setenv("HERMES_WRITE_SAFE_ROOT", "")
