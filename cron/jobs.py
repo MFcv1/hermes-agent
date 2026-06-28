@@ -9,6 +9,7 @@ import contextlib
 import copy
 import json
 import logging
+import shlex
 import shutil
 import tempfile
 import threading
@@ -181,6 +182,19 @@ def _normalize_skill_list(skill: Optional[str] = None, skills: Optional[Any] = N
         if text and text not in normalized:
             normalized.append(text)
     return normalized
+
+
+def _normalize_script_args(script_args: Optional[Any] = None) -> Optional[List[str]]:
+    """Normalize script argv fragments without introducing shell execution."""
+    if script_args is None:
+        return None
+    if isinstance(script_args, str):
+        raw_items = shlex.split(script_args)
+    else:
+        raw_items = list(script_args)
+
+    normalized = [str(item) for item in raw_items if str(item)]
+    return normalized or None
 
 
 def _apply_skill_fields(job: Dict[str, Any]) -> Dict[str, Any]:
@@ -768,6 +782,7 @@ def create_job(
     provider: Optional[str] = None,
     base_url: Optional[str] = None,
     script: Optional[str] = None,
+    script_args: Optional[Union[str, List[str]]] = None,
     context_from: Optional[Union[str, List[str]]] = None,
     enabled_toolsets: Optional[List[str]] = None,
     workdir: Optional[str] = None,
@@ -796,6 +811,9 @@ def create_job(
                 change-detection pattern). Paths resolve under
                 ~/.hermes/scripts/; ``.sh`` / ``.bash`` files run via bash,
                 anything else via Python.
+        script_args: Optional arguments passed to ``script`` as argv. Strings
+                are parsed with shell-like quoting, stored as a list, and never
+                executed through a shell.
         context_from: Optional job ID (or list of job IDs) whose most recent output
                       is injected into the prompt as context before each run.
                       Useful for chaining cron jobs: job A finds data, job B processes it.
@@ -846,6 +864,7 @@ def create_job(
     normalized_base_url = normalized_base_url or None
     normalized_script = str(script).strip() if isinstance(script, str) else None
     normalized_script = normalized_script or None
+    normalized_script_args = _normalize_script_args(script_args)
     normalized_toolsets = [str(t).strip() for t in enabled_toolsets if str(t).strip()] if enabled_toolsets else None
     normalized_toolsets = normalized_toolsets or None
     normalized_workdir = _normalize_workdir(workdir)
@@ -880,6 +899,7 @@ def create_job(
         "provider": normalized_provider,
         "base_url": normalized_base_url,
         "script": normalized_script,
+        "script_args": normalized_script_args,
         "no_agent": normalized_no_agent,
         "context_from": context_from,
         "schedule": parsed_schedule,
@@ -993,6 +1013,9 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
                     updates["workdir"] = None
                 else:
                     updates["workdir"] = _normalize_workdir(_wd)
+
+            if "script_args" in updates:
+                updates["script_args"] = _normalize_script_args(updates.get("script_args"))
 
             updated = _apply_skill_fields({**job, **updates})
             schedule_changed = "schedule" in updates

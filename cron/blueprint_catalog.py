@@ -24,7 +24,9 @@ slot named ``schedule`` that passes through verbatim.
 from __future__ import annotations
 
 import re
+import shutil
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 __all__ = [
@@ -37,6 +39,7 @@ __all__ = [
     "blueprint_deeplink",
     "blueprint_catalog_entry",
     "fill_blueprint",
+    "install_blueprint_script",
     "BlueprintFillError",
     "WEEKDAY_PRESETS",
 ]
@@ -97,6 +100,7 @@ class AutomationBlueprint:
     deliver_default: str = "origin"
     skills: tuple = ()        # skills the job loads before running
     script_template: Optional[str] = None
+    script_args_template: tuple = ()
     no_agent: bool = False
     tags: tuple = ()
 
@@ -224,6 +228,73 @@ CATALOG: List[AutomationBlueprint] = [
         script_template="weekly_updatecheck.py",
         no_agent=True,
         tags=("ops", "updates", "vps"),
+    ),
+    AutomationBlueprint(
+        key="github-release-watch",
+        title="GitHub release watcher",
+        description="Watch a GitHub repository for new releases and notify only "
+        "when something new appears.",
+        category="ops",
+        schedule_template="0 */{interval_hours} * * *",
+        prompt_template=(
+            "Watch GitHub releases for {repo}. This no-agent watcher stays "
+            "silent on unchanged runs and emits a concise release alert when "
+            "a new release appears."
+        ),
+        slots=[
+            BlueprintSlot(
+                name="repo", type="text", label="GitHub repo",
+                default="NousResearch/hermes-agent",
+                help="owner/name, e.g. NousResearch/hermes-agent",
+            ),
+            BlueprintSlot(
+                name="interval_hours", type="enum", label="How often?",
+                default="6", options=("1", "3", "6", "12", "24"),
+                help="hours between checks",
+            ),
+            BlueprintSlot(
+                name="include_prereleases", type="enum",
+                label="Include prereleases?",
+                default="false", options=("false", "true"),
+            ),
+            BlueprintSlot(
+                name="max_items", type="enum", label="Max alerts per run?",
+                default="5", options=("1", "3", "5", "10"),
+            ),
+            _DELIVER,
+        ],
+        script_template="github_release_watch.py",
+        script_args_template=(
+            "--repo", "{repo}",
+            "--include-prereleases", "{include_prereleases}",
+            "--max", "{max_items}",
+        ),
+        no_agent=True,
+        tags=("ops", "github", "releases", "watcher"),
+    ),
+    AutomationBlueprint(
+        key="vps-healthcheck",
+        title="VPS healthcheck",
+        description="Watch Hermes VPS basics and notify only when storage, cron, "
+        "or services need attention.",
+        category="ops",
+        schedule_template="0 */{interval_hours} * * *",
+        prompt_template=(
+            "Check Hermes VPS health. This no-agent watcher stays silent when "
+            "the VPS is green and emits a compact status report on warning or "
+            "error."
+        ),
+        slots=[
+            BlueprintSlot(
+                name="interval_hours", type="enum", label="How often?",
+                default="6", options=("1", "3", "6", "12", "24"),
+                help="hours between checks",
+            ),
+            _DELIVER,
+        ],
+        script_template="vps_healthcheck.py",
+        no_agent=True,
+        tags=("ops", "vps", "healthcheck", "watcher"),
     ),
     AutomationBlueprint(
         key="workday-start",
@@ -749,6 +820,13 @@ def fill_blueprint(
             spec["script"] = blueprint.script_template.format(**resolved)
         except KeyError as e:
             raise BlueprintFillError(f"blueprint script missing value for {e}") from e
+    if blueprint.script_args_template:
+        try:
+            spec["script_args"] = [
+                str(part).format(**resolved) for part in blueprint.script_args_template
+            ]
+        except KeyError as e:
+            raise BlueprintFillError(f"blueprint script args missing value for {e}") from e
     if blueprint.no_agent:
         spec["no_agent"] = True
     if blueprint.skills:
@@ -756,3 +834,33 @@ def fill_blueprint(
     if origin is not None:
         spec["origin"] = origin
     return spec
+
+
+def install_blueprint_script(spec: Dict[str, Any]) -> Optional[str]:
+    """Copy a bundled blueprint script into ``HERMES_HOME/scripts``.
+
+    ``fill_blueprint`` stays side-effect free. Creation surfaces call this
+    helper immediately before ``create_job`` so script-backed blueprints are
+    runnable when the scheduler later resolves relative paths under
+    ``HERMES_HOME/scripts``. Only bundled filenames from ``cron/scripts`` are
+    installable; arbitrary paths are rejected.
+    """
+    script = str(spec.get("script") or "").strip()
+    if not script:
+        return None
+
+    script_name = Path(script).name
+    if script_name != script:
+        raise BlueprintFillError(f"blueprint script must be a bundled filename: {script!r}")
+
+    source = Path(__file__).resolve().parent / "scripts" / script_name
+    if not source.is_file():
+        raise BlueprintFillError(f"bundled blueprint script not found: {script_name}")
+
+    from hermes_constants import get_hermes_home
+
+    scripts_dir = get_hermes_home() / "scripts"
+    scripts_dir.mkdir(parents=True, exist_ok=True)
+    dest = scripts_dir / script_name
+    shutil.copy2(source, dest)
+    return str(dest)

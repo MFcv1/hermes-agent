@@ -197,6 +197,19 @@ class TestRunJobScript:
         parsed = json.loads(output)
         assert parsed["new_prs"][0]["number"] == 42
 
+    def test_script_args_passed_as_argv(self, cron_env):
+        from cron.scheduler import _run_job_script
+
+        script = cron_env / "scripts" / "argv.py"
+        script.write_text(
+            "import sys\n"
+            "print('|'.join(sys.argv[1:]))\n"
+        )
+
+        success, output = _run_job_script("argv.py", ["--repo", "owner/name", "--max", "5"])
+        assert success is True
+        assert output == "--repo|owner/name|--max|5"
+
 
 class TestBuildJobPromptWithScript:
     """Test that script output is injected into the prompt."""

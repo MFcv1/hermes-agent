@@ -5,6 +5,9 @@ Audience: next Codex/Hermes implementation chat.
 Goal: implement concrete roadmap features step by step. For each step: code,
 test, validate, update this file, then move to the next step.
 
+Companion learnings/feature handoff:
+`docs/HERMES_FEATURES_AND_LEARNINGS_2026-06-27.md`.
+
 ## Operating Rules
 
 - Keep this file updated as the source of truth.
@@ -77,7 +80,7 @@ Evidence:
 
 ```bash
 venv/bin/python -m pytest tests/gateway/test_telegram_conv_ux.py -q
-# 2 passed
+# 5 passed
 ```
 
 ### 4. Telegram Rich Messages/Table Renderer Gated Rollout
@@ -99,14 +102,26 @@ venv/bin/python -m pytest tests/gateway/test_telegram_rich_messages.py -q
 
 ### 5. Background/Subagent Audit Feature For Repo Cockpit
 
-Status: todo.
+Status: done locally.
 
-Next slice:
+Implemented:
 
-- Reuse existing `/background` or `delegate_task(background=true)` mechanisms.
-- Do not add a new core model tool.
-- Return task id, repo, phase, heartbeat/progress, and status/resume
-  instructions.
+- Added Telegram `/audit` and `/auditer` Repo Cockpit commands.
+- The command reuses the existing Repo Cockpit task/worker API and does not add
+  a new core model tool.
+- It creates a bounded read-only audit task from the active `/conv` thread,
+  immediately returns job id, task id, repo, mode, phase, and `/status` /
+  `/runs` follow-up commands.
+- The background worker is invoked with `execute: false`; the message contract
+  explicitly says dry-run and forbids repo mutation, deployment, service
+  restart, or destructive actions.
+
+Evidence:
+
+```bash
+venv/bin/python -m pytest tests/gateway/test_telegram_conv_ux.py -q
+# 5 passed
+```
 
 ### 6. Concurrent Approval Multi-Session Stress Proof
 
@@ -150,22 +165,182 @@ venv/bin/python -m pytest \
 
 ### 8. Skill Curator Dry-Run Safety
 
-Status: todo.
+Status: done locally.
 
-Next slice:
+Implemented:
 
-- Run only against a temp `HERMES_HOME`.
-- Prove pinned/user skills are not deleted.
-- Do not run production curator mutation on VPS.
+- Hardened the existing prune dry-run contract: old unpinned skills appear in
+  the preview, pinned skills and recent skills are excluded, and `archive_skill`
+  is never called.
+- No production curator mutation was run on VPS.
+
+Evidence:
+
+```bash
+venv/bin/python -m pytest tests/hermes_cli/test_curator_archive_prune.py -q
+# 13 passed
+```
 
 ### 9. Weekly Updatecheck Activation Plan
 
-Status: todo.
+Status: done locally; real activation still pending user-provided Telegram
+target/cadence.
 
-Next slice:
+Implemented:
 
-- Keep `weekly-updatecheck` no-agent and unarmed until the user gives target
-  Telegram thread and cadence.
+- `weekly-updatecheck` remains a no-agent blueprint backed by
+  `cron/scripts/weekly_updatecheck.py`.
+- Script-backed blueprints now install their bundled script into
+  `HERMES_HOME/scripts/` at job creation time, so the future weekly job will be
+  runnable instead of pointing at a missing script.
+- The install path is used by `/blueprint`, dashboard blueprint instantiation,
+  and accepted cron suggestions.
+- No production cron job was created, resumed, or armed.
+
+Evidence:
+
+```bash
+venv/bin/python -m pytest tests/cron/test_blueprint_catalog.py tests/cron/test_cron_no_agent.py -q
+# 47 passed
+```
+
+### 10. GitHub Release Watcher Blueprint
+
+Status: implemented locally; production activation still pending explicit
+Telegram target/cadence/repo choice.
+
+Implemented:
+
+- Added `github-release-watch`, a no-agent Automation Blueprint for monitoring
+  GitHub releases without relying on X/Twitter or a permanent agent.
+- Added `cron/scripts/github_release_watch.py`, which polls GitHub releases,
+  stores a local watermark in `HERMES_HOME/watcher-state`, stays silent on the
+  first baseline and unchanged runs, and emits a concise Markdown alert only
+  when new releases appear.
+- Added generic `script_args` support in cron jobs, scheduler execution,
+  blueprint fills, and the `cronjob` tool so script-backed blueprints can be
+  parameterized safely without shell interpolation.
+- Did not create or arm a live cron job.
+
+Evidence:
+
+```bash
+venv/bin/python -m pytest -q \
+  tests/cron/test_cron_script.py \
+  tests/cron/test_cron_no_agent.py \
+  tests/cron/test_blueprint_catalog.py \
+  tests/cron/test_github_release_watch_script.py \
+  tests/tools/test_cronjob_tools.py
+# 156 passed
+```
+
+```bash
+venv/bin/python -m pytest \
+  tests/hermes_cli/test_web_server.py::TestNewEndpoints::test_cron_blueprints_list \
+  tests/hermes_cli/test_web_server.py::TestNewEndpoints::test_blueprint_instantiate_creates_job \
+  tests/hermes_cli/test_web_server.py::TestNewEndpoints::test_blueprint_instantiate_unknown_404 \
+  tests/hermes_cli/test_web_server.py::TestNewEndpoints::test_blueprint_instantiate_bad_value_422 -q
+# 4 passed
+```
+
+### 11. Simple Telegram Ops Commands
+
+Status: implemented locally; production watchers still require the user to run
+the command from the intended Telegram chat/topic.
+
+Implemented:
+
+- `/runs` was already present and remains the simple Repo Cockpit task/gates
+  view for the active task or an explicit `op_xxx`.
+- Added `/watch` Telegram shortcuts:
+  - `/watch releases owner/repo` creates a `github-release-watch` no-agent job.
+  - `/watch vps` creates a `vps-healthcheck` no-agent job.
+  - `/watch list` shows active release/VPS watcher jobs.
+  - `/watch remove job_id` removes one watcher.
+- Added `vps-healthcheck`, a no-agent Automation Blueprint backed by
+  `cron/scripts/vps_healthcheck.py`; it stays silent when the VPS is green and
+  reports only warning/error states.
+- Added `/vps`, a concise Telegram overview for disk, Hermes home disk, cron
+  heartbeat, enabled cron jobs, user services, and load.
+- Added a shorter Telegram `/updatecheck` path using
+  `format_updatecheck_short()` for update readiness: git status, update
+  availability, worktree dirtiness, disk, latest release, and blockers.
+- Did not create or arm a live production watcher in this implementation turn.
+
+Evidence:
+
+```bash
+venv/bin/python -m pytest -q \
+  tests/gateway/test_telegram_conv_ux.py \
+  tests/cron/test_blueprint_catalog.py \
+  tests/cron/test_github_release_watch_script.py \
+  tests/cron/test_vps_healthcheck_script.py \
+  tests/hermes_cli/test_vps_status.py \
+  tests/cron/test_cron_no_agent.py \
+  tests/cron/test_cron_script.py \
+  tests/tools/test_cronjob_tools.py \
+  tests/cron/test_cronjob_schema.py
+# 175 passed
+```
+
+```bash
+venv/bin/python -m py_compile \
+  gateway/platforms/telegram.py hermes_cli/commands.py hermes_cli/updatecheck.py \
+  hermes_cli/vps_status.py cron/blueprint_catalog.py \
+  cron/scripts/github_release_watch.py cron/scripts/vps_healthcheck.py \
+  tools/cronjob_tools.py
+# passed
+```
+
+### 12. Beginner Developer Cockpit / Noise Reduction
+
+Status: implemented locally.
+
+Implemented:
+
+- Added `/dev` as the simple Telegram entry point for a learning developer.
+  It groups the useful workflows instead of exposing every expert command:
+  project start/resume, GitHub branch/PR flow, audit/runs/approvals,
+  deploy/ops checks, and learning-oriented prompts.
+- Added `/dev` inline buttons:
+  - `Nouveau projet` -> existing `/new` repo/project flow.
+  - `Conversations` -> existing `/conv` thread list.
+  - `GitHub flow`, `Ops / deploy`, `Apprendre`, `Accueil` -> focused help
+    sections without leaving the chat.
+- Prioritized `/dev`, `/vps`, `/watch`, and `/updatecheck` in the Telegram
+  command menu so the beginner-friendly surface survives Telegram's visible
+  menu cap.
+- Routed legacy `/serveurstatut` to the simpler `/vps` path to reduce noisy
+  rich status output while preserving compatibility for old muscle memory.
+- Added `docs/HERMES_BOT_ACCESSIBILITY_AUDIT_2026-06-29.md`, a short audit of
+  the current beginner workflow, friction points, daily usage path, and
+  follow-up gaps.
+
+Evidence:
+
+```bash
+venv/bin/python -m pytest -q \
+  tests/gateway/test_telegram_conv_ux.py \
+  tests/hermes_cli/test_commands.py::TestTelegramMenuCommands::test_operational_builtins_survive_thirty_command_cap \
+  tests/cron/test_blueprint_catalog.py \
+  tests/cron/test_github_release_watch_script.py \
+  tests/cron/test_vps_healthcheck_script.py \
+  tests/hermes_cli/test_vps_status.py \
+  tests/cron/test_cron_no_agent.py \
+  tests/cron/test_cron_script.py \
+  tests/tools/test_cronjob_tools.py \
+  tests/cron/test_cronjob_schema.py
+# 179 passed
+```
+
+```bash
+venv/bin/python -m py_compile \
+  gateway/platforms/telegram.py hermes_cli/commands.py hermes_cli/updatecheck.py \
+  hermes_cli/vps_status.py cron/blueprint_catalog.py \
+  cron/scripts/github_release_watch.py cron/scripts/vps_healthcheck.py \
+  tools/cronjob_tools.py
+# passed
+```
 
 ## Combined Local Verification
 
@@ -181,23 +356,129 @@ venv/bin/python -m pytest \
   tests/gateway/test_telegram_conv_ux.py \
   tests/hermes_cli/test_backup.py::TestQuickSnapshot \
   tests/gateway/test_approve_deny_commands.py::TestBlockingGatewayApproval \
+  tests/hermes_cli/test_curator_archive_prune.py \
+  tests/cron/test_blueprint_catalog.py \
+  tests/cron/test_cron_no_agent.py \
+  tests/hermes_cli/test_web_server.py::TestNewEndpoints::test_cron_blueprints_list \
+  tests/hermes_cli/test_web_server.py::TestNewEndpoints::test_blueprint_instantiate_creates_job \
+  tests/hermes_cli/test_web_server.py::TestNewEndpoints::test_blueprint_instantiate_unknown_404 \
+  tests/hermes_cli/test_web_server.py::TestNewEndpoints::test_blueprint_instantiate_bad_value_422 \
+  tests/scripts/test_telegram_desktop_cua_smoke.py \
+  tests/scripts/test_vps_smoke_matrix.py \
+  tests/scripts/test_vps_maintenance_plan.py \
   tests/scripts/test_vps_write_roots_audit.py -q
-# 264 passed
+# 342 passed before ops skill addition; see Feature / Learning Handoff for current skill-inclusive run
 ```
 
 ```bash
 venv/bin/python -m py_compile \
-  gateway/run.py gateway/platforms/telegram.py hermes_cli/backup.py tools/approval.py
+  gateway/run.py gateway/platforms/telegram.py hermes_cli/backup.py hermes_cli/curator.py \
+  cron/blueprint_catalog.py hermes_cli/blueprint_cmd.py hermes_cli/web_server.py \
+  cron/suggestions.py scripts/telegram_desktop_cua_smoke.py scripts/vps_smoke_matrix.py \
+  tools/approval.py
 # passed
 ```
 
 ## CUA Validation Status
 
-Pending. `scripts/telegram_desktop_cua_smoke.py` was not present in this
-checkout during this implementation pass, so no Telegram Desktop CUA live smoke
-was run.
+Harness ready; live operator smoke still pending.
+
+Implemented:
+
+- Added `scripts/telegram_desktop_cua_smoke.py`, the script already referenced
+  by `scripts/vps_smoke_matrix.py` and `scripts/vps_maintenance_plan.py`.
+- Default mode is safe dry-run: target Telegram Desktop via CUA, capture
+  evidence under `~/.hermes/telegram-gui-smoke/`, and do not type/send.
+- `--send` explicitly types the requested `--message` or `--command` and presses
+  Return; this assumes the operator already opened the intended Telegram chat.
+
+Evidence:
+
+```bash
+venv/bin/python -m pytest \
+  tests/scripts/test_telegram_desktop_cua_smoke.py \
+  tests/scripts/test_vps_smoke_matrix.py \
+  tests/scripts/test_vps_maintenance_plan.py -q
+# 11 passed
+```
+
+```bash
+venv/bin/python scripts/telegram_desktop_cua_smoke.py --help
+# passed
+```
+
+Not run live: no operator-approved Telegram Desktop send/capture smoke was
+executed in this turn.
+
+Latest dry-run attempt:
+
+```bash
+venv/bin/python scripts/telegram_desktop_cua_smoke.py \
+  --message 'smoke roadmap dry-run: reponds juste OK smoke' --json
+# status: telegram_window_not_on_current_space
+```
+
+CUA sees Telegram running and a `Herme_core` window, but marks the Telegram
+window as `is_on_screen=false`. The operator must bring Telegram Desktop onto
+the current visible space/chat before the live CUA smoke can proceed.
+
+## Feature / Learning Handoff
+
+Status: done locally.
+
+Created `docs/HERMES_FEATURES_AND_LEARNINGS_2026-06-27.md` and
+`skills/software-development/hermes-vps-repo-cockpit-ops/SKILL.md` with:
+
+- implemented feature inventory;
+- implementation learnings and design decisions;
+- explicit non-actions;
+- remaining live CUA and weekly-updatecheck activation steps;
+- verification command snapshot.
+- a durable in-repo skill for Hermes VPS / Repo Cockpit runbooks.
+
+Evidence:
+
+```bash
+venv/bin/python -m pytest \
+  tests/scripts/test_build_skills_index_health.py \
+  tests/website/test_extract_skills.py \
+  tests/website/test_generate_skill_docs.py -q
+# 22 passed
+```
+
+Current skill-inclusive roadmap run:
+
+```bash
+venv/bin/python -m pytest \
+  tests/gateway/test_gateway_noise_suppression.py \
+  tests/gateway/test_human_heartbeat.py \
+  tests/gateway/test_busy_session_ack.py \
+  tests/gateway/test_telegram_format.py \
+  tests/gateway/test_telegram_rich_messages.py \
+  tests/gateway/test_telegram_status_update.py \
+  tests/gateway/test_telegram_progress_edit_transient.py \
+  tests/gateway/test_telegram_conv_ux.py \
+  tests/hermes_cli/test_backup.py::TestQuickSnapshot \
+  tests/gateway/test_approve_deny_commands.py::TestBlockingGatewayApproval \
+  tests/hermes_cli/test_curator_archive_prune.py \
+  tests/cron/test_blueprint_catalog.py \
+  tests/cron/test_cron_no_agent.py \
+  tests/hermes_cli/test_web_server.py::TestNewEndpoints::test_cron_blueprints_list \
+  tests/hermes_cli/test_web_server.py::TestNewEndpoints::test_blueprint_instantiate_creates_job \
+  tests/hermes_cli/test_web_server.py::TestNewEndpoints::test_blueprint_instantiate_unknown_404 \
+  tests/hermes_cli/test_web_server.py::TestNewEndpoints::test_blueprint_instantiate_bad_value_422 \
+  tests/scripts/test_telegram_desktop_cua_smoke.py \
+  tests/scripts/test_vps_smoke_matrix.py \
+  tests/scripts/test_vps_maintenance_plan.py \
+  tests/scripts/test_vps_write_roots_audit.py \
+  tests/scripts/test_build_skills_index_health.py \
+  tests/website/test_extract_skills.py \
+  tests/website/test_generate_skill_docs.py -q
+# 364 passed
+```
 
 ## Update Log
 
-- 2026-06-27: Implemented local phases 1, 2, 3, 6, and 7. Added roadmap
+- 2026-06-27: Implemented local phases 1, 2, 3, 5, 6, 7, 8, and 9. Added roadmap
   evidence after discovering the referenced roadmap file was absent on disk.
+- 2026-06-27: Added explicit feature/learning handoff document.

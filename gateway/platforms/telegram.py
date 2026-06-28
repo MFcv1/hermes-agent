@@ -16,6 +16,7 @@ import os
 import tempfile
 import html as _html
 import re
+import shlex
 import subprocess
 import time
 import urllib.parse
@@ -510,6 +511,7 @@ class TelegramAdapter(BasePlatformAdapter):
         # Repo Cockpit new-chat repo choices per Telegram user. Callback data is
         # capped by Telegram, so buttons carry short indexes into this map.
         self._repo_new_chat_choices: Dict[str, dict] = {}
+        self._cockpit_background_tasks: set[asyncio.Task] = set()
         # Approval button state: message_id → session_key
         self._approval_state: Dict[int, str] = {}
         # Slash-confirm button state: confirm_id → session_key (for /reload-mcp
@@ -4074,6 +4076,21 @@ class TelegramAdapter(BasePlatformAdapter):
             await self._handle_autonomy_callback(query, data)
             return
 
+        # --- Simple developer cockpit callbacks (dev:section) ---
+        if data.startswith("dev:"):
+            caller_id = str(getattr(query.from_user, "id", ""))
+            if not self._is_callback_user_authorized(
+                caller_id,
+                chat_id=query_chat_id,
+                chat_type=str(query_chat_type) if query_chat_type is not None else None,
+                thread_id=str(query_thread_id) if query_thread_id is not None else None,
+                user_name=query_user_name,
+            ):
+                await query.answer(text="⛔ Tu n'es pas autorisé à utiliser ce bouton.")
+                return
+            await self._handle_dev_callback(query, data)
+            return
+
         # --- Model picker callbacks ---
         if data.startswith(("mp:", "mpg:", "mm:", "mc:", "mb", "mx", "mg:")):
             chat_id = str(query.message.chat_id) if query.message else None
@@ -6551,6 +6568,119 @@ class TelegramAdapter(BasePlatformAdapter):
         lines.append(f"Resume : <code>{_html.escape(data.get('resume_md_path',''))}</code>")
         await self._send_cockpit_text(msg, "\n".join(lines))
 
+    def _audit_task_text(self, active: dict, args: str = "") -> str:
+        repo = str(active.get("repo") or "repo actif").strip() or "repo actif"
+        thread_id = str(active.get("thread_id") or "").strip()
+        user_focus = (args or "").strip()
+        focus_line = f"\nFocus utilisateur : {user_focus}" if user_focus else ""
+        return (
+            f"Audit borné Repo Cockpit pour {repo}.\n"
+            "Objectif : inspecter l'état courant sans modifier le repo, identifier "
+            "les risques principaux, les tests/smokes utiles, et la prochaine "
+            "action sûre.\n"
+            f"Thread actif : {thread_id or 'inconnu'}."
+            f"{focus_line}\n"
+            "Contraintes : pas de déploiement, pas de restart service, pas de "
+            "mutation destructive. Produire un résumé court avec statut, phase, "
+            "preuves consultées et suite recommandée."
+        )
+
+    def _format_audit_started(self, *, job_id: str, task: dict, active: dict) -> str:
+        task_id = str(task.get("id") or "")
+        repo = str(task.get("repo") or active.get("repo") or "")
+        phase = str(task.get("current_phase") or task.get("status") or "queued_plan")
+        mode = str(task.get("mode") or active.get("thread_mode") or active.get("project_mode") or "ask_review")
+        lines = [
+            "<b>🔎 Audit Repo Cockpit lancé</b>",
+            "",
+            f"Job : <code>{_html.escape(job_id)}</code>",
+            f"Tâche : <code>{_html.escape(task_id)}</code>",
+            f"Repo : <code>{_html.escape(repo)}</code>",
+            f"Mode : <b>{_html.escape(self._mode_title(mode))}</b>",
+            f"Phase : <code>{_html.escape(phase)}</code>",
+            "",
+            "Je lance le worker en arrière-plan en dry-run. Le chat reste disponible.",
+            f"Suivi : <code>/status {_html.escape(task_id)}</code> · <code>/runs {_html.escape(task_id)}</code>",
+        ]
+        return "\n".join(lines)
+
+    async def _send_audit_command(self, msg: Message, args: str = "") -> None:
+        user_id, data, active = await self._get_active_cockpit_thread(msg)
+        if not data or not data.get("ok"):
+            return await self._send_cockpit_text(
+                msg,
+                "<b>🔎 Audit Repo Cockpit</b>\n\nImpossible de lire le thread actif : <code>"
+                + _html.escape(str((data or {}).get("description") or data))[:800]
+                + "</code>",
+                role="preview",
+            )
+        if not active:
+            return await self._send_cockpit_text(
+                msg,
+                "<b>🔎 Audit Repo Cockpit</b>\n\nAucun thread actif. Lance <code>/conv</code> puis choisis un repo.",
+                role="preview",
+            )
+
+        payload = {
+            "telegram_user_id": user_id,
+            "chat_id": str(getattr(msg, "chat_id", "")),
+            "task": self._audit_task_text(active, args),
+            "source": "telegram_audit_command",
+        }
+        task = await asyncio.to_thread(self._cockpit_api_sync, "POST", "/api/internal/tasks/from-thread", payload, 30)
+        if not task or not task.get("ok"):
+            return await self._send_cockpit_text(
+                msg,
+                "<b>🔎 Audit non lancé</b>\n\n<code>"
+                + _html.escape(str((task or {}).get("description") or task))[:900]
+                + "</code>",
+                role="preview",
+            )
+
+        job_id = f"audit_{datetime.now().strftime('%H%M%S')}_{os.urandom(2).hex()}"
+        await self._send_cockpit_text(
+            msg,
+            self._format_audit_started(job_id=job_id, task=task, active=active),
+            role="progress",
+        )
+
+        task_id = str(task.get("id") or "")
+        worker_task = asyncio.create_task(self._run_cockpit_audit_background(msg, task_id, job_id))
+        self._cockpit_background_tasks.add(worker_task)
+        worker_task.add_done_callback(self._cockpit_background_tasks.discard)
+
+    async def _run_cockpit_audit_background(self, msg: Message, task_id: str, job_id: str) -> None:
+        try:
+            worker = await asyncio.to_thread(
+                self._cockpit_api_sync,
+                "POST",
+                "/api/worker/run-once",
+                {"status": "queued_plan", "execute": False},
+                1800,
+            )
+            worker = worker or {}
+            worker_result = worker.get("result") if isinstance(worker.get("result"), dict) else {}
+            status = str(worker.get("status") or worker_result.get("status") or "done")
+            lines = [
+                "<b>🔎 Audit Repo Cockpit terminé</b>",
+                "",
+                f"Job : <code>{_html.escape(job_id)}</code>",
+                f"Tâche : <code>{_html.escape(task_id)}</code>",
+                f"Worker : <code>{_html.escape(status)}</code>",
+                "",
+                f"Suivi : <code>/status {_html.escape(task_id)}</code> · <code>/runs {_html.escape(task_id)}</code>",
+            ]
+            await self._send_cockpit_text(msg, "\n".join(lines), role="progress")
+        except Exception as exc:
+            await self._send_cockpit_text(
+                msg,
+                "<b>🔎 Audit Repo Cockpit bloqué</b>\n\n"
+                f"Job : <code>{_html.escape(job_id)}</code>\n"
+                f"Tâche : <code>{_html.escape(task_id)}</code>\n\n"
+                "<code>" + _html.escape(str(exc))[:1000] + "</code>",
+                role="progress",
+            )
+
     async def _resolve_status_task_id(self, msg: Message, args: str = "") -> tuple[str | None, str | None]:
         raw = (args or "").strip()
         if raw:
@@ -6789,6 +6919,275 @@ class TelegramAdapter(BasePlatformAdapter):
         if not data or not data.get("ok"):
             return await self._send_cockpit_text(msg, "<b>🧪 Runs / gates</b>\n\nImpossible : <code>" + _html.escape(str((data or {}).get("description") or data))[:1000] + "</code>", role="preview")
         await self._send_cockpit_panel(msg, self._format_runs_status(data), self._autonomy_keyboard(data, "runs"), role="progress")
+
+    def _dev_menu_text(self, section: str = "home") -> str:
+        if section == "github":
+            return (
+                "<b>🧑‍💻 GitHub sans friction</b>\n\n"
+                "<code>/new</code> : choisir un repo GitHub ou créer un nouveau projet.\n"
+                "Ensuite tu écris normalement : “corrige ce bug”, “ajoute cette page”, "
+                "“crée une branche et ouvre une PR”.\n\n"
+                "<code>/task ...</code> : lance un travail suivi sur le repo sélectionné.\n"
+                "<code>/runs</code> : montre où en est ce travail : tests, erreurs, blocage, deploy.\n"
+                "<code>/audit</code> : inspecte le repo ou la PR sans modifier le code.\n"
+                "<code>/prs</code> : liste les PR à relire ou merger.\n\n"
+                "Exemple : <code>/task crée une branche, corrige le bug de login, lance les tests, ouvre une PR et explique-moi le diff</code>"
+            )
+        if section == "ops":
+            return (
+                "<b>🛠️ Déploiement / maintenance</b>\n\n"
+                "<code>/vps</code> : état rapide du VPS.\n"
+                "<code>/updatecheck</code> : peut-on mettre Hermes à jour ?\n"
+                "<code>/watch vps</code> : alerte seulement si le VPS se dégrade.\n"
+                "<code>/watch releases owner/repo</code> : alerte nouvelle release.\n"
+                "<code>/watch list</code> : watchers actifs.\n\n"
+                "Règle simple : check d'abord, déploie ensuite. Pas de mutation automatique sans approbation."
+            )
+        if section == "learn":
+            return (
+                "<b>📚 Mode apprentissage</b>\n\n"
+                "Tu peux parler normalement : “explique-moi ce fichier”, “pourquoi ce test fail”, "
+                "“fais-moi un plan avant de modifier”, “résume-moi la PR”.\n\n"
+                "Commandes utiles : <code>/dev</code>, <code>/chat</code>, <code>/runs</code>, "
+                "<code>/audit</code>, <code>/clean</code>.\n\n"
+                "Objectif : comprendre ce que fait Hermes, pas subir une boîte noire."
+            )
+        return (
+            "<b>🧑‍💻 Dev cockpit simple</b>\n\n"
+            "<b>Créer / reprendre</b>\n"
+            "• <code>/new</code> : choisir un repo ou créer un projet.\n"
+            "• <code>/conv</code> : reprendre une conversation projet.\n\n"
+            "<b>Coder avec GitHub</b>\n"
+            "• <code>/new</code> sélectionne le repo GitHub.\n"
+            "• Message normal : petite question ou petite modif.\n"
+            "• <code>/task ...</code> : gros travail suivi, branche, tests, PR.\n"
+            "• <code>/runs</code> : statut du travail en cours.\n"
+            "• <code>/audit</code> : analyse repo/PR sans toucher au code.\n\n"
+            "<b>Ops utiles</b>\n"
+            "• <code>/vps</code>, <code>/updatecheck</code>, <code>/watch</code>.\n\n"
+            "Si tu es perdu : lance <code>/dev</code>, puis choisis un bouton."
+        )
+
+    def _dev_menu_keyboard(self) -> InlineKeyboardMarkup:
+        return InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("Nouveau projet", callback_data="rcn:mode:ask_review"),
+                InlineKeyboardButton("Conversations", callback_data="rct:list:all"),
+            ],
+            [
+                InlineKeyboardButton("GitHub flow", callback_data="dev:github"),
+                InlineKeyboardButton("Ops / deploy", callback_data="dev:ops"),
+            ],
+            [
+                InlineKeyboardButton("Apprendre", callback_data="dev:learn"),
+                InlineKeyboardButton("Accueil", callback_data="dev:home"),
+            ],
+        ])
+
+    async def _send_dev_command(self, msg: Message, args: str = "") -> None:
+        section = (args or "home").strip().lower()
+        if section not in {"home", "github", "ops", "learn"}:
+            section = "home"
+        await self._send_cockpit_panel(
+            msg,
+            self._dev_menu_text(section),
+            self._dev_menu_keyboard(),
+            role="preview",
+        )
+
+    async def _handle_dev_callback(self, query, data: str) -> None:
+        section = data.split(":", 1)[1] if ":" in data else "home"
+        if section not in {"home", "github", "ops", "learn"}:
+            section = "home"
+        await query.answer(text="Menu dev")
+        try:
+            await query.edit_message_text(
+                self._dev_menu_text(section),
+                parse_mode=ParseMode.HTML,
+                reply_markup=self._dev_menu_keyboard(),
+                disable_web_page_preview=True,
+            )
+        except Exception:
+            pass
+
+    def _telegram_origin(self, msg: Message) -> dict:
+        thread_id = getattr(msg, "message_thread_id", None)
+        return {
+            "platform": "telegram",
+            "chat_id": str(getattr(msg, "chat_id", "")),
+            "chat_name": str(getattr(getattr(msg, "chat", None), "title", "") or ""),
+            "thread_id": str(thread_id) if thread_id is not None else None,
+        }
+
+    def _watch_job_kind(self, job: dict) -> str | None:
+        script = str(job.get("script") or "")
+        if script == "github_release_watch.py":
+            return "releases"
+        if script == "vps_healthcheck.py":
+            return "vps"
+        return None
+
+    def _watch_repo_from_job(self, job: dict) -> str:
+        args = [str(item) for item in (job.get("script_args") or [])]
+        for index, item in enumerate(args):
+            if item == "--repo" and index + 1 < len(args):
+                return args[index + 1]
+        return ""
+
+    def _format_watch_jobs(self, jobs: list[dict]) -> str:
+        lines = ["<b>👀 Watchers</b>", ""]
+        watch_jobs = [job for job in jobs if self._watch_job_kind(job)]
+        if not watch_jobs:
+            lines.extend([
+                "Aucun watcher actif.",
+                "",
+                "Créer : <code>/watch releases owner/repo</code>",
+                "VPS : <code>/watch vps</code>",
+            ])
+            return "\n".join(lines)
+
+        for job in watch_jobs:
+            kind = self._watch_job_kind(job) or "watch"
+            repo = self._watch_repo_from_job(job)
+            label = repo if repo else kind
+            lines.append(
+                f"• <code>{_html.escape(str(job.get('id') or ''))}</code> · "
+                f"<b>{_html.escape(kind)}</b> · {_html.escape(label)} · "
+                f"<code>{_html.escape(str(job.get('schedule_display') or '?'))}</code>"
+            )
+        lines.extend([
+            "",
+            "Retirer : <code>/watch remove job_id</code>",
+        ])
+        return "\n".join(lines)
+
+    async def _send_watch_command(self, msg: Message, args: str = "") -> None:
+        try:
+            tokens = shlex.split(args or "")
+        except ValueError:
+            tokens = (args or "").split()
+        verb = (tokens[0].lower() if tokens else "help")
+
+        if verb in {"help", ""}:
+            return await self._send_cockpit_text(
+                msg,
+                "<b>👀 Watchers simples</b>\n\n"
+                "Releases : <code>/watch releases owner/repo</code>\n"
+                "VPS : <code>/watch vps</code>\n"
+                "Liste : <code>/watch list</code>\n"
+                "Retirer : <code>/watch remove job_id</code>",
+                role="preview",
+            )
+
+        if verb in {"list", "ls"}:
+            from cron.jobs import list_jobs
+
+            jobs = await asyncio.to_thread(list_jobs, True)
+            return await self._send_cockpit_text(msg, self._format_watch_jobs(jobs), role="preview")
+
+        if verb in {"remove", "rm", "delete"}:
+            target = tokens[1] if len(tokens) > 1 else ""
+            if not target:
+                return await self._send_cockpit_text(msg, "Usage : <code>/watch remove job_id</code>", role="preview")
+            from cron.jobs import list_jobs, remove_job
+
+            jobs = await asyncio.to_thread(list_jobs, True)
+            matches = [
+                job for job in jobs
+                if str(job.get("id") or "") == target
+                or self._watch_repo_from_job(job).lower() == target.lower()
+            ]
+            matches = [job for job in matches if self._watch_job_kind(job)]
+            if not matches:
+                return await self._send_cockpit_text(
+                    msg,
+                    "Watcher introuvable. Fais <code>/watch list</code> pour voir les IDs.",
+                    role="preview",
+                )
+            if len(matches) > 1:
+                return await self._send_cockpit_text(
+                    msg,
+                    "Plusieurs watchers correspondent. Retire par ID :\n"
+                    + "\n".join(f"<code>{_html.escape(str(job.get('id')))}</code>" for job in matches),
+                    role="preview",
+                )
+            job = matches[0]
+            ok = await asyncio.to_thread(remove_job, str(job.get("id")))
+            title = "Watcher retiré" if ok else "Suppression impossible"
+            return await self._send_cockpit_text(
+                msg,
+                f"<b>{_html.escape(title)}</b>\n\n<code>{_html.escape(str(job.get('id') or ''))}</code>",
+                role="preview",
+            )
+
+        if verb in {"release", "releases", "github"}:
+            repo = tokens[1] if len(tokens) > 1 else ""
+            if "/" not in repo.strip("/"):
+                return await self._send_cockpit_text(
+                    msg,
+                    "Usage : <code>/watch releases owner/repo</code>",
+                    role="preview",
+                )
+            interval = "6"
+            include_prereleases = "false"
+            for token in tokens[2:]:
+                lower = token.lower()
+                if lower in {"1", "3", "6", "12", "24"}:
+                    interval = lower
+                elif lower in {"prerelease", "prereleases", "--prerelease", "--prereleases"}:
+                    include_prereleases = "true"
+            from hermes_cli.blueprint_cmd import handle_blueprint_command
+
+            result = await asyncio.to_thread(
+                handle_blueprint_command,
+                (
+                    f"github-release-watch repo={shlex.quote(repo.strip('/'))} "
+                    f"interval_hours={interval} include_prereleases={include_prereleases} "
+                    "max_items=5 deliver=origin"
+                ),
+                origin=self._telegram_origin(msg),
+                surface="gateway",
+            )
+            return await self._send_cockpit_text(msg, _html.escape(result.text), role="preview")
+
+        if verb in {"vps", "health", "healthcheck"}:
+            interval = tokens[1] if len(tokens) > 1 and tokens[1] in {"1", "3", "6", "12", "24"} else "6"
+            from hermes_cli.blueprint_cmd import handle_blueprint_command
+
+            result = await asyncio.to_thread(
+                handle_blueprint_command,
+                f"vps-healthcheck interval_hours={interval} deliver=origin",
+                origin=self._telegram_origin(msg),
+                surface="gateway",
+            )
+            return await self._send_cockpit_text(msg, _html.escape(result.text), role="preview")
+
+        return await self._send_cockpit_text(
+            msg,
+            "Commande inconnue. Essaie <code>/watch releases owner/repo</code>, <code>/watch vps</code> ou <code>/watch list</code>.",
+            role="preview",
+        )
+
+    async def _send_vps_command(self, msg: Message) -> None:
+        from hermes_cli.vps_status import collect_vps_overview, format_vps_overview_html
+
+        report = await asyncio.to_thread(collect_vps_overview)
+        await self._send_cockpit_text(msg, format_vps_overview_html(report), role="preview")
+
+    async def _send_updatecheck_command(self, msg: Message, args: str = "") -> None:
+        cached = "--cached" in (args or "")
+        timeout = 12 if "--slow" not in (args or "") else 25
+        from hermes_cli.updatecheck import collect_updatecheck, format_updatecheck_short
+        from hermes_constants import get_hermes_home
+
+        report = await asyncio.to_thread(
+            collect_updatecheck,
+            hermes_home=get_hermes_home(),
+            fresh=not cached,
+            fetch_timeout=timeout,
+        )
+        text = "<pre><code>" + _html.escape(format_updatecheck_short(report)) + "</code></pre>"
+        await self._send_cockpit_text(msg, text, role="preview")
 
     async def _handle_autonomy_callback(self, query, data: str) -> None:
         if data == "rca:prs":
@@ -7757,6 +8156,9 @@ class TelegramAdapter(BasePlatformAdapter):
         if command_token in {"/new", "/newchat"}:
             await self._send_new_command(msg, command_args)
             return
+        if command_token == "/dev":
+            await self._send_dev_command(msg, command_args)
+            return
         if command_token in {"/chat", "/current"}:
             await self._send_chat_status_command(msg)
             return
@@ -7776,13 +8178,25 @@ class TelegramAdapter(BasePlatformAdapter):
             await self._send_repo_cockpit_shortcut(msg)
             return
         if command_token == "/serveurstatut":
-            await self._send_serveurstatut(msg)
+            await self._send_vps_command(msg)
+            return
+        if command_token in {"/vps", "/vpsstatus", "/serverstatus"}:
+            await self._send_vps_command(msg)
+            return
+        if command_token == "/watch":
+            await self._send_watch_command(msg, command_args)
+            return
+        if command_token in {"/updatecheck", "/update-check"}:
+            await self._send_updatecheck_command(msg, command_args)
             return
         if command_token == "/tasks":
             await self._send_tasks_command(msg, command_args)
             return
         if command_token in {"/prs", "/pulls", "/pr"}:
             await self._send_pending_prs_command(msg, command_args)
+            return
+        if command_token in {"/audit", "/auditer"}:
+            await self._send_audit_command(msg, command_args)
             return
         if command_token == "/task":
             await self._send_task_command(msg, command_args)

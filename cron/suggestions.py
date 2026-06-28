@@ -229,12 +229,14 @@ def accept_suggestion(ref: str, *, origin: Optional[Dict[str, Any]] = None) -> O
     if not s or s.get("status") != _STATUS_PENDING:
         return None
 
+    from cron.blueprint_catalog import install_blueprint_script
     from cron.jobs import create_job
 
     spec = dict(s.get("job_spec") or {})
     if origin is not None and "origin" not in spec:
         spec["origin"] = origin
 
+    install_blueprint_script(spec)
     job = create_job(**spec)
     _set_status(s["id"], _STATUS_ACCEPTED)
     return job

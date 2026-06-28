@@ -634,6 +634,53 @@ def format_updatecheck(report: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def format_updatecheck_short(report: dict[str, Any]) -> str:
+    """Compact update readiness summary for chat surfaces."""
+    status = str(report.get("status", "unknown")).upper()
+    icon = {"GREEN": "OK", "YELLOW": "WARN", "RED": "BLOCK"}.get(status, "INFO")
+    head = str(report.get("head") or "?")[:10]
+    origin = str(report.get("origin_main") or "?")[:10]
+    worktree = report.get("worktree") or {}
+    counts = worktree.get("counts") if isinstance(worktree, dict) else {}
+    disk = report.get("disk") or {}
+    latest_release = report.get("latest_release") or {}
+
+    if report.get("update_available") is True:
+        behind = report.get("behind_count")
+        update = "available" + (f" ({behind} commits behind)" if behind is not None else "")
+    elif report.get("update_available") is False:
+        update = "not available"
+    else:
+        update = "unknown"
+
+    lines = [
+        f"{icon} Updatecheck: {status}",
+        f"Git: {head} -> origin/main {origin}",
+        f"Update: {update}",
+        "Worktree: "
+        + ("clean" if worktree.get("clean") else "dirty")
+        + f" (modified={counts.get('modified', 0)}, untracked={counts.get('untracked', 0)})",
+        f"Disk: {disk.get('free_gb', '?')}GB free, {disk.get('used_percent', '?')}% used",
+    ]
+    if isinstance(latest_release, dict) and latest_release.get("tag"):
+        lines.append(f"Release: {latest_release.get('tag')}")
+
+    blockers = list(report.get("issues") or [])
+    warnings = list(report.get("warnings") or [])
+    if blockers:
+        lines.append("")
+        lines.append("Blockers:")
+        lines.extend(f"- {item}" for item in blockers[:4])
+    elif warnings:
+        lines.append("")
+        lines.append("Warnings:")
+        lines.extend(f"- {item}" for item in warnings[:4])
+    else:
+        lines.append("")
+        lines.append("Ready: no blocker found.")
+    return "\n".join(lines)
+
+
 def run_updatecheck(args: Any) -> int:
     report = collect_updatecheck(
         fresh=not bool(getattr(args, "cached", False)),

@@ -295,7 +295,10 @@ def handle_blueprint_command(
 
     # `<name> slot=val …` -> fill + create directly (deterministic shortcut).
     try:
+        from cron.blueprint_catalog import install_blueprint_script
+
         spec = fill_blueprint(blueprint, values, origin=_resolve_origin(origin))
+        install_blueprint_script(spec)
     except BlueprintFillError as e:
         return BlueprintCommandResult(
             f"Can't set up '{blueprint.title}': {e}\n"

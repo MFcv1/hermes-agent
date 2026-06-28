@@ -7970,7 +7970,12 @@ async def list_cron_blueprints():
 async def instantiate_blueprint(body: AutomationBlueprintInstantiate, profile: str = "default"):
     """Fill a blueprint's slots and create the cron job (form-submit path)."""
     try:
-        from cron.blueprint_catalog import fill_blueprint, get_blueprint, BlueprintFillError
+        from cron.blueprint_catalog import (
+            BlueprintFillError,
+            fill_blueprint,
+            get_blueprint,
+            install_blueprint_script,
+        )
 
         blueprint = get_blueprint(body.blueprint)
         if blueprint is None:
@@ -7983,6 +7988,7 @@ async def instantiate_blueprint(body: AutomationBlueprintInstantiate, profile: s
         # Blueprint-created jobs deliver to the dashboard's configured target by
         # default; the form's deliver slot overrides via spec["deliver"].
         spec.pop("origin", None)
+        install_blueprint_script(spec)
         return _call_cron_for_profile(profile, "create_job", **spec)
     except HTTPException:
         raise

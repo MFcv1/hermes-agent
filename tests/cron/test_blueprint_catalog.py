@@ -75,6 +75,39 @@ class TestScheduleResolution:
         assert "Do not run `hermes update`" in spec["prompt"]
         assert "[SILENT]" in spec["prompt"]
 
+    def test_github_release_watch_blueprint_is_no_agent_watcher(self):
+        spec = fill_blueprint(
+            get_blueprint("github-release-watch"),
+            {
+                "repo": "NousResearch/hermes-agent",
+                "interval_hours": "6",
+                "include_prereleases": "false",
+                "max_items": "5",
+                "deliver": "telegram",
+            },
+        )
+
+        assert spec["schedule"] == "0 */6 * * *"
+        assert spec["deliver"] == "telegram"
+        assert spec["script"] == "github_release_watch.py"
+        assert spec["script_args"] == [
+            "--repo", "NousResearch/hermes-agent",
+            "--include-prereleases", "false",
+            "--max", "5",
+        ]
+        assert spec["no_agent"] is True
+
+    def test_vps_healthcheck_blueprint_is_no_agent_watcher(self):
+        spec = fill_blueprint(
+            get_blueprint("vps-healthcheck"),
+            {"interval_hours": "6", "deliver": "telegram"},
+        )
+
+        assert spec["schedule"] == "0 */6 * * *"
+        assert spec["deliver"] == "telegram"
+        assert spec["script"] == "vps_healthcheck.py"
+        assert spec["no_agent"] is True
+
     def test_weekday_preset_to_dow(self):
         spec = fill_blueprint(
             get_blueprint("custom-reminder"),
@@ -223,6 +256,66 @@ class TestCommandHandler:
         assert len(jobs) == 1
         assert (jobs[0].get("schedule_display") or jobs[0].get("schedule")) == "30 7 * * *"
         assert jobs[0].get("deliver") == "telegram"
+
+    def test_weekly_updatecheck_create_installs_no_agent_script(self, isolated_home):
+        from hermes_cli.blueprint_cmd import handle_blueprint_command
+        from hermes_constants import get_hermes_home
+
+        res = handle_blueprint_command(
+            "weekly-updatecheck time=09:30 day=saturday timeout_seconds=20 deliver=telegram"
+        )
+
+        assert "Scheduled 'Weekly Hermes updatecheck'" in res.text
+        jobs = isolated_home.load_jobs()
+        assert len(jobs) == 1
+        job = jobs[0]
+        assert job["no_agent"] is True
+        assert job["script"] == "weekly_updatecheck.py"
+        assert job["deliver"] == "telegram"
+        assert job["schedule_display"] == "30 9 * * 6"
+        script_path = get_hermes_home() / "scripts" / "weekly_updatecheck.py"
+        assert script_path.is_file()
+        assert "No-agent cron watchdog for Hermes update readiness" in script_path.read_text()
+
+    def test_github_release_watch_create_installs_no_agent_script(self, isolated_home):
+        from hermes_cli.blueprint_cmd import handle_blueprint_command
+        from hermes_constants import get_hermes_home
+
+        res = handle_blueprint_command(
+            "github-release-watch repo=NousResearch/hermes-agent interval_hours=6 "
+            "include_prereleases=false max_items=5 deliver=telegram"
+        )
+
+        assert "Scheduled 'GitHub release watcher'" in res.text
+        jobs = isolated_home.load_jobs()
+        assert len(jobs) == 1
+        job = jobs[0]
+        assert job["no_agent"] is True
+        assert job["script"] == "github_release_watch.py"
+        assert job["script_args"] == [
+            "--repo", "NousResearch/hermes-agent",
+            "--include-prereleases", "false",
+            "--max", "5",
+        ]
+        script_path = get_hermes_home() / "scripts" / "github_release_watch.py"
+        assert script_path.is_file()
+        assert "GitHub release watcher" in script_path.read_text()
+
+    def test_vps_healthcheck_create_installs_no_agent_script(self, isolated_home):
+        from hermes_cli.blueprint_cmd import handle_blueprint_command
+        from hermes_constants import get_hermes_home
+
+        res = handle_blueprint_command("vps-healthcheck interval_hours=6 deliver=telegram")
+
+        assert "Scheduled 'VPS healthcheck'" in res.text
+        jobs = isolated_home.load_jobs()
+        assert len(jobs) == 1
+        job = jobs[0]
+        assert job["no_agent"] is True
+        assert job["script"] == "vps_healthcheck.py"
+        script_path = get_hermes_home() / "scripts" / "vps_healthcheck.py"
+        assert script_path.is_file()
+        assert "VPS healthcheck" in script_path.read_text()
 
     def test_unknown_blueprint(self, isolated_home):
         from hermes_cli.blueprint_cmd import handle_blueprint_command

@@ -70,6 +70,21 @@ def test_create_job_no_agent_stores_field(hermes_env):
     assert job["prompt"] in {None, ""}
 
 
+def test_create_job_stores_script_args(hermes_env):
+    from cron.jobs import create_job
+
+    job = create_job(
+        prompt=None,
+        schedule="every 5m",
+        script="watchdog.py",
+        script_args=["--repo", "owner/name"],
+        no_agent=True,
+        deliver="local",
+    )
+
+    assert job["script_args"] == ["--repo", "owner/name"]
+
+
 def test_create_job_default_is_not_no_agent(hermes_env):
     from cron.jobs import create_job
 
@@ -126,6 +141,27 @@ def test_cronjob_tool_create_no_agent_with_script_succeeds(hermes_env):
     assert result.get("success") is True
     assert result["job"]["no_agent"] is True
     assert result["job"]["script"] == "alert.sh"
+
+
+def test_cronjob_tool_create_no_agent_with_script_args_succeeds(hermes_env):
+    from tools.cronjob_tools import cronjob
+
+    script_path = hermes_env / "scripts" / "watch.py"
+    script_path.write_text("print('ok')\n")
+
+    result = json.loads(
+        cronjob(
+            action="create",
+            schedule="every 5m",
+            script="watch.py",
+            script_args=["--repo", "owner/name", "--max", "5"],
+            no_agent=True,
+            deliver="local",
+        )
+    )
+
+    assert result.get("success") is True
+    assert result["job"]["script_args"] == ["--repo", "owner/name", "--max", "5"]
 
 
 def test_cronjob_tool_update_toggles_no_agent(hermes_env):
@@ -208,6 +244,28 @@ def test_run_job_no_agent_success_returns_script_stdout(hermes_env):
     assert error is None
     assert "RAM 92% on host" in final_response
     assert "RAM 92% on host" in doc
+
+
+def test_run_job_no_agent_passes_script_args(hermes_env):
+    from cron.jobs import create_job
+    from cron.scheduler import run_job
+
+    script_path = hermes_env / "scripts" / "argv.py"
+    script_path.write_text("import sys\nprint(' '.join(sys.argv[1:]))\n")
+
+    job = create_job(
+        prompt=None,
+        schedule="every 5m",
+        script="argv.py",
+        script_args=["--repo", "owner/name"],
+        no_agent=True,
+        deliver="local",
+    )
+
+    success, _doc, final_response, error = run_job(job)
+    assert success is True
+    assert error is None
+    assert final_response == "--repo owner/name"
 
 
 def test_run_job_no_agent_empty_output_is_silent(hermes_env):

@@ -159,7 +159,11 @@ def test_prune_dry_run_makes_no_changes(monkeypatch, capsys):
     import hermes_cli.curator as curator_cli
     import tools.skill_usage as skill_usage
 
-    rows = [_mk_record("old-skill", idle_days=200)]
+    rows = [
+        _mk_record("old-skill", idle_days=200),
+        _mk_record("old-pinned", idle_days=200, pinned=True),
+        _mk_record("recent-skill", idle_days=5),
+    ]
     monkeypatch.setattr(skill_usage, "agent_created_report", lambda: rows)
     archived = []
     monkeypatch.setattr(
@@ -171,6 +175,8 @@ def test_prune_dry_run_makes_no_changes(monkeypatch, capsys):
     assert archived == []
     out = capsys.readouterr().out
     assert "old-skill" in out
+    assert "old-pinned" not in out
+    assert "recent-skill" not in out
     assert "dry run" in out
 
 

@@ -31,7 +31,7 @@ except ImportError:
     except ImportError:
         msvcrt = None
 from pathlib import Path
-from typing import List, Optional
+from typing import Any, List, Optional
 
 # Add parent directory to path for imports BEFORE repo-level imports.
 # Without this, standalone invocations (e.g. after `hermes update` reloads
@@ -1181,7 +1181,19 @@ def _get_script_timeout() -> int:
     return _DEFAULT_SCRIPT_TIMEOUT
 
 
-def _run_job_script(script_path: str) -> tuple[bool, str]:
+def _normalize_script_argv_args(script_args: Optional[Any] = None) -> list[str]:
+    if script_args is None:
+        return []
+    if isinstance(script_args, str):
+        import shlex
+
+        raw_items = shlex.split(script_args)
+    else:
+        raw_items = list(script_args)
+    return [str(item) for item in raw_items if str(item)]
+
+
+def _run_job_script(script_path: str, script_args: Optional[Any] = None) -> tuple[bool, str]:
     """Execute a cron job's data-collection script and capture its output.
 
     Scripts must reside within HERMES_HOME/scripts/.  Both relative and
@@ -1207,6 +1219,8 @@ def _run_job_script(script_path: str) -> tuple[bool, str]:
         script_path: Path to the script.  Relative paths are resolved
             against HERMES_HOME/scripts/.  Absolute and ~-prefixed paths
             are also validated to ensure they stay within the scripts dir.
+        script_args: Optional argv fragments passed after the script path.
+            Arguments are not evaluated through a shell.
 
     Returns:
         (success, output) — on failure *output* contains the error message so the
@@ -1244,6 +1258,7 @@ def _run_job_script(script_path: str) -> tuple[bool, str]:
     # shebang: the scripts dir is trusted, but keeping the interpreter
     # choice explicit here keeps the allowed surface small and auditable.
     suffix = path.suffix.lower()
+    argv_args = _normalize_script_argv_args(script_args)
     if suffix in {".sh", ".bash"}:
         # Resolve bash dynamically so Windows (Git Bash) and Linux/macOS
         # all work.  On native Windows without Git for Windows installed
@@ -1259,9 +1274,9 @@ def _run_job_script(script_path: str) -> tuple[bool, str]:
                 "On Windows, install Git for Windows (which ships Git Bash) "
                 "or rewrite the script as Python (.py)."
             )
-        argv = [_bash, str(path)]
+        argv = [_bash, str(path), *argv_args]
     else:
-        argv = [sys.executable, str(path)]
+        argv = [sys.executable, str(path), *argv_args]
 
     try:
         from tools.environments.local import _sanitize_subprocess_env
@@ -1356,7 +1371,7 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
         if prerun_script is not None:
             success, script_output = prerun_script
         else:
-            success, script_output = _run_job_script(script_path)
+            success, script_output = _run_job_script(script_path, job.get("script_args"))
         if success:
             if script_output:
                 prompt = (
@@ -1650,7 +1665,7 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
                 _prior_cwd = None
 
         try:
-            ok, output = _run_job_script(script_path)
+            ok, output = _run_job_script(script_path, job.get("script_args"))
         finally:
             if _prior_cwd is not None:
                 try:
@@ -1739,7 +1754,7 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
     prerun_script = None
     script_path = job.get("script")
     if script_path:
-        prerun_script = _run_job_script(script_path)
+        prerun_script = _run_job_script(script_path, job.get("script_args"))
         _ran_ok, _script_output = prerun_script
         if _ran_ok and not _parse_wake_gate(_script_output):
             logger.info(
