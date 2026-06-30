@@ -4091,6 +4091,21 @@ class TelegramAdapter(BasePlatformAdapter):
             await self._handle_dev_callback(query, data)
             return
 
+        # --- Scheduled jobs callbacks (job:verb:id) ---
+        if data.startswith("job:"):
+            caller_id = str(getattr(query.from_user, "id", ""))
+            if not self._is_callback_user_authorized(
+                caller_id,
+                chat_id=query_chat_id,
+                chat_type=str(query_chat_type) if query_chat_type is not None else None,
+                thread_id=str(query_thread_id) if query_thread_id is not None else None,
+                user_name=query_user_name,
+            ):
+                await query.answer(text="⛔ Tu n'es pas autorisé à utiliser ce bouton.")
+                return
+            await self._handle_jobs_callback(query, data)
+            return
+
         # --- Model picker callbacks ---
         if data.startswith(("mp:", "mpg:", "mm:", "mc:", "mb", "mx", "mg:")):
             chat_id = str(query.message.chat_id) if query.message else None
@@ -6940,7 +6955,8 @@ class TelegramAdapter(BasePlatformAdapter):
                 "<code>/updatecheck</code> : peut-on mettre Hermes à jour ?\n"
                 "<code>/watch vps</code> : alerte seulement si le VPS se dégrade.\n"
                 "<code>/watch releases owner/repo</code> : alerte nouvelle release.\n"
-                "<code>/watch list</code> : watchers actifs.\n\n"
+                "<code>/watch list</code> : watchers actifs.\n"
+                "<code>/jobs</code> : toutes les tâches planifiées et leur livraison.\n\n"
                 "Règle simple : check d'abord, déploie ensuite. Pas de mutation automatique sans approbation."
             )
         if section == "learn":
@@ -6964,7 +6980,7 @@ class TelegramAdapter(BasePlatformAdapter):
             "• <code>/runs</code> : statut du travail en cours.\n"
             "• <code>/audit</code> : analyse repo/PR sans toucher au code.\n\n"
             "<b>Ops utiles</b>\n"
-            "• <code>/vps</code>, <code>/updatecheck</code>, <code>/watch</code>.\n\n"
+            "• <code>/vps</code>, <code>/updatecheck</code>, <code>/watch</code>, <code>/jobs</code>.\n\n"
             "Si tu es perdu : lance <code>/dev</code>, puis choisis un bouton."
         )
 
@@ -7000,15 +7016,27 @@ class TelegramAdapter(BasePlatformAdapter):
         if section not in {"home", "github", "ops", "learn"}:
             section = "home"
         await query.answer(text="Menu dev")
+        text = self._dev_menu_text(section)
+        keyboard = self._dev_menu_keyboard()
         try:
             await query.edit_message_text(
-                self._dev_menu_text(section),
+                text,
                 parse_mode=ParseMode.HTML,
-                reply_markup=self._dev_menu_keyboard(),
-                disable_web_page_preview=True,
+                reply_markup=keyboard,
             )
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning("[%s] /dev callback edit failed; sending fallback: %s", self.name, exc)
+            query_message = getattr(query, "message", None)
+            if query_message is not None:
+                try:
+                    await query_message.reply_text(
+                        text,
+                        parse_mode=ParseMode.HTML,
+                        reply_markup=keyboard,
+                        **self._link_preview_kwargs(),
+                    )
+                except Exception:
+                    logger.exception("[%s] /dev callback fallback send failed", self.name)
 
     def _telegram_origin(self, msg: Message) -> dict:
         thread_id = getattr(msg, "message_thread_id", None)
@@ -7060,6 +7088,191 @@ class TelegramAdapter(BasePlatformAdapter):
             "Retirer : <code>/watch remove job_id</code>",
         ])
         return "\n".join(lines)
+
+    def _job_delivery_label(self, job: dict) -> str:
+        deliver = str(job.get("deliver") or "local")
+        origin = job.get("origin") if isinstance(job.get("origin"), dict) else {}
+        if deliver == "origin" and origin:
+            platform = str(origin.get("platform") or "origin")
+            chat_id = str(origin.get("chat_id") or "")
+            if platform == "telegram":
+                return "Telegram" + (f" {chat_id}" if chat_id else "")
+            return platform
+        return deliver
+
+    def _job_status_label(self, job: dict) -> str:
+        if not job.get("enabled", True):
+            return "paused"
+        return str(job.get("last_status") or job.get("state") or "scheduled")
+
+    def _format_scheduled_jobs(self, jobs: list[dict], *, limit: int = 12) -> str:
+        lines = ["<b>🗓️ Jobs planifiés</b>", ""]
+        if not jobs:
+            lines.extend([
+                "Aucun job planifié.",
+                "",
+                "Watchers simples : <code>/watch releases owner/repo</code> ou <code>/watch vps</code>",
+            ])
+            return "\n".join(lines)
+
+        for job in jobs[:limit]:
+            name = str(job.get("name") or "job")
+            job_id = str(job.get("id") or "")
+            schedule = str(job.get("schedule_display") or "?")
+            next_run = str(job.get("next_run_at") or "?")
+            status = self._job_status_label(job)
+            delivery = self._job_delivery_label(job)
+            no_agent = "no-agent" if job.get("no_agent") else "agent"
+            lines.append(
+                f"• <code>{_html.escape(job_id)}</code> · <b>{_html.escape(name)[:80]}</b>\n"
+                f"  {_html.escape(status)} · {_html.escape(no_agent)} · <code>{_html.escape(schedule)}</code>\n"
+                f"  next: <code>{_html.escape(next_run)[:32]}</code> · vers: {_html.escape(delivery)}"
+            )
+
+        if len(jobs) > limit:
+            lines.append(f"\n... {len(jobs) - limit} autre(s) job(s).")
+        lines.extend([
+            "",
+            "Gestion : <code>/jobs pause id</code> · <code>/jobs resume id</code> · <code>/jobs remove id</code>",
+            "Watchers seuls : <code>/watch list</code>",
+        ])
+        return "\n".join(lines)
+
+    def _jobs_keyboard(self, jobs: list[dict], *, limit: int = 8) -> InlineKeyboardMarkup | None:
+        if not jobs:
+            return None
+        rows: list[list[InlineKeyboardButton]] = []
+        for job in jobs[:limit]:
+            job_id = str(job.get("id") or "")
+            if not job_id:
+                continue
+            label = str(job.get("name") or job_id)[:22]
+            if job.get("enabled", True):
+                rows.append([
+                    InlineKeyboardButton(f"Pause {label}", callback_data=f"job:pause:{job_id}"),
+                    InlineKeyboardButton("Supprimer", callback_data=f"job:remove:{job_id}"),
+                ])
+            else:
+                rows.append([
+                    InlineKeyboardButton(f"Reprendre {label}", callback_data=f"job:resume:{job_id}"),
+                    InlineKeyboardButton("Supprimer", callback_data=f"job:remove:{job_id}"),
+                ])
+        rows.append([InlineKeyboardButton("Rafraîchir", callback_data="job:list")])
+        return InlineKeyboardMarkup(rows)
+
+    async def _send_jobs_panel(self, msg: Message) -> None:
+        from cron.jobs import list_jobs
+
+        jobs = await asyncio.to_thread(list_jobs, True)
+        keyboard = self._jobs_keyboard(jobs)
+        text = self._format_scheduled_jobs(jobs)
+        if keyboard is None:
+            await self._send_cockpit_text(msg, text, role="preview")
+        else:
+            await self._send_cockpit_panel(msg, text, keyboard, role="preview")
+
+    async def _send_jobs_command(self, msg: Message, args: str = "") -> None:
+        try:
+            tokens = shlex.split(args or "")
+        except ValueError:
+            tokens = (args or "").split()
+        verb = (tokens[0].lower() if tokens else "list")
+        if verb in {"list", "ls", "all", ""}:
+            return await self._send_jobs_panel(msg)
+
+        if verb in {"pause", "resume", "remove", "rm", "delete"}:
+            target = tokens[1] if len(tokens) > 1 else ""
+            if not target:
+                return await self._send_cockpit_text(
+                    msg,
+                    "Usage : <code>/jobs pause id</code>, <code>/jobs resume id</code> ou <code>/jobs remove id</code>",
+                    role="preview",
+                )
+            from cron.jobs import get_job, pause_job, remove_job, resume_job
+
+            before = await asyncio.to_thread(get_job, target)
+            if not before:
+                return await self._send_cockpit_text(
+                    msg,
+                    "Job introuvable. Fais <code>/jobs</code> pour voir les IDs.",
+                    role="preview",
+                )
+            if verb == "pause":
+                updated = await asyncio.to_thread(pause_job, target, "paused from Telegram /jobs")
+                action = "mis en pause"
+            elif verb == "resume":
+                updated = await asyncio.to_thread(resume_job, target)
+                action = "repris"
+            else:
+                ok = await asyncio.to_thread(remove_job, target)
+                updated = before if ok else None
+                action = "supprimé" if ok else "non supprimé"
+            title = str(before.get("name") or target)
+            status = self._job_status_label(updated or before)
+            return await self._send_cockpit_text(
+                msg,
+                f"<b>Job { _html.escape(action) }</b>\n\n"
+                f"<code>{_html.escape(target)}</code> · {_html.escape(title)}\n"
+                f"Statut : <code>{_html.escape(status)}</code>",
+                role="preview",
+            )
+
+        return await self._send_cockpit_text(
+            msg,
+            "Usage : <code>/jobs</code>, <code>/jobs pause id</code>, <code>/jobs resume id</code>, <code>/jobs remove id</code>",
+            role="preview",
+        )
+
+    async def _handle_jobs_callback(self, query, data: str) -> None:
+        parts = data.split(":", 2)
+        verb = parts[1] if len(parts) > 1 else "list"
+        job_id = parts[2] if len(parts) > 2 else ""
+        from cron.jobs import get_job, list_jobs, pause_job, remove_job, resume_job
+
+        if verb == "list":
+            await query.answer(text="Jobs")
+        elif verb in {"pause", "resume", "remove"}:
+            if not job_id:
+                await query.answer(text="Job invalide")
+                return
+            before = await asyncio.to_thread(get_job, job_id)
+            if not before:
+                await query.answer(text="Job introuvable")
+            elif verb == "pause":
+                await asyncio.to_thread(pause_job, job_id, "paused from Telegram UI")
+                await query.answer(text="Job en pause")
+            elif verb == "resume":
+                await asyncio.to_thread(resume_job, job_id)
+                await query.answer(text="Job repris")
+            else:
+                await asyncio.to_thread(remove_job, job_id)
+                await query.answer(text="Job supprimé")
+        else:
+            await query.answer(text="Action inconnue")
+            return
+
+        jobs = await asyncio.to_thread(list_jobs, True)
+        text = self._format_scheduled_jobs(jobs)
+        keyboard = self._jobs_keyboard(jobs)
+        try:
+            await query.edit_message_text(
+                text,
+                parse_mode=ParseMode.HTML,
+                reply_markup=keyboard,
+            )
+        except Exception as exc:
+            logger.warning("[%s] /jobs callback edit failed; sending fallback: %s", self.name, exc)
+            query_message = getattr(query, "message", None)
+            if query_message is not None:
+                try:
+                    await query_message.reply_text(
+                        text,
+                        parse_mode=ParseMode.HTML,
+                        reply_markup=keyboard,
+                        **self._link_preview_kwargs(),
+                    )
+                except Exception:
+                    logger.exception("[%s] /jobs callback fallback send failed", self.name)
 
     async def _send_watch_command(self, msg: Message, args: str = "") -> None:
         try:
@@ -8185,6 +8398,9 @@ class TelegramAdapter(BasePlatformAdapter):
             return
         if command_token == "/watch":
             await self._send_watch_command(msg, command_args)
+            return
+        if command_token == "/jobs":
+            await self._send_jobs_command(msg, command_args)
             return
         if command_token in {"/updatecheck", "/update-check"}:
             await self._send_updatecheck_command(msg, command_args)
