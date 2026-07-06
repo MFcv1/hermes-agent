@@ -56,6 +56,7 @@ from gateway.repo_cockpit_text import (
     repo_selected_text,
     tasks_list_text,
 )
+from gateway.observation_reporter import post_runtime_observations
 
 logger = logging.getLogger("gateway.platforms.telegram")
 REPO_COCKPIT_MODES = {"ask_review", "pilote", "autopilot"}
@@ -1271,19 +1272,14 @@ class RepoCockpitTelegramMixin:
             if not force and (not signature or signature == runtime_observer_state.get("signature")):
                 return report
             runtime_observer_state["signature"] = signature
-            observation_payload = {
-                "source": "telegram_runtime_observer",
-                "task_id": task_id,
-                "report": report,
-                "captured_at": int(time.time()),
-            }
             try:
                 await asyncio.to_thread(
+                    post_runtime_observations,
                     self._cockpit_api_sync,
-                    "POST",
-                    f"/api/internal/tasks/{task_id}/runtime-observations",
-                    observation_payload,
-                    10,
+                    task_id=task_id,
+                    report=report,
+                    timeout=10,
+                    prefer_v2=False,
                 )
             except Exception:
                 logger.debug("[%s] Runtime observation attach failed for %s", self.name, task_id, exc_info=True)

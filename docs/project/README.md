@@ -21,6 +21,7 @@ directement dans `docs/`).
 | `PHASE1_REPO_COCKPIT_KEYBOARDS_REPORT.md` | Rapport Phase 1 partielle : extraction builders de keyboards Repo Cockpit. |
 | `PHASE1_REPO_COCKPIT_TEXT_REPORT.md` | Rapport Phase 1 partielle : extraction textes `/new`, Pilote, sélection repo. |
 | `PHASE1_COMPLETION_REPORT.md` | Rapport de fin locale Phase 1 : `telegram.py` sous 2k lignes, mixins extraits, tests verts. |
+| `PHASE2_OBSERVATION_BUS_REPORT.md` | Rapport Phase 2 locale : reporter gateway, payload v2, compat v1, masquage. |
 | `AUTONOMIE_V2_IMPLEMENTATION_STATUS.md` | Point de reprise consolidé : phases, preuves, prochaine cible. |
 | `autonomie-v2-symbol-inventory.json` | Inventaire statique des symboles `gateway/run.py` et `gateway/platforms/telegram.py`. |
 

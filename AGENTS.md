@@ -1247,6 +1247,20 @@ def profile_env(tmp_path, monkeypatch):
 
 ---
 
+## Autonomie V2 Roadmap
+
+Les phases Claude Fable / Autonomie V2 sont documentées dans des `.md` dédiés
+sous `docs/project/` et servent de source de reprise pour les agents :
+
+- `AUDIT-AUTONOMIE-V2.md` — plan directeur.
+- `docs/project/AUTONOMIE_V2_IMPLEMENTATION_STATUS.md` — état courant et ordre de reprise.
+- `docs/project/PHASE0_COMPLETION_REPORT.md` — Phase 0.
+- `docs/project/PHASE1_COMPLETION_REPORT.md` — Phase 1.
+- `docs/project/PHASE2_OBSERVATION_BUS_REPORT.md` — Phase 2.
+
+Avant de poursuivre une phase, relire le rapport dédié et les contrats
+normatifs dans `docs/brain/03-implementation-contracts.md`.
+
 ## Testing
 
 **ALWAYS use `scripts/run_tests.sh`** — do not call `pytest` directly. The script enforces

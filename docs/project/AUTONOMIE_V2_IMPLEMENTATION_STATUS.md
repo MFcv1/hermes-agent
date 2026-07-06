@@ -18,7 +18,7 @@ Ces documents sont la source à suivre pour les prochaines sessions. En cas de c
 |---|---|---|
 | Phase 0 — stabilisation/inventaire | Terminé côté code local + déploiement VPS documenté | `PHASE0_COMPLETION_REPORT.md`, `gateway/deployment_info.py`, `scripts/inventory_symbols.py`, `docs/project/autonomie-v2-symbol-inventory.json` |
 | Phase 1 — extraction modules gateway | Terminé côté code local, sync VPS non fait | `PHASE1_COMPLETION_REPORT.md` |
-| Phase 2 — observation bus + contrats | Prochaine phase | Lire `docs/brain/03-implementation-contracts.md` avant d'écrire le contrat v2 |
+| Phase 2 — observation bus + contrats | En cours côté gateway, backend Cockpit restant | `PHASE2_OBSERVATION_BUS_REPORT.md` |
 | Phase 3 — worker runtime engine | Pas commencé | Aucun `CommandSpan`/state machine v2 extrait côté Cockpit dans ce repo |
 | Phase 4 — self-repair v2 | Pas commencé | Ne pas démarrer sans `policy_engine` + snapshot/rollback testés |
 | Phase 5 — memory/handoff unifié | Pas commencé | `ActiveWorkStore` JSON existe encore |
@@ -44,20 +44,21 @@ Le pattern actuel est volontairement conservateur :
 
 ## Point de reprise recommandé
 
-Passer à la Phase 2 seulement après validation humaine du résultat local Phase 1.
+Continuer Phase 2 côté Repo Cockpit après validation de la brique gateway locale.
 
 Prochaine cible :
 
 ```text
-Observation bus + contrats v2
+Observation bus serveur + contrats v2
 ```
 
 Ordre conseillé :
 
 1. Relire `docs/brain/03-implementation-contracts.md`.
-2. Formaliser le payload observation v2 et la compat v1.
-3. Implémenter fingerprint/dédup côté Repo Cockpit, pas dans Telegram.
-4. Ajouter `gateway/observation_reporter.py` seulement après le contrat serveur.
+2. Implémenter `backend/runtime_observations.py` côté Repo Cockpit.
+3. Ajouter compat endpoint v1/v2.
+4. Implémenter fingerprint/dédup et masquage à l'ingestion.
+5. Basculer `gateway/observation_reporter.py` en `prefer_v2=True` seulement quand le serveur est validé.
 
 ## À ne pas faire maintenant
 

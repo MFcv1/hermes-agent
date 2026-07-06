@@ -55,6 +55,23 @@ class RepoCockpitClient:
         except Exception as exc:
             return {"ok": False, "description": str(exc)}
 
+    def post_runtime_observation(
+        self,
+        task_id: str,
+        payload: dict[str, Any],
+        timeout: int = 10,
+    ) -> dict[str, Any]:
+        """Post one runtime observation payload to the task-scoped endpoint."""
+        clean_task_id = str(task_id or "").strip()
+        if not clean_task_id:
+            raise ValueError("runtime observation requires task_id")
+        return self.api_sync(
+            "POST",
+            f"/api/internal/tasks/{clean_task_id}/runtime-observations",
+            payload,
+            timeout,
+        )
+
 
 def cockpit_webapp_url(path: str = "/", **params: str | None) -> str:
     """Build the public Repo Cockpit WebApp URL with cache busting."""

@@ -77,3 +77,28 @@ def test_cockpit_webapp_url_keeps_existing_query_adds_params_and_busts_cache(mon
     result = cockpit_webapp_url("/select-repo", mode="pilote", ignored=None)
 
     assert result == "https://cockpit.example/select-repo?existing=1&v=1234567890&mode=pilote"
+
+
+def test_repo_cockpit_client_posts_runtime_observation(monkeypatch):
+    captured = {}
+
+    def fake_urlopen(req, timeout):
+        captured["url"] = req.full_url
+        captured["method"] = req.get_method()
+        captured["data"] = req.data
+        captured["timeout"] = timeout
+        return _Response({"ok": True})
+
+    monkeypatch.setattr("gateway.repo_cockpit_client.urlopen", fake_urlopen)
+
+    result = RepoCockpitClient().post_runtime_observation(
+        "op_123",
+        {"schema_version": 2, "task_id": "op_123", "raw_excerpt": "failed"},
+        timeout=6,
+    )
+
+    assert result == {"ok": True}
+    assert captured["url"] == "http://127.0.0.1:8765/api/internal/tasks/op_123/runtime-observations"
+    assert captured["method"] == "POST"
+    assert json.loads(captured["data"].decode("utf-8"))["schema_version"] == 2
+    assert captured["timeout"] == 6
