@@ -7194,6 +7194,22 @@ class TelegramAdapter(TelegramModelsConfigMixin, BasePlatformAdapter):
             return f"${value:.4f}" if 0 < value < 0.01 else f"${value:.2f}"
         return f"Aujourd'hui {fmt(daily_cost)} · task {fmt(task_cost)} · appels {calls}"
 
+    def _selfops_summary_line(self, data: dict) -> str:
+        event = data.get("selfops") or {}
+        if not isinstance(event, dict):
+            return ""
+        payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
+        sample = payload.get("sample") if isinstance(payload.get("sample"), dict) else {}
+        evaluation = payload.get("evaluation") if isinstance(payload.get("evaluation"), dict) else {}
+        metrics = sample.get("metrics") if isinstance(sample.get("metrics"), dict) else {}
+        if not metrics:
+            return ""
+        overall = evaluation.get("overall") or event.get("decision") or "unknown"
+        return (
+            f"{overall} · disque {metrics.get('disk_root_pct', '?')}% · "
+            f"RAM {metrics.get('ram_used_pct', '?')}% · load {metrics.get('load15_per_cpu', '?')}"
+        )
+
     def _short_observation_label(self, item: dict) -> str:
         signature = str(item.get("signature") or "")
         source = str(item.get("source") or "")
@@ -7242,6 +7258,9 @@ class TelegramAdapter(TelegramModelsConfigMixin, BasePlatformAdapter):
         cost_line = self._cost_summary_line(data)
         if cost_line:
             lines.append(f"Coût : <code>{_html.escape(cost_line)}</code>")
+        selfops_line = self._selfops_summary_line(data)
+        if selfops_line:
+            lines.append(f"VPS : <code>{_html.escape(selfops_line)}</code>")
         if latest_error:
             lines.extend([
                 "",
@@ -7282,6 +7301,15 @@ class TelegramAdapter(TelegramModelsConfigMixin, BasePlatformAdapter):
             for item in self._latest_items(data, "runtime_observations"):
                 label = self._short_observation_label(item)
                 lines.append(f"{self._status_badge(item.get('status'))} <code>{_html.escape(label[:90])}</code>")
+        telemetry = self._latest_items(data, "telemetry_events", 4)
+        if telemetry:
+            lines.extend(["", "<b>Telemetry</b>"])
+            for item in telemetry:
+                kind = str(item.get("kind") or "event")
+                source = str(item.get("source") or "")
+                decision = str(item.get("decision") or item.get("action") or "")
+                suffix = f" · {decision}" if decision else ""
+                lines.append(f"• <code>{_html.escape(kind[:40])}</code> {_html.escape(source[:40])}{_html.escape(suffix[:60])}")
         if approvals:
             pending = [item for item in approvals if str(item.get("status") or "") == "pending"]
             shown = pending or approvals
