@@ -118,6 +118,15 @@ from gateway.repo_cockpit_formatting import (
     status_badge,
     status_is_problem,
 )
+from gateway.repo_cockpit_keyboards import (
+    autonomy_keyboard,
+    new_chat_keyboard,
+    pending_prs_keyboard,
+    pilot_existing_intent_keyboard,
+    repo_button_label,
+    repo_new_chat_keyboard,
+    repo_selected_keyboard,
+)
 from utils import atomic_replace
 
 _TELEGRAM_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
@@ -6125,25 +6134,7 @@ class TelegramAdapter(TelegramModelsConfigMixin, BasePlatformAdapter):
         return cockpit_webapp_url(path, **params)
 
     def _new_chat_keyboard(self, mode: str) -> InlineKeyboardMarkup:
-        mode = normalize_cockpit_mode(mode)
-        return InlineKeyboardMarkup([
-            [
-                InlineKeyboardButton(("✓ Ask review" if mode == "ask_review" else "Ask review"), callback_data="rcn:mode:ask_review"),
-                InlineKeyboardButton(("✓ Pilote" if mode == "pilote" else "Pilote"), callback_data="rcn:mode:pilote"),
-            ],
-            [
-                InlineKeyboardButton(("✓ Autopilot" if mode == "autopilot" else "Autopilot"), callback_data="rcn:mode:autopilot"),
-            ],
-            [
-                InlineKeyboardButton("Projet GitHub existant", callback_data=f"rcn:existing:{mode}"),
-            ],
-            [
-                InlineKeyboardButton("Start from scratch", callback_data=f"rcn:scratch:{mode}"),
-            ],
-            [
-                InlineKeyboardButton("Annuler", callback_data="rcn:cancel"),
-            ],
-        ])
+        return new_chat_keyboard(mode, button=InlineKeyboardButton, markup=InlineKeyboardMarkup)
 
 
     def _pilot_default_reasoning(self, user_id: str, origin: str | None = None, intent: str | None = None) -> str:
@@ -6168,16 +6159,7 @@ class TelegramAdapter(TelegramModelsConfigMixin, BasePlatformAdapter):
         return titles.get(str(intent or ""), "Architect / cadrage")
 
     def _pilot_existing_intent_keyboard(self, mode: str = "pilote") -> InlineKeyboardMarkup:
-        mode = normalize_cockpit_mode(mode)
-        return InlineKeyboardMarkup([
-            [InlineKeyboardButton("Comprendre / auditer le repo", callback_data=f"rcn:intent:audit_repo:{mode}")],
-            [InlineKeyboardButton("Modifier / ajouter une feature", callback_data=f"rcn:intent:feature_work:{mode}")],
-            [InlineKeyboardButton("Corriger un bug", callback_data=f"rcn:intent:debug_fix:{mode}")],
-            [InlineKeyboardButton("Déployer / vérifier prod", callback_data=f"rcn:intent:deploy:{mode}")],
-            [InlineKeyboardButton("Refactor / sécuriser", callback_data=f"rcn:intent:review_harden:{mode}")],
-            [InlineKeyboardButton("Je ne sais pas", callback_data=f"rcn:intent:pilot_discovery:{mode}")],
-            [InlineKeyboardButton("Retour", callback_data=f"rcn:mode:{mode}"), InlineKeyboardButton("Annuler", callback_data="rcn:cancel")],
-        ])
+        return pilot_existing_intent_keyboard(mode, button=InlineKeyboardButton, markup=InlineKeyboardMarkup)
 
     def _pilot_waiting_prompt_text(self, *, origin: str, intent: str, repo: str | None = None, user_id: str = "") -> str:
         reasoning = self._pilot_default_reasoning(user_id, origin, intent) if user_id else "high"
@@ -6289,39 +6271,18 @@ class TelegramAdapter(TelegramModelsConfigMixin, BasePlatformAdapter):
         return False
 
     def _repo_button_label(self, repo: dict) -> str:
-        full_name = str(repo.get("nameWithOwner") or repo.get("name") or "Repo")
-        name = full_name.split("/", 1)[-1]
-        clean = re.sub(r"\s+", " ", name).strip() or "Repo"
-        if len(clean) > 30:
-            clean = clean[:29].rstrip() + "…"
-        visibility = "privé" if repo.get("isPrivate") else "public"
-        return f"{clean} · {visibility}"
+        return repo_button_label(repo)
 
     def _repo_new_chat_keyboard(self, user_id: str, mode: str, repos: list[dict], cockpit_url: str) -> InlineKeyboardMarkup:
-        mode = normalize_cockpit_mode(mode)
-        rows: list[list[InlineKeyboardButton]] = []
-        for index, repo in enumerate(repos[:8]):
-            if not isinstance(repo, dict) or not repo.get("nameWithOwner"):
-                continue
-            rows.append([
-                InlineKeyboardButton(
-                    self._repo_button_label(repo),
-                    callback_data=f"rcnr:{mode}:{index}",
-                )
-            ])
-        if not rows:
-            rows.append([InlineKeyboardButton("Actualiser les repos", callback_data=f"rcn:existing:{mode}")])
-        button_kwargs = (
-            {"web_app": WebAppInfo(url=cockpit_url)}
-            if WebAppInfo is not None
-            else {"url": cockpit_url}
+        return repo_new_chat_keyboard(
+            user_id,
+            mode,
+            repos,
+            cockpit_url,
+            button=InlineKeyboardButton,
+            markup=InlineKeyboardMarkup,
+            web_app_info=WebAppInfo,
         )
-        rows.append([InlineKeyboardButton("Mini App liste complète", **button_kwargs)])
-        rows.append([
-            InlineKeyboardButton("Actualiser", callback_data=f"rcn:existing:{mode}"),
-            InlineKeyboardButton("Annuler", callback_data="rcn:cancel"),
-        ])
-        return InlineKeyboardMarkup(rows)
 
     def _repo_selected_text(self, repo: str, mode: str, thread_id: str | None = None) -> str:
         mode = normalize_cockpit_mode(mode)
@@ -6340,20 +6301,7 @@ class TelegramAdapter(TelegramModelsConfigMixin, BasePlatformAdapter):
         return "\n".join(lines)
 
     def _repo_selected_keyboard(self, mode: str) -> InlineKeyboardMarkup:
-        mode = normalize_cockpit_mode(mode)
-        return InlineKeyboardMarkup([
-            [
-                InlineKeyboardButton("Changer repo", callback_data=f"rcn:existing:{mode}"),
-                InlineKeyboardButton("Ask review", callback_data="rcn:mode:ask_review"),
-            ],
-            [
-                InlineKeyboardButton("Pilote", callback_data="rcn:mode:pilote"),
-                InlineKeyboardButton("Autopilot", callback_data="rcn:mode:autopilot"),
-            ],
-            [
-                InlineKeyboardButton("Annuler", callback_data="rcn:cancel"),
-            ],
-        ])
+        return repo_selected_keyboard(mode, button=InlineKeyboardButton, markup=InlineKeyboardMarkup)
 
     def _new_chat_text(self, mode: str, selected_repo: str | None = None) -> str:
         mode = normalize_cockpit_mode(mode)
@@ -6463,25 +6411,7 @@ class TelegramAdapter(TelegramModelsConfigMixin, BasePlatformAdapter):
         return format_pending_prs(data)
 
     def _pending_prs_keyboard(self, data: dict) -> InlineKeyboardMarkup:
-        rows: list[list[InlineKeyboardButton]] = []
-        for item in (data.get("prs") or [])[:5]:
-            task_id = str(item.get("task_id") or "")
-            pr_url = str(item.get("pr_url") or "")
-            preview_url = str(item.get("preview_url") or "")
-            label = self._pending_pr_label(item)
-            if pr_url.startswith(("https://", "http://")):
-                rows.append([InlineKeyboardButton(f"PR {label}", url=pr_url)])
-            if preview_url.startswith(("https://", "http://")):
-                rows.append([InlineKeyboardButton(f"Preview {label}", url=preview_url)])
-            if task_id.startswith("op_"):
-                rows.append([
-                    InlineKeyboardButton(f"Status {label}", callback_data=f"rca:status:{task_id}"),
-                    InlineKeyboardButton(f"Runs {label}", callback_data=f"rca:runs:{task_id}"),
-                ])
-                rows.append([InlineKeyboardButton(f"Résumé {label}", callback_data=f"rca:prsum:{task_id}")])
-        rows.append([InlineKeyboardButton("Rafraîchir PRs", callback_data="rca:prs")])
-        rows.append([InlineKeyboardButton("Threads", callback_data="rct:list:all")])
-        return InlineKeyboardMarkup(rows)
+        return pending_prs_keyboard(data, button=InlineKeyboardButton, markup=InlineKeyboardMarkup)
 
     async def _send_pending_prs_command(self, msg: Message, args: str = "") -> None:
         limit = 10
@@ -6732,26 +6662,7 @@ class TelegramAdapter(TelegramModelsConfigMixin, BasePlatformAdapter):
         return status_is_problem(status)
 
     def _autonomy_keyboard(self, data: dict, view: str = "status") -> InlineKeyboardMarkup:
-        task = data.get("task") or {}
-        task_id = str(task.get("id") or data.get("task_id") or "")
-        status = str(task.get("status") or "")
-        preview = str(task.get("preview_url") or task.get("deployment_url") or "")
-        rows: list[list[InlineKeyboardButton]] = []
-        if preview.startswith(("https://", "http://")) and not self._preview_is_blocked(status):
-            rows.append([InlineKeyboardButton("Ouvrir preview", url=preview)])
-        if task_id:
-            if view == "runs":
-                rows.append([
-                    InlineKeyboardButton("Status", callback_data=f"rca:status:{task_id}"),
-                    InlineKeyboardButton("Rafraîchir", callback_data=f"rca:runs:{task_id}"),
-                ])
-            else:
-                rows.append([
-                    InlineKeyboardButton("Runs", callback_data=f"rca:runs:{task_id}"),
-                    InlineKeyboardButton("Rafraîchir", callback_data=f"rca:status:{task_id}"),
-                ])
-        rows.append([InlineKeyboardButton("Threads", callback_data="rct:list:all")])
-        return InlineKeyboardMarkup(rows)
+        return autonomy_keyboard(data, view, button=InlineKeyboardButton, markup=InlineKeyboardMarkup)
 
     async def _send_status_command(self, msg: Message, args: str = "") -> None:
         task_id, error = await self._resolve_status_task_id(msg, args)

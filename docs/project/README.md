@@ -18,6 +18,8 @@ directement dans `docs/`).
 | `PHASE1_FORMATTING_EXTRACTION_REPORT.md` | Rapport Phase 1 partielle : extraction formatting Telegram. |
 | `PHASE1_REPO_COCKPIT_CLIENT_REPORT.md` | Rapport Phase 1 partielle : extraction client HTTP Repo Cockpit gateway. |
 | `PHASE1_REPO_COCKPIT_FORMATTERS_REPORT.md` | Rapport Phase 1 partielle : extraction formatters panels/status/PR Repo Cockpit. |
+| `PHASE1_REPO_COCKPIT_KEYBOARDS_REPORT.md` | Rapport Phase 1 partielle : extraction builders de keyboards Repo Cockpit. |
+| `AUTONOMIE_V2_IMPLEMENTATION_STATUS.md` | Point de reprise consolidé : phases, preuves, prochaine cible. |
 | `autonomie-v2-symbol-inventory.json` | Inventaire statique des symboles `gateway/run.py` et `gateway/platforms/telegram.py`. |
 
 ## Documents de référence (ailleurs)
