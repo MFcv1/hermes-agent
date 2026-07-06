@@ -8379,7 +8379,7 @@ class TelegramAdapter(TelegramModelsConfigMixin, BasePlatformAdapter):
         from gateway.libre_orchestrator import classify_libre_message, extract_learning_policy
 
         decision = classify_libre_message(clean)
-        if decision.action == "learn_policy":
+        if decision.action in {"learn_policy", "policy"}:
             policy = extract_learning_policy(clean) or {}
             stored = self._libre_store().remember_policy(state.get("key") or self._libre_context_key(msg, user_id), policy, source="telegram_libre")
             details = " · ".join(
@@ -8394,7 +8394,7 @@ class TelegramAdapter(TelegramModelsConfigMixin, BasePlatformAdapter):
             )
             return True
 
-        if decision.action == "switch_repo":
+        if decision.action == "switch_repo" or decision.intent == "switch_repo":
             await self._send_cockpit_text(
                 msg,
                 "<b>🔁 Switch repo détecté</b>\n\n"

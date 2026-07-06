@@ -1,0 +1,1 @@
+{"category":"unknown","injection":"non-repairable failure across three attempts","expected":{"outcome":"blocked_runtime_repair","attempts":3,"clean_worktree":true}}

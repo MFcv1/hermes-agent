@@ -1,0 +1,55 @@
+{"id":"routing_001","text":"corrige le bug sur mon app","context":{"active_task":false},"expected":{"action":"repo_task","mode":"pilote","intent":"debug_fix"}}
+{"id":"routing_002","text":"déploie ce projet proprement","context":{"active_task":true},"expected":{"action":"repo_task","mode":"pilote","intent":"deploy"}}
+{"id":"routing_003","text":"reprends le chantier d'hier","context":{"active_task":true},"expected":{"action":"resume","intent":"resume"}}
+{"id":"routing_004","text":"explique-moi comment fonctionne le deploy de mon app","context":{"active_task":false},"expected":{"action":"chat"}}
+{"id":"routing_005","text":"j'ai un bug dans ma compréhension des promises","context":{"active_task":false},"expected":{"action":"chat"}}
+{"id":"routing_006","text":"audite cette stack comme un CTO","context":{"active_task":true},"expected":{"action":"repo_task","mode":"ask_review","intent":"audit_repo"}}
+{"id":"routing_007","text":"vas-y tout seul, si les tests passent tu continues","context":{"active_task":true},"expected":{"action":"repo_task","mode":"autopilot"}}
+{"id":"routing_008","text":"pour les plans mets toi toujours en opus xhigh","context":{"active_task":false},"expected":{"action":"policy","intent":"learning_policy"}}
+{"id":"routing_009","text":"ça avance ?","context":{"active_task":true},"expected":{"action":"status","intent":"progress_status"}}
+{"id":"routing_010","text":"t'en penses quoi de rust vs go","context":{"active_task":true},"expected":{"action":"chat"}}
+{"id":"routing_011","text":"ajoute un dark mode à la page settings","context":{"active_task":false},"expected":{"action":"repo_task","mode":"pilote","intent":"feature_work"}}
+{"id":"routing_012","text":"surveille pendant que tu bosses et corrige si ça casse","context":{"active_task":true},"expected":{"action":"repo_task","mode":"autopilot"}}
+{"id":"routing_013","text":"passe sur le repo du portfolio","context":{"active_task":true},"expected":{"action":"repo_task","mode":"pilote","intent":"switch_repo"}}
+{"id":"routing_014","text":"c'est quoi une race condition","context":{"active_task":true},"expected":{"action":"chat"}}
+{"id":"routing_015","text":"merge la PR","context":{"active_task":true},"expected":{"action":"repo_task","mode":"pilote","intent":"merge_request"}}
+{"id":"routing_016","text":"fix le crash au login","context":{"active_task":true},"expected":{"action":"repo_task","mode":"pilote","intent":"debug_fix"}}
+{"id":"routing_017","text":"corrige l'erreur 500 dans le gateway","context":{"active_task":true},"expected":{"action":"repo_task","mode":"pilote","intent":"debug_fix"}}
+{"id":"routing_018","text":"répare les tests qui cassent","context":{"active_task":true},"expected":{"action":"repo_task","mode":"pilote","intent":"debug_fix"}}
+{"id":"routing_019","text":"ajoute la connexion GitHub","context":{"active_task":false},"expected":{"action":"repo_task","mode":"pilote","intent":"feature_work"}}
+{"id":"routing_020","text":"implémente le dashboard admin","context":{"active_task":false},"expected":{"action":"repo_task","mode":"pilote","intent":"feature_work"}}
+{"id":"routing_021","text":"modifie le formulaire d'inscription","context":{"active_task":true},"expected":{"action":"repo_task","mode":"pilote","intent":"feature_work"}}
+{"id":"routing_022","text":"améliore la page pricing","context":{"active_task":false},"expected":{"action":"repo_task","mode":"pilote","intent":"feature_work"}}
+{"id":"routing_023","text":"deploy en preview seulement","context":{"active_task":true},"expected":{"action":"repo_task","mode":"pilote","intent":"deploy"}}
+{"id":"routing_024","text":"prépare le déploiement VPS","context":{"active_task":true},"expected":{"action":"repo_task","mode":"pilote","intent":"deploy"}}
+{"id":"routing_025","text":"mets ça en prod","context":{"active_task":true},"expected":{"action":"repo_task","mode":"pilote","intent":"deploy"}}
+{"id":"routing_026","text":"audit sécurité du repo","context":{"active_task":true},"expected":{"action":"repo_task","mode":"ask_review","intent":"audit_repo"}}
+{"id":"routing_027","text":"relis le diff avant merge","context":{"active_task":true},"expected":{"action":"repo_task","mode":"ask_review","intent":"audit_repo"}}
+{"id":"routing_028","text":"vérifie si la PR est clean","context":{"active_task":true},"expected":{"action":"repo_task","mode":"ask_review","intent":"audit_repo"}}
+{"id":"routing_029","text":"fais le en autopilot","context":{"active_task":true},"expected":{"action":"repo_task","mode":"autopilot"}}
+{"id":"routing_030","text":"go direct si tout est vert","context":{"active_task":true},"expected":{"action":"repo_task","mode":"autopilot"}}
+{"id":"routing_031","text":"continue le chantier","context":{"active_task":true},"expected":{"action":"resume","intent":"resume"}}
+{"id":"routing_032","text":"où on en était ?","context":{"active_task":true},"expected":{"action":"resume","intent":"resume"}}
+{"id":"routing_033","text":"reprend le repo du CRM","context":{"active_task":true},"expected":{"action":"repo_task","intent":"switch_repo"}}
+{"id":"routing_034","text":"change de repo pour le starter pack","context":{"active_task":true},"expected":{"action":"repo_task","intent":"switch_repo"}}
+{"id":"routing_035","text":"status du chantier","context":{"active_task":true},"expected":{"action":"status"}}
+{"id":"routing_036","text":"t'en es où ?","context":{"active_task":true},"expected":{"action":"status"}}
+{"id":"routing_037","text":"c'est fini ?","context":{"active_task":true},"expected":{"action":"status"}}
+{"id":"routing_038","text":"pour les deploy utilise gpt-5.5 high","context":{"active_task":false},"expected":{"action":"policy","intent":"learning_policy"}}
+{"id":"routing_039","text":"mémorise que les audits sont en grok high","context":{"active_task":false},"expected":{"action":"policy","intent":"learning_policy"}}
+{"id":"routing_040","text":"utilise toujours sonnet pour les plans","context":{"active_task":false},"expected":{"action":"policy","intent":"learning_policy"}}
+{"id":"routing_041","text":"explique moi la différence entre ask review et autopilot","context":{"active_task":false},"expected":{"action":"chat"}}
+{"id":"routing_042","text":"comment fonctionne une migration postgres","context":{"active_task":true},"expected":{"action":"chat"}}
+{"id":"routing_043","text":"tu penses quoi de vercel vs cloudflare","context":{"active_task":true},"expected":{"action":"chat"}}
+{"id":"routing_044","text":"j'ai une erreur dans ma tête sur les closures","context":{"active_task":false},"expected":{"action":"chat"}}
+{"id":"routing_045","text":"le bouton login crash, corrige","context":{"active_task":true},"expected":{"action":"repo_task","intent":"debug_fix"}}
+{"id":"routing_046","text":"le build casse sur CI","context":{"active_task":true},"expected":{"action":"repo_task","intent":"debug_fix"}}
+{"id":"routing_047","text":"ajoute les tests manquants","context":{"active_task":true},"expected":{"action":"repo_task","intent":"feature_work"}}
+{"id":"routing_048","text":"modifie la branche et commit proprement","context":{"active_task":true},"expected":{"action":"repo_task","intent":"feature_work"}}
+{"id":"routing_049","text":"prépare une PR propre","context":{"active_task":true},"expected":{"action":"repo_task","intent":"feature_work"}}
+{"id":"routing_050","text":"lance les tests et corrige si rouge","context":{"active_task":true},"expected":{"action":"repo_task","intent":"debug_fix"}}
+{"id":"routing_051","text":"reprends le chantier d'hier","context":{"active_task":false},"expected":{"action":"chat"}}
+{"id":"routing_052","text":"est-ce que les tests passent ?","context":{"active_task":true},"expected":{"action":"status"}}
+{"id":"routing_053","text":"analyse seulement l'architecture","context":{"active_task":true},"expected":{"action":"repo_task","mode":"ask_review","intent":"audit_repo"}}
+{"id":"routing_054","text":"fais une review du code sans modifier","context":{"active_task":true},"expected":{"action":"repo_task","mode":"ask_review","intent":"audit_repo"}}
+{"id":"routing_055","text":"ajoute une route API pour les webhooks","context":{"active_task":false},"expected":{"action":"repo_task","mode":"pilote","intent":"feature_work"}}

@@ -1,0 +1,1 @@
+{"category":"dependency_missing","injection":"import absent from manifest","expected":{"runbook":"missing_dependency","outcome":"fixed","attempts":1}}
