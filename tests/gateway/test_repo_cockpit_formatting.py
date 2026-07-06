@@ -83,6 +83,10 @@ def test_format_autonomy_and_runs_status_keep_badges_and_preview_blocking():
         "provider_checks": [{"provider": "vercel", "check_name": "deploy", "status": "failed"}],
         "smoke_tests": [{"status": "queued", "url": "https://preview.example"}],
         "task_runs": [{"phase": "pytest", "status": "failed"}],
+        "repair_attempts": [{"runbook": "syntax_error", "status": "rolled_back", "attempt": 1}],
+        "runtime_observations": [{"status": "attention", "source": "worker", "signature": "SyntaxError: x"}],
+        "approvals": [{"approval_type": "deploy_prod", "status": "pending"}],
+        "evaluation_summary": {"suites": {"routing": {"passed": 55, "total": 55}}},
     }
 
     status_text = format_autonomy_status(data)
@@ -90,7 +94,15 @@ def test_format_autonomy_and_runs_status_keep_badges_and_preview_blocking():
 
     assert status_badge("failed") == "🚨"
     assert "Preview non validée : https://preview.example" in status_text
+    assert "<b>Vue rapide</b>" in status_text
+    assert "Runs : <code>1 failed</code>" in status_text
+    assert "Repairs : <code>1 rolled_back</code>" in status_text
+    assert "Evals : <code>routing 55/55</code>" in status_text
     assert "Catégorie : <code>test_regression</code>" in status_text
     assert "🚨 vercel/deploy : <code>failed</code>" in status_text
+    assert "<b>Runs récents</b>" in status_text
+    assert "🚨 <code>syntax_error</code> · rolled_back · tentative 1" in status_text
+    assert "• <code>attention · SyntaxError: x</code>" in status_text
+    assert "⏳ <code>deploy_prod</code> · pending" in status_text
     assert "<b>🧪 Runs / gates</b>" in runs_text
     assert "🚨 <code>pytest</code> · <b>failed</b>" in runs_text

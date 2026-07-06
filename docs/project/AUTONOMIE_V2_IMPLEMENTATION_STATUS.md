@@ -23,7 +23,7 @@ Ces documents sont la source à suivre pour les prochaines sessions. En cas de c
 | Phase 4 — self-repair v2 | Terminé côté backend/worker VPS | `PHASE4_SELF_REPAIR_V2_REPORT.md` |
 | Phase 5 — memory/handoff unifié | Terminé côté backend/gateway VPS | `PHASE5_MEMORY_HANDOFF_STORE_REPORT.md` |
 | Phase 6 — eval harness | Terminé côté local + backend/gateway VPS | `PHASE6_EVAL_HARNESS_REPORT.md` |
-| Phase 7 — dashboard/admin UX | Pas commencé | À repousser après les fondations |
+| Phase 7 — dashboard/admin UX | Terminé côté backend/gateway VPS | `PHASE7_AUTONOMY_STATUS_UX_REPORT.md` |
 
 ## Phase 1 déjà faite
 
@@ -68,23 +68,30 @@ Le pattern actuel est volontairement conservateur :
 - Repo Cockpit expose une table `evaluations` et des endpoints internes batch/list.
 - Tests live : routing 55/55, repair 7/7, Cockpit evaluation store, anciens tests Phase 3/4/5.
 
+## Phase 7 déjà faite
+
+- `/api/internal/tasks/{task_id}/autonomy` expose désormais runs, repairs, observations runtime, approvals, evals et lineage.
+- `/status` Telegram affiche l'état complet de la task en un message riche.
+- `/runs` reste le détail technique.
+- Tests live : payload autonomy enrichi, anciens tests Phase 4/5/6, gateway routing/repair evals.
+
 ## Point de reprise recommandé
 
-Passer à la Phase 7 après validation humaine du résultat Phase 6.
+La roadmap principale Autonomie V2 est terminée jusqu'à la Phase 7.
 
-Prochaine cible :
+Prochaine cible possible :
 
 ```text
-Dashboard / admin UX
+Quick win 9 — Skill / Runbook Registry
 ```
 
 Ordre conseillé :
 
 1. Relire `docs/brain/03-implementation-contracts.md`.
-2. Relire `PHASE4_SELF_REPAIR_V2_REPORT.md`, `PHASE5_MEMORY_HANDOFF_STORE_REPORT.md` et `PHASE6_EVAL_HARNESS_REPORT.md`.
-3. Définir les vues admin sans dupliquer le chat principal.
-4. Afficher l'état des tasks/runs/observations/evaluations depuis Cockpit.
-5. Garder toute nouvelle action dangereuse derrière la policy existante.
+2. Relire `PHASE6_EVAL_HARNESS_REPORT.md` et `PHASE7_AUTONOMY_STATUS_UX_REPORT.md`.
+3. Implémenter `repo-cockpit/runbooks/*.yaml` + loader `backend/runbooks.py`.
+4. Tester le schéma runbook : verify et rollback obligatoires.
+5. Ne pas ajouter d'action dangereuse hors policy explicite.
 
 ## À ne pas faire maintenant
 

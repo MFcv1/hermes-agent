@@ -26,6 +26,7 @@ directement dans `docs/`).
 | `PHASE4_SELF_REPAIR_V2_REPORT.md` | Rapport Phase 4 VPS : policy engine, self-repair v2, snapshots, rollback, budget. |
 | `PHASE5_MEMORY_HANDOFF_STORE_REPORT.md` | Rapport Phase 5 VPS : handoffs Cockpit, cache SQLite gateway, reprise via parent task. |
 | `PHASE6_EVAL_HARNESS_REPORT.md` | Rapport Phase 6 VPS : golden routing, scénarios repair, table evaluations Cockpit. |
+| `PHASE7_AUTONOMY_STATUS_UX_REPORT.md` | Rapport Phase 7 VPS : `/status` Telegram enrichi, payload autonomy complet. |
 | `AUTONOMIE_V2_IMPLEMENTATION_STATUS.md` | Point de reprise consolidé : phases, preuves, prochaine cible. |
 | `autonomie-v2-symbol-inventory.json` | Inventaire statique des symboles `gateway/run.py` et `gateway/platforms/telegram.py`. |
 

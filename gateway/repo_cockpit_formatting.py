@@ -67,9 +67,9 @@ def format_pending_prs(data: dict[str, Any]) -> str:
 
 def status_badge(status: str | None) -> str:
     value = str(status or "unknown")
-    if value in {"passed", "ready", "done", "completed"} or value.startswith("running"):
+    if value in {"passed", "ready", "done", "completed", "fixed", "ok", "success", "approved"} or value.startswith("running"):
         return "✅"
-    if value.startswith("blocked") or value in {"failed", "error"}:
+    if value.startswith("blocked") or value in {"failed", "error", "worsened", "rolled_back", "denied"}:
         return "🚨"
     if value in {"queued", "pending"} or value.startswith("queued"):
         return "⏳"
@@ -81,6 +81,41 @@ def latest_items(data: dict[str, Any], key: str, limit: int = 3) -> list[dict[st
     if not isinstance(items, list):
         return []
     return items[:limit]
+
+
+def _status_counts(items: list[dict[str, Any]], key: str = "status") -> str:
+    counts: dict[str, int] = {}
+    for item in items:
+        status = str(item.get(key) or "unknown")
+        counts[status] = counts.get(status, 0) + 1
+    if not counts:
+        return "0"
+    ordered = sorted(counts.items(), key=lambda pair: (-pair[1], pair[0]))
+    return ", ".join(f"{count} {status}" for status, count in ordered[:4])
+
+
+def _evaluation_summary_line(data: dict[str, Any]) -> str:
+    summary = data.get("evaluation_summary") or {}
+    suites = summary.get("suites") if isinstance(summary, dict) else {}
+    if not isinstance(suites, dict) or not suites:
+        return ""
+    parts = []
+    for suite, item in sorted(suites.items()):
+        if not isinstance(item, dict):
+            continue
+        total = int(item.get("total") or 0)
+        passed = int(item.get("passed") or 0)
+        if total:
+            parts.append(f"{suite} {passed}/{total}")
+    return ", ".join(parts[:3])
+
+
+def _short_observation_label(item: dict[str, Any]) -> str:
+    signature = str(item.get("signature") or "")
+    source = str(item.get("source") or "")
+    status = str(item.get("status") or "")
+    label = signature or source or item.get("id") or "observation"
+    return f"{status} · {label}" if status else str(label)
 
 
 def preview_is_blocked(status: str) -> bool:
@@ -162,6 +197,10 @@ def format_autonomy_status(data: dict[str, Any]) -> str:
     task = data.get("task") or {}
     status = str(task.get("status") or "")
     error_events = data.get("error_events") or []
+    task_runs = data.get("task_runs") if isinstance(data.get("task_runs"), list) else []
+    repairs = data.get("repair_attempts") if isinstance(data.get("repair_attempts"), list) else []
+    observations = data.get("runtime_observations") if isinstance(data.get("runtime_observations"), list) else []
+    approvals = data.get("approvals") if isinstance(data.get("approvals"), list) else []
     latest_error = {}
     if status_is_problem(status):
         latest_error = (data.get("latest_error") or (error_events[0] if isinstance(error_events, list) and error_events else {}))
@@ -172,11 +211,26 @@ def format_autonomy_status(data: dict[str, Any]) -> str:
         f"Repo : <code>{_html.escape(str(task.get('repo') or ''))}</code>",
         f"Statut : <b>{_html.escape(status)}</b>",
         f"Phase : <code>{_html.escape(str(task.get('current_phase') or ''))}</code>",
+        f"Mode : <code>{_html.escape(str(task.get('mode') or ''))}</code>",
     ]
+    parent = task.get("parent_task_id")
+    if parent:
+        lines.append(f"Reprise : <code>{_html.escape(str(parent))}</code>")
     preview = task.get("preview_url") or task.get("deployment_url")
     if preview:
         label = "Preview non validée" if preview_is_blocked(status) else "Preview"
         lines.append(f"{label} : {_html.escape(str(preview))}")
+    lines.extend([
+        "",
+        "<b>Vue rapide</b>",
+        f"Runs : <code>{_html.escape(_status_counts(task_runs))}</code>",
+        f"Repairs : <code>{_html.escape(_status_counts(repairs))}</code>",
+        f"Observations : <code>{len(observations)}</code>",
+        f"Approvals : <code>{_html.escape(_status_counts(approvals))}</code>",
+    ])
+    eval_line = _evaluation_summary_line(data)
+    if eval_line:
+        lines.append(f"Evals : <code>{_html.escape(eval_line)}</code>")
     if latest_error:
         lines.extend([
             "",
@@ -198,12 +252,39 @@ def format_autonomy_status(data: dict[str, Any]) -> str:
         lines.extend(["", "<b>Smoke tests</b>"])
         for item in smokes:
             lines.append(f"{status_badge(item.get('status'))} <code>{_html.escape(str(item.get('status') or ''))}</code> · {_html.escape(str(item.get('url') or ''))[:120]}")
+    if task_runs:
+        lines.extend(["", "<b>Runs récents</b>"])
+        for item in latest_items(data, "task_runs"):
+            phase = str(item.get("phase") or item.get("id") or "")
+            run_status = str(item.get("status") or "")
+            lines.append(f"{status_badge(run_status)} <code>{_html.escape(phase[:70])}</code> · {_html.escape(run_status)}")
+    if repairs:
+        lines.extend(["", "<b>Réparations</b>"])
+        for item in latest_items(data, "repair_attempts"):
+            runbook = str(item.get("runbook") or item.get("id") or "")
+            repair_status = str(item.get("status") or "")
+            attempt = item.get("attempt")
+            suffix = f" · tentative {attempt}" if attempt else ""
+            lines.append(f"{status_badge(repair_status)} <code>{_html.escape(runbook[:70])}</code> · {_html.escape(repair_status)}{_html.escape(suffix)}")
+    if observations:
+        lines.extend(["", "<b>Observations runtime</b>"])
+        for item in latest_items(data, "runtime_observations"):
+            label = _short_observation_label(item)
+            lines.append(f"{status_badge(item.get('status'))} <code>{_html.escape(label[:90])}</code>")
+    if approvals:
+        pending = [item for item in approvals if str(item.get("status") or "") == "pending"]
+        shown = pending or approvals
+        lines.extend(["", "<b>Approvals</b>"])
+        for item in shown[:3]:
+            label = str(item.get("approval_type") or item.get("id") or "")
+            approval_status = str(item.get("status") or "")
+            lines.append(f"{status_badge(approval_status)} <code>{_html.escape(label[:70])}</code> · {_html.escape(approval_status)}")
     runbooks = latest_items(data, "runbooks_applied")
     if runbooks:
         lines.extend(["", "<b>Runbooks</b>"])
         for item in runbooks:
             lines.append(f"{status_badge(item.get('status'))} <code>{_html.escape(str(item.get('runbook') or ''))}</code> · {_html.escape(str(item.get('status') or ''))}")
-    lines.append("\nDétail : <code>/runs " + _html.escape(str(task.get("id") or data.get("task_id") or "")) + "</code>")
+    lines.append("\nDétail technique : <code>/runs " + _html.escape(str(task.get("id") or data.get("task_id") or "")) + "</code>")
     return "\n".join(lines)
 
 
