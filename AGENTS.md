@@ -1257,6 +1257,7 @@ sous `docs/project/` et servent de source de reprise pour les agents :
 - `docs/project/PHASE0_COMPLETION_REPORT.md` — Phase 0.
 - `docs/project/PHASE1_COMPLETION_REPORT.md` — Phase 1.
 - `docs/project/PHASE2_OBSERVATION_BUS_REPORT.md` — Phase 2.
+- `docs/project/PHASE3_WORKER_RUNTIME_ENGINE_REPORT.md` — Phase 3.
 
 Avant de poursuivre une phase, relire le rapport dédié et les contrats
 normatifs dans `docs/brain/03-implementation-contracts.md`.

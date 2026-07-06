@@ -19,7 +19,7 @@ Ces documents sont la source à suivre pour les prochaines sessions. En cas de c
 | Phase 0 — stabilisation/inventaire | Terminé côté code local + déploiement VPS documenté | `PHASE0_COMPLETION_REPORT.md`, `gateway/deployment_info.py`, `scripts/inventory_symbols.py`, `docs/project/autonomie-v2-symbol-inventory.json` |
 | Phase 1 — extraction modules gateway | Terminé côté code local, sync VPS non fait | `PHASE1_COMPLETION_REPORT.md` |
 | Phase 2 — observation bus + contrats | Terminé côté gateway + backend VPS | `PHASE2_OBSERVATION_BUS_REPORT.md` |
-| Phase 3 — worker runtime engine | Pas commencé | Aucun `CommandSpan`/state machine v2 extrait côté Cockpit dans ce repo |
+| Phase 3 — worker runtime engine | Terminé côté backend/worker VPS | `PHASE3_WORKER_RUNTIME_ENGINE_REPORT.md` |
 | Phase 4 — self-repair v2 | Pas commencé | Ne pas démarrer sans `policy_engine` + snapshot/rollback testés |
 | Phase 5 — memory/handoff unifié | Pas commencé | `ActiveWorkStore` JSON existe encore |
 | Phase 6 — eval harness | Pas commencé | À créer après extraction orchestrator/classifier |
@@ -44,20 +44,21 @@ Le pattern actuel est volontairement conservateur :
 
 ## Point de reprise recommandé
 
-Passer à la Phase 3 seulement après validation humaine du résultat Phase 2.
+Passer à la Phase 4 seulement après validation humaine du résultat Phase 3.
 
 Prochaine cible :
 
 ```text
-Worker runtime engine
+Self-repair v2
 ```
 
 Ordre conseillé :
 
 1. Relire `docs/brain/03-implementation-contracts.md`.
-2. Relire `PHASE2_OBSERVATION_BUS_REPORT.md` pour les nouvelles tables et endpoints.
-3. Extraire `CommandSpan` / state machine worker selon Phase 3.
-4. Ne pas démarrer le self-repair v2 avant PolicyEngine + snapshots + rollback testés.
+2. Relire `PHASE2_OBSERVATION_BUS_REPORT.md` et `PHASE3_WORKER_RUNTIME_ENGINE_REPORT.md`.
+3. Implémenter `policy_engine.py` + `policies.yaml`.
+4. Ajouter snapshots/rollback par tentative avant tout repair automatique plus ambitieux.
+5. Garder le budget de repair par task, pas par observation.
 
 ## À ne pas faire maintenant
 
