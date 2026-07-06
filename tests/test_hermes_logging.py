@@ -1,5 +1,6 @@
 """Tests for hermes_logging — centralized logging setup."""
 import io
+import json
 import logging
 import os
 import stat
@@ -311,7 +312,7 @@ class TestGatewayMode:
         """gateway.log captures records from gateway.* loggers."""
         hermes_logging.setup_logging(hermes_home=hermes_home, mode="gateway")
 
-        gw_logger = logging.getLogger("gateway.platforms.telegram")
+        gw_logger = logging.getLogger("plugins.platforms.telegram.adapter")
         gw_logger.info("telegram connected")
 
         for h in logging.getLogger().handlers:
@@ -558,9 +559,14 @@ class TestComponentFilter:
         assert f.filter(record) is True
 
     def test_passes_nested_matching_prefix(self):
-        f = hermes_logging._ComponentFilter(("gateway",))
+        # Migrated platform adapters log under plugins.platforms.* (#41112);
+        # the gateway component filter is built from COMPONENT_PREFIXES["gateway"]
+        # (which includes "plugins.platforms"), so such records pass.
+        f = hermes_logging._ComponentFilter(
+            hermes_logging.COMPONENT_PREFIXES["gateway"]
+        )
         record = logging.LogRecord(
-            "gateway.platforms.telegram", logging.INFO, "", 0, "msg", (), None
+            "plugins.platforms.telegram.adapter", logging.INFO, "", 0, "msg", (), None
         )
         assert f.filter(record) is True
 
@@ -592,10 +598,16 @@ class TestComponentPrefixes:
 
     def test_gateway_prefix(self):
         assert "gateway" in hermes_logging.COMPONENT_PREFIXES
-        # The gateway component captures both core gateway logs and the
-        # hermes_plugins facility (plugin-installed gateway adapters log
-        # under that prefix).
-        assert ("gateway", "hermes_plugins") == hermes_logging.COMPONENT_PREFIXES["gateway"]
+        # The gateway component captures core gateway logs, the hermes_plugins
+        # facility, and plugins.platforms (messaging-platform adapters that
+        # migrated out of gateway/platforms/ into bundled plugins, #41112).
+        # Assert the required members as an invariant rather than an exact
+        # tuple snapshot so adding future gateway-component prefixes doesn't
+        # break this test.
+        gateway_prefixes = hermes_logging.COMPONENT_PREFIXES["gateway"]
+        assert "gateway" in gateway_prefixes
+        assert "hermes_plugins" in gateway_prefixes
+        assert "plugins.platforms" in gateway_prefixes
 
     def test_agent_prefix(self):
         prefixes = hermes_logging.COMPONENT_PREFIXES["agent"]
@@ -618,6 +630,37 @@ class TestComponentPrefixes:
         prefixes = hermes_logging.COMPONENT_PREFIXES["gui"]
         assert "hermes_cli.web_server" in prefixes
         assert "tui_gateway" in prefixes
+
+
+def test_emit_structured_telemetry_writes_metadata_only(hermes_home):
+    hermes_logging.set_session_context("sess_telemetry")
+    try:
+        path = hermes_logging.emit_structured_telemetry(
+            "llm_call",
+            source="gateway",
+            task_id="op_123",
+            payload={
+                "purpose": "classify",
+                "input_tokens": 12,
+                "prompt": "do not persist this",
+                "user_message": "also do not persist this",
+                "nested": {"api_key": "sk-secret"},
+            },
+            hermes_home=hermes_home,
+        )
+    finally:
+        hermes_logging.clear_session_context()
+
+    raw = path.read_text(encoding="utf-8")
+    event = json.loads(raw.splitlines()[-1])
+    assert event["kind"] == "llm_call"
+    assert event["session_id"] == "sess_telemetry"
+    assert event["payload"]["purpose"] == "classify"
+    assert event["payload"]["prompt_omitted"] is True
+    assert event["payload"]["user_message_omitted"] is True
+    assert event["payload"]["nested"]["api_key_omitted"] is True
+    assert "sk-secret" not in raw
+    assert "also do not persist this" not in raw
 
 
 class TestSetupVerboseLogging:

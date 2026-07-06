@@ -28,12 +28,14 @@ Session context:
 """
 
 import io
+import json
 import logging
 import os
 import sys
 import threading
+import time
 from pathlib import Path
-from typing import Optional, Sequence
+from typing import Any, Optional, Sequence
 
 # On Windows, stdlib ``RotatingFileHandler`` calls ``os.rename()`` in
 # ``doRollover()`` and fails with ``PermissionError [WinError 32]`` whenever
@@ -152,6 +154,107 @@ def clear_session_context() -> None:
     _session_context.session_id = None
 
 
+_TELEMETRY_BLOCKED_KEYS = {
+    "api_key",
+    "apikey",
+    "authorization",
+    "bearer",
+    "body",
+    "content",
+    "message",
+    "password",
+    "prompt",
+    "raw_excerpt",
+    "secret",
+    "text",
+    "token",
+}
+
+
+def emit_structured_telemetry(
+    kind: str,
+    *,
+    source: str = "gateway",
+    task_id: str | None = None,
+    run_id: str | None = None,
+    payload: dict[str, Any] | None = None,
+    hermes_home: Optional[Path] = None,
+) -> Path:
+    """Append one metadata-only telemetry event to ``logs/telemetry.jsonl``.
+
+    This is the gateway-side structured sink for the Cockpit telemetry store.
+    It omits prompt/message/body-like fields and secret-shaped keys; callers
+    should store references and counters, not user content.
+    """
+    home = hermes_home or get_hermes_home()
+    log_dir = home / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    path = log_dir / "telemetry.jsonl"
+    event = {
+        "ts": int(time.time()),
+        "kind": _telemetry_atom(kind, "event"),
+        "source": _telemetry_atom(source, "gateway"),
+        "session_id": getattr(_session_context, "session_id", None),
+        "task_id": _telemetry_optional(task_id),
+        "run_id": _telemetry_optional(run_id),
+        "payload": _sanitize_telemetry_payload(payload or {}),
+    }
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(event, ensure_ascii=False, sort_keys=True) + "\n")
+    try:
+        path.chmod(0o600)
+    except OSError:
+        pass
+    return path
+
+
+def _sanitize_telemetry_payload(value: Any) -> Any:
+    if isinstance(value, dict):
+        clean: dict[str, Any] = {}
+        for key, item in value.items():
+            key_text = str(key)
+            normalized = key_text.lower().replace("-", "_")
+            blocked_fragments = (
+                "api_key",
+                "authorization",
+                "body",
+                "content",
+                "message",
+                "password",
+                "prompt",
+                "secret",
+                "text",
+                "token",
+            )
+            if normalized in _TELEMETRY_BLOCKED_KEYS or any(
+                part in normalized for part in blocked_fragments
+            ):
+                clean[f"{key_text[:80]}_omitted"] = True
+                continue
+            clean[key_text[:80]] = _sanitize_telemetry_payload(item)
+        return clean
+    if isinstance(value, list):
+        return [_sanitize_telemetry_payload(item) for item in value[:50]]
+    if isinstance(value, str):
+        return value[:240]
+    if isinstance(value, (int, float, bool)) or value is None:
+        return value
+    return str(value)[:240]
+
+
+def _telemetry_atom(value: Any, default: str) -> str:
+    text = str(value or "").strip().lower()
+    text = "".join(ch if ch.isalnum() or ch in {"_", "-", "."} else "_" for ch in text)
+    return text[:80] or default
+
+
+def _telemetry_optional(value: Any) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text[:240] or None
+
+
 # ---------------------------------------------------------------------------
 # Record factory — injects session_tag into every LogRecord at creation
 # ---------------------------------------------------------------------------
@@ -210,7 +313,11 @@ class _ComponentFilter(logging.Filter):
 # Logger name prefixes that belong to each component.
 # Used by _ComponentFilter and exposed for ``hermes logs --component``.
 COMPONENT_PREFIXES = {
-    "gateway": ("gateway", "hermes_plugins"),
+    # ``plugins.platforms`` covers messaging-platform adapters that migrated
+    # out of ``gateway/platforms/`` into bundled plugins (#41112) — they are
+    # still gateway components and their logs belong in gateway.log / match
+    # ``hermes logs --component gateway``.
+    "gateway": ("gateway", "hermes_plugins", "plugins.platforms"),
     "agent": ("agent", "run_agent", "model_tools", "batch_runner"),
     "tools": ("tools",),
     "cli": ("hermes_cli", "cli"),
@@ -553,6 +660,13 @@ def _read_logging_config():
         if config_path.exists():
             with open(config_path, "r", encoding="utf-8") as f:
                 cfg = yaml.safe_load(f) or {}
+            # Managed scope: an administrator can pin logging.* too. Overlay via
+            # the shared helper (fail-open) since this reads config.yaml directly.
+            try:
+                from hermes_cli import managed_scope
+                cfg = managed_scope.apply_managed_overlay(cfg)
+            except Exception:
+                pass
             log_cfg = cfg.get("logging", {})
             if isinstance(log_cfg, dict):
                 return (
