@@ -16,13 +16,30 @@ import os
 import tempfile
 import html as _html
 import re
+import shlex
+import subprocess
+import time
+import urllib.parse
+from urllib import request as _urlrequest, error as _urlerror
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Set, Any
 
 logger = logging.getLogger(__name__)
 
+REPO_COCKPIT_MODES = {"ask_review", "pilote", "autopilot"}
+
+
+def normalize_cockpit_mode(mode: str | None) -> str:
+    """Return a supported Repo Cockpit mode, preserving the new Pilote flow."""
+    clean = str(mode or "").strip().lower()
+    return clean if clean in REPO_COCKPIT_MODES else "ask_review"
+
 try:
     from telegram import Update, Bot, Message, InlineKeyboardButton, InlineKeyboardMarkup
+    try:
+        from telegram import WebAppInfo
+    except ImportError:
+        WebAppInfo = None
     try:
         from telegram import LinkPreviewOptions
     except ImportError:
@@ -45,6 +62,7 @@ except ImportError:
     Message = Any
     InlineKeyboardButton = Any
     InlineKeyboardMarkup = Any
+    WebAppInfo = None
     LinkPreviewOptions = None
     Application = Any
     CommandHandler = Any
@@ -66,6 +84,8 @@ from pathlib import Path as _Path
 sys.path.insert(0, str(_Path(__file__).resolve().parents[2]))
 
 from gateway.config import Platform, PlatformConfig
+from gateway.observation_reporter import post_runtime_observations
+from gateway.platforms.telegram_models_config import TelegramModelsConfigMixin
 from gateway.platforms.base import (
     BasePlatformAdapter,
     MessageEvent,
@@ -87,6 +107,7 @@ from gateway.platforms.telegram_network import (
     discover_fallback_ips,
     parse_fallback_ip_env,
 )
+from gateway.human_heartbeat import progress_from_autonomy, render_progress_view
 from utils import atomic_replace
 
 _TELEGRAM_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
@@ -118,7 +139,7 @@ def check_telegram_requirements() -> bool:
     so the adapter's class-level type aliases get rebound.
     """
     global TELEGRAM_AVAILABLE, Update, Bot, Message, InlineKeyboardButton
-    global InlineKeyboardMarkup, LinkPreviewOptions, Application
+    global InlineKeyboardMarkup, WebAppInfo, LinkPreviewOptions, Application
     global CommandHandler, CallbackQueryHandler, TelegramMessageHandler
     global ContextTypes, filters, ParseMode, ChatType, HTTPXRequest
     if TELEGRAM_AVAILABLE:
@@ -131,6 +152,10 @@ def check_telegram_requirements() -> bool:
     try:
         from telegram import Update as _Update, Bot as _Bot, Message as _Message
         from telegram import InlineKeyboardButton as _IKB, InlineKeyboardMarkup as _IKM
+        try:
+            from telegram import WebAppInfo as _WAI
+        except ImportError:
+            _WAI = None
         try:
             from telegram import LinkPreviewOptions as _LPO
         except ImportError:
@@ -150,6 +175,7 @@ def check_telegram_requirements() -> bool:
     Message = _Message
     InlineKeyboardButton = _IKB
     InlineKeyboardMarkup = _IKM
+    WebAppInfo = _WAI
     LinkPreviewOptions = _LPO
     Application = _App
     CommandHandler = _CH
@@ -334,7 +360,7 @@ def _wrap_markdown_tables(text: str) -> str:
     return '\n'.join(out)
 
 
-class TelegramAdapter(BasePlatformAdapter):
+class TelegramAdapter(TelegramModelsConfigMixin, BasePlatformAdapter):
     """
     Telegram bot adapter.
 
@@ -492,6 +518,29 @@ class TelegramAdapter(BasePlatformAdapter):
         )
         # Interactive model picker state per chat
         self._model_picker_state: Dict[str, dict] = {}
+        # Repo Cockpit new-chat repo choices per Telegram user. Callback data is
+        # capped by Telegram, so buttons carry short indexes into this map.
+        self._repo_new_chat_choices: Dict[str, dict] = {}
+        # Pilot Intake guided workflow state (Telegram user id -> state).
+        # This keeps /new -> buttons -> natural prompt/replies command-free.
+        self._pilot_intake_states: Dict[str, dict] = {}
+        # Libre V2 state (Telegram user id -> soft orchestration state). Libre
+        # keeps durable memory and normal chat alive while closing transient
+        # repo/wizard state from the active Repo Cockpit flow.
+        self._libre_chat_states: Dict[str, dict] = {}
+        self._libre_watch_enabled: bool = self._coerce_bool_extra("libre_watch_enabled", False)
+        try:
+            self._libre_watch_interval_seconds = max(30.0, float(self.config.extra.get("libre_watch_interval_seconds", 300)))
+        except Exception:
+            self._libre_watch_interval_seconds = 300.0
+        try:
+            self._libre_watch_initial_delay_seconds = max(0.0, float(self.config.extra.get("libre_watch_initial_delay_seconds", 15)))
+        except Exception:
+            self._libre_watch_initial_delay_seconds = 15.0
+        self._libre_watch_task: Optional[asyncio.Task] = None
+        self._libre_watch_last_signature: str = ""
+        self._ensure_models_config_state()
+        self._cockpit_background_tasks: set[asyncio.Task] = set()
         # Approval button state: message_id → session_key
         self._approval_state: Dict[int, str] = {}
         # Slash-confirm button state: confirm_id → session_key (for /reload-mcp
@@ -1984,11 +2033,11 @@ class TelegramAdapter(BasePlatformAdapter):
                 self.name,
             )
             return False
-        
+
         if not self.config.token:
             logger.error("[%s] No bot token configured", self.name)
             return False
-        
+
         try:
             if not self._acquire_platform_lock('telegram-bot-token', self.config.token, 'Telegram bot token'):
                 return False
@@ -2078,7 +2127,7 @@ class TelegramAdapter(BasePlatformAdapter):
             builder = builder.request(request).get_updates_request(get_updates_request)
             self._app = builder.build()
             self._bot = self._app.bot
-            
+
             # Register handlers
             self._app.add_handler(TelegramMessageHandler(
                 filters.TEXT & ~filters.COMMAND,
@@ -2098,7 +2147,7 @@ class TelegramAdapter(BasePlatformAdapter):
             ))
             # Handle inline keyboard button callbacks (update prompts)
             self._app.add_handler(CallbackQueryHandler(self._handle_callback_query))
-            
+
             # Start polling — retry initialize() for transient TLS resets
             try:
                 from telegram.error import NetworkError, TimedOut
@@ -2197,7 +2246,7 @@ class TelegramAdapter(BasePlatformAdapter):
                     drop_pending_updates=True,
                     error_callback=_polling_error_callback,
                 )
-            
+
             # Register bot commands so Telegram shows a hint menu when users type /
             # List is derived from the central COMMAND_REGISTRY — adding a new
             # gateway command there automatically adds it to the Telegram menu.
@@ -2240,7 +2289,7 @@ class TelegramAdapter(BasePlatformAdapter):
                     e,
                     exc_info=True,
                 )
-            
+
             self._mark_connected()
             mode = "webhook" if self._webhook_mode else "polling"
             logger.info("[%s] Connected to Telegram (%s mode)", self.name, mode)
@@ -2256,8 +2305,10 @@ class TelegramAdapter(BasePlatformAdapter):
                     self.name, topics_err, exc_info=True,
                 )
 
+            self._start_libre_watch_daemon()
+
             return True
-            
+
         except Exception as e:
             self._release_platform_lock()
             message = f"Telegram startup failed: {e}"
@@ -2267,6 +2318,7 @@ class TelegramAdapter(BasePlatformAdapter):
 
     async def disconnect(self) -> None:
         """Stop polling/webhook, cancel pending album flushes, and disconnect."""
+        await self._stop_libre_watch_daemon()
         pending_media_group_tasks = list(self._media_group_tasks.values())
         for task in pending_media_group_tasks:
             task.cancel()
@@ -2336,7 +2388,7 @@ class TelegramAdapter(BasePlatformAdapter):
         # Skip whitespace-only text to prevent Telegram 400 empty-text errors.
         if not content or not content.strip():
             return SendResult(success=True, message_id=None)
-        
+
         try:
             # Bot API 10.1 rich fast-path: send the raw agent markdown via
             # sendRichMessage so tables/task lists/etc. render natively. Falls
@@ -2367,12 +2419,12 @@ class TelegramAdapter(BasePlatformAdapter):
                     re.sub(r" \((\d+)/(\d+)\)$", r" \\(\1/\2\\)", chunk)
                     for chunk in chunks
                 ]
-            
+
             message_ids = []
             thread_id = self._metadata_thread_id(metadata)
             requested_thread_id = self._message_thread_id_for_send(thread_id)
             used_thread_fallback = False
-            
+
             try:
                 from telegram.error import NetworkError as _NetErr
             except ImportError:
@@ -2588,7 +2640,7 @@ class TelegramAdapter(BasePlatformAdapter):
                     "thread_fallback": used_thread_fallback,
                 },
             )
-            
+
         except Exception as e:
             logger.error("[%s] Failed to send Telegram message: %s", self.name, e, exc_info=True)
             err_str = str(e).lower()
@@ -3888,6 +3940,365 @@ class TelegramAdapter(BasePlatformAdapter):
         query_thread_id = getattr(query_message, "message_thread_id", None)
         query_user_name = getattr(query.from_user, "first_name", None)
 
+        # --- /models combined picker (msc:*) ---
+        if data.startswith("msc:"):
+            caller_id = str(getattr(query.from_user, "id", ""))
+            if not self._is_callback_user_authorized(
+                caller_id,
+                chat_id=query_chat_id,
+                chat_type=str(query_chat_type) if query_chat_type is not None else None,
+                thread_id=str(query_thread_id) if query_thread_id is not None else None,
+                user_name=query_user_name,
+            ):
+                await query.answer(text="⛔ Tu n'es pas autorisé à utiliser ce bouton.")
+                return
+            await self._handle_models_config_callback(
+                query, data, str(query_chat_id or "")
+            )
+            return
+
+        # --- Repo Cockpit model/reasoning quick picks (rcp:*) ---
+        if data.startswith("rcp:"):
+            caller_id = str(getattr(query.from_user, "id", ""))
+            if not self._is_callback_user_authorized(
+                caller_id,
+                chat_id=query_chat_id,
+                chat_type=str(query_chat_type) if query_chat_type is not None else None,
+                thread_id=str(query_thread_id) if query_thread_id is not None else None,
+                user_name=query_user_name,
+            ):
+                await query.answer(text="⛔ Tu n'es pas autorisé à utiliser ce bouton.")
+                return
+            parts = data.split(":")
+            mode = normalize_cockpit_mode(parts[3] if len(parts) > 3 else None)
+            await self._handle_cockpit_prefs_callback(query, data, caller_id, mode)
+            return
+
+        # --- Repo Cockpit new-chat callbacks (rcn:verb:mode) ---
+        if data.startswith("rcn:"):
+            caller_id = str(getattr(query.from_user, "id", ""))
+            if not self._is_callback_user_authorized(
+                caller_id,
+                chat_id=query_chat_id,
+                chat_type=str(query_chat_type) if query_chat_type is not None else None,
+                thread_id=str(query_thread_id) if query_thread_id is not None else None,
+                user_name=query_user_name,
+            ):
+                await query.answer(text="⛔ Tu n'es pas autorisé à utiliser ce bouton.")
+                return
+            parts = data.split(":", 2)
+            verb = parts[1] if len(parts) > 1 else ""
+            mode = normalize_cockpit_mode(parts[2] if len(parts) > 2 else None)
+            if verb == "cancel":
+                self._pilot_intake_states.pop(caller_id, None)
+                await query.answer(text="Annulé")
+                try:
+                    await query.edit_message_text("Nouveau chat annulé.", reply_markup=None)
+                except Exception:
+                    pass
+                return
+            if verb == "mode":
+                await self._set_cockpit_mode(caller_id, mode, str(query_chat_id or ""))
+                await self._sync_cockpit_llm_prefs_to_api(caller_id, mode, str(query_chat_id or ""))
+                await query.answer(text=f"Mode: {self._mode_title(mode)}")
+                try:
+                    await query.edit_message_text(
+                        self._new_chat_text_with_prefs(mode, caller_id),
+                        parse_mode=ParseMode.HTML,
+                        reply_markup=self._new_chat_keyboard_with_prefs(mode, caller_id),
+                    )
+                except Exception:
+                    pass
+                return
+            if verb == "pickmodel":
+                prefs = self._get_cockpit_llm_prefs(caller_id)
+                await query.answer()
+                try:
+                    await query.edit_message_text(
+                        "<b>Modèle pour cette tâche</b>\n\n" + self._llm_prefs_summary_html(prefs),
+                        parse_mode=ParseMode.HTML,
+                        reply_markup=self._build_cockpit_model_keyboard(mode),
+                    )
+                except Exception:
+                    pass
+                return
+            if verb == "pickreason":
+                prefs = self._get_cockpit_llm_prefs(caller_id)
+                await query.answer()
+                try:
+                    await query.edit_message_text(
+                        "<b>Réflexion pour cette tâche</b>\n\n" + self._llm_prefs_summary_html(prefs),
+                        parse_mode=ParseMode.HTML,
+                        reply_markup=self._build_cockpit_reason_keyboard(mode),
+                    )
+                except Exception:
+                    pass
+                return
+            if verb == "intent":
+                intent = parts[2].split(":", 1)[0] if len(parts) > 2 else "pilot_discovery"
+                # Data shape is rcn:intent:<intent>:<mode>; recover mode from tail if present.
+                subparts = data.split(":")
+                intent = subparts[2] if len(subparts) > 2 else "pilot_discovery"
+                mode = normalize_cockpit_mode(subparts[3] if len(subparts) > 3 else mode)
+                self._pilot_intake_states[caller_id] = {
+                    "awaiting": "repo",
+                    "mode": mode,
+                    "origin": "github_existing",
+                    "intent": intent,
+                    "chat_id": str(query_chat_id or ""),
+                    "ts": time.time(),
+                }
+                await self._set_cockpit_mode(caller_id, mode, str(query_chat_id or ""))
+                await query.answer(text="Choisis le repo")
+                cockpit_url = self._repo_cockpit_url("/select-repo", mode=mode)
+                repos_payload = await asyncio.to_thread(self._cockpit_api_sync, "GET", "/api/internal/repos", None, 20)
+                repos = repos_payload.get("repos") if isinstance(repos_payload, dict) else []
+                if not isinstance(repos, list):
+                    repos = []
+                self._repo_new_chat_choices[caller_id] = {
+                    "repos": repos,
+                    "mode": mode,
+                    "chat_id": str(query_chat_id or ""),
+                    "intent": intent,
+                    "ts": time.time(),
+                }
+                try:
+                    await query.edit_message_text(
+                        "<b>Projet GitHub existant</b>\n\n"
+                        f"Route : <b>{_html.escape(self._pilot_intent_title(intent))}</b>\n\n"
+                        "Choisis le repo MFcv1 à utiliser.",
+                        parse_mode=ParseMode.HTML,
+                        reply_markup=self._repo_new_chat_keyboard(caller_id, mode, repos, cockpit_url),
+                    )
+                except Exception:
+                    pass
+                return
+            if verb == "existing":
+                await self._set_cockpit_mode(caller_id, mode, str(query_chat_id or ""))
+                if mode == "pilote":
+                    await query.answer(text="Choisis l'intention")
+                    try:
+                        await query.edit_message_text(
+                            "<b>Projet GitHub existant</b>\n\n"
+                            "Tu veux faire quoi sur ce repo ?",
+                            parse_mode=ParseMode.HTML,
+                            reply_markup=self._pilot_existing_intent_keyboard(mode),
+                        )
+                    except Exception:
+                        pass
+                    return
+                await query.answer(text="Repos MFcv1")
+                cockpit_url = self._repo_cockpit_url("/select-repo", mode=mode)
+                repos_payload = await asyncio.to_thread(self._cockpit_api_sync, "GET", "/api/internal/repos", None, 20)
+                repos = repos_payload.get("repos") if isinstance(repos_payload, dict) else []
+                if not isinstance(repos, list):
+                    repos = []
+                self._repo_new_chat_choices[caller_id] = {
+                    "repos": repos,
+                    "mode": mode,
+                    "chat_id": str(query_chat_id or ""),
+                    "ts": time.time(),
+                }
+                keyboard = self._repo_new_chat_keyboard(caller_id, mode, repos, cockpit_url)
+                try:
+                    await query.edit_message_text(
+                        "<b>Projet GitHub existant</b>\n\n"
+                        f"Mode choisi : <b>{_html.escape(self._mode_title(mode))}</b>\n\n"
+                        "Choisis un repo MFcv1 ci-dessous. La Mini App reste disponible en secours pour la liste complète.",
+                        parse_mode=ParseMode.HTML,
+                        reply_markup=keyboard,
+                    )
+                except Exception:
+                    pass
+                return
+            if verb == "scratch":
+                await self._set_cockpit_mode(caller_id, mode, str(query_chat_id or ""))
+                if mode == "pilote":
+                    self._pilot_intake_states[caller_id] = {
+                        "awaiting": "prompt",
+                        "mode": "pilote",
+                        "origin": "from_scratch",
+                        "intent": "architect",
+                        "chat_id": str(query_chat_id or ""),
+                        "ts": time.time(),
+                    }
+                    await query.answer(text="Écris le prompt")
+                    try:
+                        await query.edit_message_text(
+                            self._pilot_waiting_prompt_text(origin="from_scratch", intent="architect", user_id=caller_id),
+                            parse_mode=ParseMode.HTML,
+                            reply_markup=InlineKeyboardMarkup([[
+                                InlineKeyboardButton("Annuler", callback_data="rcn:cancel")
+                            ]]),
+                        )
+                    except Exception:
+                        pass
+                    return
+                await query.answer(text="Confirmation texte requise")
+                try:
+                    await query.edit_message_text(
+                        "<b>Start from scratch</b>\n\n"
+                        f"Mode choisi : <b>{_html.escape(self._mode_title(mode))}</b>\n\n"
+                        "Pour éviter une création accidentelle de repo GitHub, confirme avec une commande texte :\n\n"
+                        f"<code>/new scratch nom-projet | description courte | private | {mode}</code>\n\n"
+                        "Exemple :\n"
+                        f"<code>/new scratch landing-ai-test | landing page IA de test | private | {mode}</code>",
+                        parse_mode=ParseMode.HTML,
+                        reply_markup=None,
+                    )
+                except Exception:
+                    pass
+                return
+
+        # --- Repo Cockpit native repo selection callbacks (rcnr:mode:index) ---
+        if data.startswith("rcnr:"):
+            caller_id = str(getattr(query.from_user, "id", ""))
+            if not self._is_callback_user_authorized(
+                caller_id,
+                chat_id=query_chat_id,
+                chat_type=str(query_chat_type) if query_chat_type is not None else None,
+                thread_id=str(query_thread_id) if query_thread_id is not None else None,
+                user_name=query_user_name,
+            ):
+                await query.answer(text="⛔ Tu n'es pas autorisé à utiliser ce bouton.")
+                return
+            parts = data.split(":", 2)
+            mode = normalize_cockpit_mode(parts[1] if len(parts) > 1 else None)
+            try:
+                index = int(parts[2]) if len(parts) > 2 else -1
+            except ValueError:
+                index = -1
+            choice_state = self._repo_new_chat_choices.get(caller_id) or {}
+            repos = choice_state.get("repos") if isinstance(choice_state, dict) else []
+            if not isinstance(repos, list) or index < 0 or index >= len(repos):
+                await query.answer(text="Liste expirée, relance /new")
+                return
+            repo = str((repos[index] or {}).get("nameWithOwner") or "")
+            if not repo:
+                await query.answer(text="Repo invalide")
+                return
+            await query.answer(text="Sélection...")
+            prefs = self._get_cockpit_llm_prefs(caller_id)
+            payload = {
+                "telegram_user_id": caller_id,
+                "chat_id": str(query_chat_id or choice_state.get("chat_id") or ""),
+                "repo": repo,
+                "mode": mode,
+                "notify": False,
+                "chat_model": prefs.get("model"),
+                "chat_provider": prefs.get("provider"),
+                "reasoning_effort": prefs.get("reasoning_effort"),
+            }
+            result = await asyncio.to_thread(self._cockpit_api_sync, "POST", "/api/internal/select", payload, 20)
+            if not result.get("ok"):
+                try:
+                    await query.edit_message_text(
+                        "<b>Projet GitHub existant</b>\n\n"
+                        "Sélection impossible : <code>"
+                        + _html.escape(str(result.get("description") or result))[:900]
+                        + "</code>",
+                        parse_mode=ParseMode.HTML,
+                        reply_markup=None,
+                    )
+                except Exception:
+                    pass
+                return
+            self._repo_new_chat_choices.pop(caller_id, None)
+            thread_id = str(result.get("thread_id") or "")
+            if thread_id:
+                self._cockpit_register_thread_llm_prefs(
+                    chat_id=str(query_chat_id or choice_state.get("chat_id") or ""),
+                    thread_id=thread_id,
+                    telegram_user_id=caller_id,
+                )
+            try:
+                if mode == "pilote":
+                    intent = str(choice_state.get("intent") or (self._pilot_intake_states.get(caller_id) or {}).get("intent") or "pilot_discovery")
+                    self._pilot_intake_states[caller_id] = {
+                        "awaiting": "prompt",
+                        "mode": mode,
+                        "origin": "github_existing",
+                        "intent": intent,
+                        "repo": repo,
+                        "chat_id": str(query_chat_id or choice_state.get("chat_id") or ""),
+                        "thread_id": thread_id,
+                        "ts": time.time(),
+                    }
+                    await query.edit_message_text(
+                        self._pilot_waiting_prompt_text(origin="github_existing", intent=intent, repo=repo, user_id=caller_id),
+                        parse_mode=ParseMode.HTML,
+                        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Annuler", callback_data="rcn:cancel")]]),
+                    )
+                else:
+                    await query.edit_message_text(
+                        self._repo_selected_text(repo, mode, str(result.get("thread_id") or "")),
+                        parse_mode=ParseMode.HTML,
+                        reply_markup=self._repo_selected_keyboard(mode),
+                    )
+            except Exception:
+                pass
+            return
+
+        # --- Repo Cockpit thread callbacks (rct:verb:arg) ---
+        if data.startswith("rct:"):
+            caller_id = str(getattr(query.from_user, "id", ""))
+            if not self._is_callback_user_authorized(
+                caller_id,
+                chat_id=query_chat_id,
+                chat_type=str(query_chat_type) if query_chat_type is not None else None,
+                thread_id=str(query_thread_id) if query_thread_id is not None else None,
+                user_name=query_user_name,
+            ):
+                await query.answer(text="⛔ Tu n'es pas autorisé à utiliser ce bouton.")
+                return
+            await self._handle_thread_callback(query, data, caller_id)
+            return
+
+        # --- Repo Cockpit autonomy callbacks (rca:verb:task_id) ---
+        if data.startswith("rca:"):
+            caller_id = str(getattr(query.from_user, "id", ""))
+            if not self._is_callback_user_authorized(
+                caller_id,
+                chat_id=query_chat_id,
+                chat_type=str(query_chat_type) if query_chat_type is not None else None,
+                thread_id=str(query_thread_id) if query_thread_id is not None else None,
+                user_name=query_user_name,
+            ):
+                await query.answer(text="⛔ Tu n'es pas autorisé à utiliser ce bouton.")
+                return
+            await self._handle_autonomy_callback(query, data)
+            return
+
+        # --- Simple developer cockpit callbacks (dev:section) ---
+        if data.startswith("dev:"):
+            caller_id = str(getattr(query.from_user, "id", ""))
+            if not self._is_callback_user_authorized(
+                caller_id,
+                chat_id=query_chat_id,
+                chat_type=str(query_chat_type) if query_chat_type is not None else None,
+                thread_id=str(query_thread_id) if query_thread_id is not None else None,
+                user_name=query_user_name,
+            ):
+                await query.answer(text="⛔ Tu n'es pas autorisé à utiliser ce bouton.")
+                return
+            await self._handle_dev_callback(query, data)
+            return
+
+        # --- Scheduled jobs callbacks (job:verb:id) ---
+        if data.startswith("job:"):
+            caller_id = str(getattr(query.from_user, "id", ""))
+            if not self._is_callback_user_authorized(
+                caller_id,
+                chat_id=query_chat_id,
+                chat_type=str(query_chat_type) if query_chat_type is not None else None,
+                thread_id=str(query_thread_id) if query_thread_id is not None else None,
+                user_name=query_user_name,
+            ):
+                await query.answer(text="⛔ Tu n'es pas autorisé à utiliser ce bouton.")
+                return
+            await self._handle_jobs_callback(query, data)
+            return
+
         # --- Model picker callbacks ---
         if data.startswith(("mp:", "mpg:", "mm:", "mc:", "mb", "mx", "mg:")):
             chat_id = str(query.message.chat_id) if query.message else None
@@ -4389,11 +4800,11 @@ class TelegramAdapter(BasePlatformAdapter):
         """Send audio as a native Telegram voice message or audio file."""
         if not self._bot:
             return SendResult(success=False, error="Not connected")
-        
+
         try:
             if not os.path.exists(audio_path):
                 return SendResult(success=False, error=self._missing_media_path_error("Audio", audio_path))
-            
+
             with open(audio_path, "rb") as audio_file:
                 ext = os.path.splitext(audio_path)[1].lower()
                 # .ogg / .opus files -> send as voice (round playable bubble)
@@ -4803,7 +5214,7 @@ class TelegramAdapter(BasePlatformAdapter):
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
         """Send an image natively as a Telegram photo.
-        
+
         Tries URL-based send first (fast, works for <5MB images).
         Falls back to downloading and uploading as file (supports up to 10MB).
         """
@@ -4899,7 +5310,7 @@ class TelegramAdapter(BasePlatformAdapter):
         """Send an animated GIF natively as a Telegram animation (auto-plays inline)."""
         if not self._bot:
             return SendResult(success=False, error="Not connected")
-        
+
         try:
             _anim_thread = self._metadata_thread_id(metadata)
             reply_to_id = self._reply_to_message_id_for_send(reply_to, metadata, reply_to_mode=self._reply_to_mode)
@@ -4974,10 +5385,10 @@ class TelegramAdapter(BasePlatformAdapter):
         """Get information about a Telegram chat."""
         if not self._bot:
             return {"name": "Unknown", "type": "dm"}
-        
+
         try:
             chat = await self._bot.get_chat(int(chat_id))
-            
+
             chat_type = "dm"
             if chat.type == ChatType.GROUP:
                 chat_type = "group"
@@ -4987,7 +5398,7 @@ class TelegramAdapter(BasePlatformAdapter):
                     chat_type = "forum"
             elif chat.type == ChatType.CHANNEL:
                 chat_type = "channel"
-            
+
             return {
                 "name": chat.title or chat.full_name or str(chat_id),
                 "type": chat_type,
@@ -5915,9 +6326,2859 @@ class TelegramAdapter(BasePlatformAdapter):
 
         event = self._build_message_event(msg, MessageType.TEXT, update_id=update.update_id)
         event.text = self._clean_bot_trigger_text(event.text)
+        event._telegram_message = msg  # type: ignore[attr-defined]
         await self._cache_replied_media(msg, event)
         event = self._apply_telegram_group_observe_attribution(event)
         self._enqueue_text_event(event)
+
+
+    def _cockpit_api_sync(self, method: str, path: str, payload: dict | None = None, timeout: int = 20) -> dict:
+        """Call local Repo Cockpit backend without consuming LLM quota."""
+        url = "http://127.0.0.1:8765" + path
+        data = None if payload is None else json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        req = _urlrequest.Request(url, data=data, headers={"Content-Type": "application/json"}, method=method)
+        try:
+            with _urlrequest.urlopen(req, timeout=timeout) as r:
+                return json.loads(r.read().decode("utf-8"))
+        except _urlerror.HTTPError as exc:
+            return {"ok": False, "error_code": exc.code, "description": exc.read().decode("utf-8", "replace")[:1200]}
+        except Exception as exc:
+            return {"ok": False, "description": str(exc)}
+
+    async def _log_cockpit_message(self, msg: Message | None, *, direction: str, role: str, command: str | None = None, sent: Message | None = None) -> None:
+        """Persist Telegram message ids in Repo Cockpit so /clean can delete known recent noise."""
+        target = sent or msg
+        if not target:
+            return
+        chat_id = getattr(target, "chat_id", None) or getattr(getattr(target, "chat", None), "id", None)
+        message_id = getattr(target, "message_id", None)
+        if chat_id is None or message_id is None:
+            return
+        payload = {"chat_type": getattr(getattr(target, "chat", None), "type", None)}
+        body = {"chat_id": str(chat_id), "message_id": int(message_id), "direction": direction, "message_role": role, "command": command, "payload": payload}
+        try:
+            await asyncio.to_thread(self._cockpit_api_sync, "POST", "/api/telegram/messages/log", body, 10)
+        except Exception:
+            pass
+
+    async def _send_cockpit_text(self, msg: Message, text: str, *, parse_mode: str | None = "HTML", role: str = "bot_reply") -> None:
+        try:
+            sent = await msg.reply_text(text[:3900], parse_mode=parse_mode, disable_web_page_preview=True)
+        except Exception:
+            sent = await msg.reply_text(re.sub(r"<[^>]+>", "", text)[:3900])
+        await self._log_cockpit_message(msg, direction="outgoing", role=role, sent=sent)
+
+    async def _send_cockpit_panel(self, msg: Message, text: str, keyboard: InlineKeyboardMarkup, *, role: str = "preview") -> Message | None:
+        try:
+            sent = await msg.reply_text(
+                text[:3900],
+                parse_mode=ParseMode.HTML,
+                reply_markup=keyboard,
+                disable_web_page_preview=True,
+            )
+        except Exception:
+            sent = await msg.reply_text(re.sub(r"<[^>]+>", "", text)[:3900], reply_markup=keyboard)
+        await self._log_cockpit_message(msg, direction="outgoing", role=role, sent=sent)
+        return sent
+
+    async def _edit_cockpit_panel(
+        self,
+        chat_id: str | int,
+        message_id: str | int,
+        text: str,
+        keyboard: InlineKeyboardMarkup,
+    ) -> bool:
+        if not self._bot:
+            return False
+        try:
+            await self._bot.edit_message_text(
+                chat_id=int(chat_id),
+                message_id=int(message_id),
+                text=text[:3900],
+                parse_mode=ParseMode.HTML,
+                reply_markup=keyboard,
+                disable_web_page_preview=True,
+            )
+            return True
+        except Exception as exc:
+            if "not modified" in str(exc).lower():
+                return True
+            try:
+                await self._bot.edit_message_text(
+                    chat_id=int(chat_id),
+                    message_id=int(message_id),
+                    text=re.sub(r"<[^>]+>", "", text)[:3900],
+                    reply_markup=keyboard,
+                    disable_web_page_preview=True,
+                )
+                return True
+            except Exception as retry_exc:
+                logger.warning("[%s] Cockpit panel edit failed: %s", self.name, retry_exc)
+                return False
+
+    def _mode_title(self, mode: str) -> str:
+        mode = normalize_cockpit_mode(mode)
+        if mode == "autopilot":
+            return "Autopilot"
+        if mode == "pilote":
+            return "Pilote"
+        return "Ask review"
+
+    def _mode_note(self, mode: str) -> str:
+        mode = normalize_cockpit_mode(mode)
+        if mode == "autopilot":
+            return "peut merger automatiquement seulement après PR, gates, secret scan et review indépendante high"
+        if mode == "pilote":
+            return "cadre d'abord Architect/Deploy, pose les questions critiques, puis avance en autonomie avec PR et gates"
+        return "prépare, teste et ouvre une PR, puis attend ta validation avant merge"
+
+    async def _get_cockpit_state(self, telegram_user_id: str) -> dict:
+        return await asyncio.to_thread(self._cockpit_api_sync, "GET", f"/api/internal/state/{telegram_user_id}", None, 10)
+
+    async def _set_cockpit_mode(self, telegram_user_id: str, mode: str, chat_id: str | None = None) -> dict:
+        mode = normalize_cockpit_mode(mode)
+        return await asyncio.to_thread(
+            self._cockpit_api_sync,
+            "POST",
+            "/api/internal/state",
+            {"telegram_user_id": str(telegram_user_id), "mode": mode, "chat_id": str(chat_id or "")},
+            10,
+        )
+
+    def _repo_cockpit_url(self, path: str = "/", **params: str) -> str:
+        base = os.getenv(
+            "REPO_COCKPIT_URL",
+            "https://cockpit.134.122.73.242.sslip.io/?v=20260620-immediate-close",
+        )
+        parsed = urllib.parse.urlsplit(base)
+        clean_path = "/" + path.lstrip("/")
+        existing = dict(urllib.parse.parse_qsl(parsed.query, keep_blank_values=True))
+        existing.update({k: v for k, v in params.items() if v is not None})
+        existing["v"] = str(int(time.time()))
+        return urllib.parse.urlunsplit((
+            parsed.scheme,
+            parsed.netloc,
+            clean_path,
+            urllib.parse.urlencode(existing),
+            parsed.fragment,
+        ))
+
+    def _new_chat_keyboard(self, mode: str) -> InlineKeyboardMarkup:
+        mode = normalize_cockpit_mode(mode)
+        return InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton(("✓ Ask review" if mode == "ask_review" else "Ask review"), callback_data="rcn:mode:ask_review"),
+                InlineKeyboardButton(("✓ Pilote" if mode == "pilote" else "Pilote"), callback_data="rcn:mode:pilote"),
+            ],
+            [
+                InlineKeyboardButton(("✓ Autopilot" if mode == "autopilot" else "Autopilot"), callback_data="rcn:mode:autopilot"),
+            ],
+            [
+                InlineKeyboardButton("Projet GitHub existant", callback_data=f"rcn:existing:{mode}"),
+            ],
+            [
+                InlineKeyboardButton("Start from scratch", callback_data=f"rcn:scratch:{mode}"),
+            ],
+            [
+                InlineKeyboardButton("Annuler", callback_data="rcn:cancel"),
+            ],
+        ])
+
+
+    def _pilot_default_reasoning(self, user_id: str, origin: str | None = None, intent: str | None = None) -> str:
+        prefs = self._get_cockpit_llm_prefs(user_id)
+        selected = str(prefs.get("reasoning_effort") or "medium").lower()
+        if selected in {"high", "xhigh"}:
+            return selected
+        if origin == "from_scratch" or intent in {"deploy", "review_harden"}:
+            return "high"
+        return selected if selected in {"low", "medium"} else "medium"
+
+    def _pilot_intent_title(self, intent: str | None) -> str:
+        titles = {
+            "architect": "Architect / cadrage",
+            "deploy": "Déployer / vérifier prod",
+            "audit_repo": "Comprendre / auditer le repo",
+            "feature_work": "Modifier / ajouter une feature",
+            "debug_fix": "Corriger un bug",
+            "review_harden": "Refactor / sécuriser",
+            "pilot_discovery": "Je ne sais pas",
+        }
+        return titles.get(str(intent or ""), "Architect / cadrage")
+
+    def _pilot_existing_intent_keyboard(self, mode: str = "pilote") -> InlineKeyboardMarkup:
+        mode = normalize_cockpit_mode(mode)
+        return InlineKeyboardMarkup([
+            [InlineKeyboardButton("Comprendre / auditer le repo", callback_data=f"rcn:intent:audit_repo:{mode}")],
+            [InlineKeyboardButton("Modifier / ajouter une feature", callback_data=f"rcn:intent:feature_work:{mode}")],
+            [InlineKeyboardButton("Corriger un bug", callback_data=f"rcn:intent:debug_fix:{mode}")],
+            [InlineKeyboardButton("Déployer / vérifier prod", callback_data=f"rcn:intent:deploy:{mode}")],
+            [InlineKeyboardButton("Refactor / sécuriser", callback_data=f"rcn:intent:review_harden:{mode}")],
+            [InlineKeyboardButton("Je ne sais pas", callback_data=f"rcn:intent:pilot_discovery:{mode}")],
+            [InlineKeyboardButton("Retour", callback_data=f"rcn:mode:{mode}"), InlineKeyboardButton("Annuler", callback_data="rcn:cancel")],
+        ])
+
+    def _pilot_waiting_prompt_text(self, *, origin: str, intent: str, repo: str | None = None, user_id: str = "") -> str:
+        reasoning = self._pilot_default_reasoning(user_id, origin, intent) if user_id else "high"
+        lines = [
+            "<b>🧭 Pilote prêt</b>",
+            "",
+            f"Source : <b>{'Start from scratch' if origin == 'from_scratch' else 'Projet GitHub existant'}</b>",
+            f"Route : <b>{_html.escape(self._pilot_intent_title(intent))}</b>",
+            f"Plan : <b>{_html.escape(reasoning)}</b>",
+        ]
+        if repo:
+            lines.append(f"Repo : <code>{_html.escape(repo)}</code>")
+        lines.extend([
+            "",
+            "Écris maintenant ce que tu veux que je fasse.",
+            "",
+            "Pas besoin de <code>/task</code> : ton prochain message devient la tâche Pilote.",
+        ])
+        return "\n".join(lines)
+
+    def _pilot_slug_from_text(self, text: str) -> str:
+        raw = re.sub(r"[^a-zA-Z0-9]+", "-", (text or "").lower()).strip("-")
+        raw = re.sub(r"-+", "-", raw)[:42].strip("-")
+        return raw or f"pilot-project-{int(time.time())}"
+
+    async def _pilot_create_scratch_and_task(self, msg: Message, task_text: str, state: dict) -> bool:
+        user_id = str(getattr(getattr(msg, "from_user", None), "id", "") or getattr(msg, "chat_id", ""))
+        title = self._pilot_slug_from_text(task_text)
+        prefs = self._get_cockpit_llm_prefs(user_id)
+        payload = {
+            "telegram_user_id": user_id,
+            "chat_id": str(getattr(msg, "chat_id", "")),
+            "title": title,
+            "mode": "pilote",
+            "visibility": "private",
+            "description": task_text[:600],
+            "create_repo": True,
+            "chat_model": prefs.get("model"),
+            "chat_provider": prefs.get("provider"),
+            "reasoning_effort": self._pilot_default_reasoning(user_id, "from_scratch", state.get("intent") or "architect"),
+        }
+        data = await asyncio.to_thread(self._cockpit_api_sync, "POST", "/api/internal/projects", payload, 90)
+        if not data.get("ok"):
+            await self._send_cockpit_text(
+                msg,
+                "<b>❌ Création projet impossible</b>\n\n<code>" + _html.escape(str(data.get("description") or data))[:1200] + "</code>",
+                role="preview",
+            )
+            return True
+        await self._send_cockpit_text(
+            msg,
+            "<b>✅ Projet Pilote créé</b>\n\n"
+            f"Repo : <code>{_html.escape(data.get('repo') or '')}</code>\n"
+            "Je crée maintenant la tâche autonome avec ton prompt.",
+            role="sticky",
+        )
+        thread_id = str(data.get("thread_id") or "")
+        if thread_id:
+            self._cockpit_register_thread_llm_prefs(
+                chat_id=str(getattr(msg, "chat_id", "")),
+                thread_id=thread_id,
+                telegram_user_id=user_id,
+            )
+        await self._create_task_from_thread_command(msg, task_text)
+        return True
+
+    async def _maybe_handle_pilot_intake_text(self, msg: Message, text: str) -> bool:
+        clean = (text or "").strip()
+        if not clean or clean.startswith("/"):
+            return False
+        user_id = str(getattr(getattr(msg, "from_user", None), "id", "") or getattr(msg, "chat_id", ""))
+        state = self._pilot_intake_states.get(user_id) or {}
+        if state.get("awaiting") == "prompt":
+            self._pilot_intake_states.pop(user_id, None)
+            origin = str(state.get("origin") or "existing_repo")
+            if origin == "from_scratch":
+                return await self._pilot_create_scratch_and_task(msg, clean, state)
+            await self._create_task_from_thread_command(msg, clean)
+            return True
+
+        # If a Pilote task is waiting for context, a natural message is the answer.
+        pending = await asyncio.to_thread(
+            self._cockpit_api_sync,
+            "GET",
+            f"/api/internal/tasks/pilot-pending/{user_id}",
+            None,
+            15,
+        )
+        if pending.get("ok") and pending.get("pending") and (pending.get("task") or {}).get("id"):
+            pilot_task_id = str((pending.get("task") or {}).get("id"))
+            result = await asyncio.to_thread(
+                self._cockpit_api_sync,
+                "POST",
+                f"/api/internal/tasks/{pilot_task_id}/pilot-answer",
+                {"telegram_user_id": user_id, "answer": clean},
+                20,
+            )
+            if result.get("ok"):
+                await self._send_cockpit_text(
+                    msg,
+                    "<b>🧭 Réponse Pilote reçue</b>\n\n"
+                    f"Tâche : <code>{_html.escape(pilot_task_id)}</code>\n"
+                    f"Statut : <code>{_html.escape(str(result.get('status') or 'queued_plan'))}</code>\n\n"
+                    "Je relance le worker avec ce contexte.",
+                    role="sticky",
+                )
+                asyncio.create_task(self._run_autopilot_worker_after_task_create(msg, pilot_task_id))
+                return True
+        return False
+
+    def _repo_button_label(self, repo: dict) -> str:
+        full_name = str(repo.get("nameWithOwner") or repo.get("name") or "Repo")
+        name = full_name.split("/", 1)[-1]
+        clean = re.sub(r"\s+", " ", name).strip() or "Repo"
+        if len(clean) > 30:
+            clean = clean[:29].rstrip() + "…"
+        visibility = "privé" if repo.get("isPrivate") else "public"
+        return f"{clean} · {visibility}"
+
+    def _repo_new_chat_keyboard(self, user_id: str, mode: str, repos: list[dict], cockpit_url: str) -> InlineKeyboardMarkup:
+        mode = normalize_cockpit_mode(mode)
+        rows: list[list[InlineKeyboardButton]] = []
+        for index, repo in enumerate(repos[:8]):
+            if not isinstance(repo, dict) or not repo.get("nameWithOwner"):
+                continue
+            rows.append([
+                InlineKeyboardButton(
+                    self._repo_button_label(repo),
+                    callback_data=f"rcnr:{mode}:{index}",
+                )
+            ])
+        if not rows:
+            rows.append([InlineKeyboardButton("Actualiser les repos", callback_data=f"rcn:existing:{mode}")])
+        button_kwargs = (
+            {"web_app": WebAppInfo(url=cockpit_url)}
+            if WebAppInfo is not None
+            else {"url": cockpit_url}
+        )
+        rows.append([InlineKeyboardButton("Mini App liste complète", **button_kwargs)])
+        rows.append([
+            InlineKeyboardButton("Actualiser", callback_data=f"rcn:existing:{mode}"),
+            InlineKeyboardButton("Annuler", callback_data="rcn:cancel"),
+        ])
+        return InlineKeyboardMarkup(rows)
+
+    def _repo_selected_text(self, repo: str, mode: str, thread_id: str | None = None) -> str:
+        mode = normalize_cockpit_mode(mode)
+        lines = [
+            "<b>✅ Repo sélectionné</b>",
+            "",
+            f"Repo : <code>{_html.escape(repo)}</code>",
+            f"Mode : <b>{_html.escape(self._mode_title(mode))}</b>",
+        ]
+        if thread_id:
+            lines.append(f"Conversation : <code>{_html.escape(str(thread_id))}</code>")
+        lines.extend([
+            "",
+            "Prochaine étape : envoie ta tâche directement dans ce chat.",
+        ])
+        return "\n".join(lines)
+
+    def _repo_selected_keyboard(self, mode: str) -> InlineKeyboardMarkup:
+        mode = normalize_cockpit_mode(mode)
+        return InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("Changer repo", callback_data=f"rcn:existing:{mode}"),
+                InlineKeyboardButton("Ask review", callback_data="rcn:mode:ask_review"),
+            ],
+            [
+                InlineKeyboardButton("Pilote", callback_data="rcn:mode:pilote"),
+                InlineKeyboardButton("Autopilot", callback_data="rcn:mode:autopilot"),
+            ],
+            [
+                InlineKeyboardButton("Annuler", callback_data="rcn:cancel"),
+            ],
+        ])
+
+    def _new_chat_text(self, mode: str, selected_repo: str | None = None) -> str:
+        mode = normalize_cockpit_mode(mode)
+        repo_line = f"Repo actuel : <code>{_html.escape(selected_repo)}</code>" if selected_repo else "Repo actuel : <i>aucun repo sélectionné</i>"
+        return (
+            "<b>🧭 Nouveau chat Hermes</b>\n\n"
+            f"Mode : <b>{_html.escape(self._mode_title(mode))}</b>\n"
+            f"Effet : {_html.escape(self._mode_note(mode))}.\n"
+            f"{repo_line}\n\n"
+            "Choisis si ce clavardage part d'un repo GitHub existant ou d'un nouveau projet."
+        )
+
+    async def _send_new_command(self, msg: Message, args: str = "") -> None:
+        args = (args or "").strip()
+        if args.lower().startswith("scratch "):
+            return await self._create_scratch_project_from_command(msg, args[len("scratch "):])
+        user_id = str(getattr(getattr(msg, "from_user", None), "id", "") or getattr(msg, "chat_id", ""))
+        state = await self._get_cockpit_state(user_id)
+        mode = normalize_cockpit_mode(state.get("mode"))
+        if args.lower() in REPO_COCKPIT_MODES:
+            mode = normalize_cockpit_mode(args)
+            await asyncio.to_thread(
+                self._cockpit_api_sync,
+                "POST",
+                "/api/internal/state",
+                {
+                    "telegram_user_id": user_id,
+                    "mode": mode,
+                    "chat_id": str(getattr(msg, "chat_id", "")),
+                },
+                10,
+            )
+            state["mode"] = mode
+        await self._send_cockpit_panel(
+            msg,
+            self._new_chat_text_with_prefs(mode, user_id, state.get("selected_repo")),
+            self._new_chat_keyboard_with_prefs(mode, user_id),
+            role="preview",
+        )
+
+    async def _create_scratch_project_from_command(self, msg: Message, raw: str) -> None:
+        # Format: /new scratch repo-name | description | private|public | ask_review|pilote|autopilot
+        parts = [p.strip() for p in raw.split("|")]
+        title = parts[0] if parts else ""
+        if not title:
+            return await self._send_cockpit_text(
+                msg,
+                "<b>Start from scratch</b>\n\nUsage : <code>/new scratch nom-projet | description | private | pilote</code>",
+                role="preview",
+            )
+        description = parts[1] if len(parts) > 1 and parts[1] else title
+        visibility = parts[2].lower() if len(parts) > 2 and parts[2].lower() in {"private", "public"} else "private"
+        mode = normalize_cockpit_mode(parts[3] if len(parts) > 3 else None)
+        user_id = str(getattr(getattr(msg, "from_user", None), "id", "") or getattr(msg, "chat_id", ""))
+        prefs = self._get_cockpit_llm_prefs(user_id)
+        payload = {
+            "telegram_user_id": user_id,
+            "chat_id": str(getattr(msg, "chat_id", "")),
+            "title": title,
+            "mode": mode,
+            "visibility": visibility,
+            "description": description,
+            "create_repo": True,
+            "chat_model": prefs.get("model"),
+            "chat_provider": prefs.get("provider"),
+            "reasoning_effort": prefs.get("reasoning_effort"),
+        }
+        data = await asyncio.to_thread(self._cockpit_api_sync, "POST", "/api/internal/projects", payload, 90)
+        if not data.get("ok"):
+            return await self._send_cockpit_text(
+                msg,
+                "<b>❌ Création projet impossible</b>\n\n<code>" + _html.escape(str(data.get("description") or data))[:1200] + "</code>",
+                role="preview",
+            )
+        text = (
+            "<b>✅ Nouveau projet créé</b>\n\n"
+            f"Projet : <code>{_html.escape(data.get('title',''))}</code>\n"
+            f"Repo : <code>{_html.escape(data.get('repo') or '')}</code>\n"
+            f"Mode : <b>{_html.escape(self._mode_title(data.get('mode','ask_review')))}</b>\n"
+            f"Thread : <code>{_html.escape(data.get('thread_id',''))}</code>\n\n"
+            "Tu peux maintenant écrire la tâche à réaliser dans ce chat."
+        )
+        await self._send_cockpit_text(msg, text, role="sticky")
+        thread_id = str(data.get("thread_id") or "")
+        if thread_id:
+            self._cockpit_register_thread_llm_prefs(
+                chat_id=str(getattr(msg, "chat_id", "")),
+                thread_id=thread_id,
+                telegram_user_id=user_id,
+            )
+
+    async def _send_tasks_command(self, msg: Message, args: str = "") -> None:
+        data = await asyncio.to_thread(self._cockpit_api_sync, "GET", "/api/tasks?limit=12", None, 20)
+        tasks = data.get("tasks") or []
+        if not tasks:
+            return await self._send_cockpit_text(msg, "<b>📋 Tâches</b>\n\nAucune tâche.")
+        lines = ["<b>📋 Tâches Repo Cockpit</b>", ""]
+        for t in tasks:
+            lines.append(f"<code>{_html.escape(t.get('id',''))}</code> · <b>{_html.escape(t.get('status',''))}</b> · {_html.escape(t.get('repo',''))}")
+        lines.append("\nDétail : <code>/task ID</code>")
+        await self._send_cockpit_text(msg, "\n".join(lines))
+
+    def _pending_pr_label(self, item: dict) -> str:
+        repo = str(item.get("repo") or "")
+        task_id = str(item.get("task_id") or "")
+        title = str(item.get("title") or "")
+        blob = f"{repo} {title}".lower()
+        if "tennis" in blob:
+            project = "tennis"
+        else:
+            project = repo.rsplit("/", 1)[-1] if repo else "projet"
+        project = re.sub(r"[^a-zA-Z0-9_-]+", "-", project).strip("-") or "projet"
+        if len(project) > 18:
+            project = project[:18].rstrip("-")
+        suffix = task_id[-6:] if task_id else ""
+        return f"{project} · {suffix}" if suffix else project
+
+    def _format_pending_prs(self, data: dict) -> str:
+        prs = data.get("prs") or []
+        lines = ["<b>🔀 PRs en attente</b>", ""]
+        if not prs:
+            lines.append("Aucune PR en attente côté Repo Cockpit.")
+            return "\n".join(lines)
+        for idx, item in enumerate(prs[:10], 1):
+            task_id = str(item.get("task_id") or "")
+            repo = str(item.get("repo") or "")
+            status = str(item.get("status") or "")
+            title = str(item.get("title") or "Tâche Hermes")
+            branch = str(item.get("branch") or "")
+            updated = item.get("updated_at")
+            updated_txt = ""
+            try:
+                updated_txt = datetime.fromtimestamp(int(updated), tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+            except Exception:
+                updated_txt = str(updated or "")
+            lines.extend([
+                f"<b>{idx}. {_html.escape(repo)}</b>",
+                f"{_html.escape(title[:120])}",
+                f"Status : <code>{_html.escape(status)}</code>",
+                f"Task : <code>{_html.escape(task_id)}</code>",
+            ])
+            if branch:
+                lines.append(f"Branche : <code>{_html.escape(branch)}</code>")
+            smoke = item.get("smoke_status")
+            if smoke is not None:
+                lines.append(f"Smoke : <code>{_html.escape(str(smoke))}</code>")
+            if updated_txt:
+                lines.append(f"Maj : <code>{_html.escape(updated_txt)}</code>")
+            lines.append("")
+        lines.append("Détail : <code>/status op_xxx</code> ou <code>/runs op_xxx</code>")
+        return "\n".join(lines).strip()
+
+    def _pending_prs_keyboard(self, data: dict) -> InlineKeyboardMarkup:
+        rows: list[list[InlineKeyboardButton]] = []
+        for item in (data.get("prs") or [])[:5]:
+            task_id = str(item.get("task_id") or "")
+            pr_url = str(item.get("pr_url") or "")
+            preview_url = str(item.get("preview_url") or "")
+            label = self._pending_pr_label(item)
+            if pr_url.startswith(("https://", "http://")):
+                rows.append([InlineKeyboardButton(f"PR {label}", url=pr_url)])
+            if preview_url.startswith(("https://", "http://")):
+                rows.append([InlineKeyboardButton(f"Preview {label}", url=preview_url)])
+            if task_id.startswith("op_"):
+                rows.append([
+                    InlineKeyboardButton(f"Status {label}", callback_data=f"rca:status:{task_id}"),
+                    InlineKeyboardButton(f"Runs {label}", callback_data=f"rca:runs:{task_id}"),
+                ])
+                rows.append([InlineKeyboardButton(f"Résumé {label}", callback_data=f"rca:prsum:{task_id}")])
+        rows.append([InlineKeyboardButton("Rafraîchir PRs", callback_data="rca:prs")])
+        rows.append([InlineKeyboardButton("Threads", callback_data="rct:list:all")])
+        return InlineKeyboardMarkup(rows)
+
+    async def _send_pending_prs_command(self, msg: Message, args: str = "") -> None:
+        limit = 10
+        raw = (args or "").strip()
+        if raw:
+            try:
+                limit = max(1, min(int(raw.split()[0]), 30))
+            except Exception:
+                limit = 10
+        data = await asyncio.to_thread(self._cockpit_api_sync, "GET", f"/api/internal/prs/pending?limit={limit}", None, 20)
+        if not data or not data.get("ok"):
+            return await self._send_cockpit_text(
+                msg,
+                "<b>🔀 PRs en attente</b>\n\nImpossible : <code>"
+                + _html.escape(str((data or {}).get("description") or data))[:1000]
+                + "</code>",
+                role="preview",
+            )
+        await self._send_cockpit_panel(msg, self._format_pending_prs(data), self._pending_prs_keyboard(data), role="preview")
+
+    def _format_pr_summary(self, data: dict) -> str:
+        task = data.get("task") or {}
+        task_id = str(task.get("id") or data.get("task_id") or "")
+        result = task.get("result_json")
+        if isinstance(result, str):
+            try:
+                result = json.loads(result)
+            except Exception:
+                result = {}
+        result = result if isinstance(result, dict) else {}
+        pr = result.get("pr") if isinstance(result.get("pr"), dict) else {}
+        pr_url = pr.get("pr_url") or pr.get("url") or result.get("pr_url")
+        preview = task.get("preview_url") or task.get("deployment_url") or result.get("preview_url") or result.get("deployment_url")
+        branch = (
+            pr.get("branch")
+            or pr.get("head")
+            or result.get("branch")
+            or ((result.get("branch_result") or {}) if isinstance(result.get("branch_result"), dict) else {}).get("effective_branch")
+        )
+        lines = [
+            "<b>🧾 Résumé PR</b>",
+            "",
+            f"Task : <code>{_html.escape(task_id)}</code>",
+            f"Repo : <code>{_html.escape(str(task.get('repo') or ''))}</code>",
+            f"Statut : <b>{_html.escape(str(task.get('status') or ''))}</b>",
+            f"Mode : <code>{_html.escape(str(task.get('mode') or ''))}</code>",
+        ]
+        if branch:
+            lines.append(f"Branche : <code>{_html.escape(str(branch))}</code>")
+        if pr_url:
+            lines.append(f"PR : {_html.escape(str(pr_url))}")
+        if preview:
+            lines.append(f"Preview : {_html.escape(str(preview))}")
+        smokes = data.get("smoke_tests") or []
+        if smokes:
+            latest = smokes[0]
+            lines.append(f"Smoke : <code>{_html.escape(str(latest.get('status') or ''))}</code>")
+        checks = data.get("provider_checks") or []
+        if checks:
+            ok = sum(1 for item in checks if str(item.get("status") or "").lower() in {"passed", "ok", "ready"})
+            lines.append(f"Provider checks : <code>{ok}/{len(checks)} OK</code>")
+        runs = data.get("task_runs") or []
+        if runs:
+            lines.extend(["", "<b>Dernières étapes</b>"])
+            for item in runs[:5]:
+                phase = str(item.get("phase") or item.get("id") or "")
+                status = str(item.get("status") or "")
+                lines.append(f"{self._status_badge(status)} <code>{_html.escape(phase[:70])}</code> · {_html.escape(status)}")
+        lines.extend([
+            "",
+            "Pour continuer dans ce chat : écris une nouvelle demande. Hermes utilisera le projet/thread actif.",
+            "Pour changer de mode ou de projet : <code>/new</code> ou <code>/conv</code>.",
+        ])
+        return "\n".join(lines)
+
+    async def _send_task_command(self, msg: Message, args: str = "") -> None:
+        raw = (args or "").strip()
+        task_id = raw.split()[0] if raw else ""
+        if not task_id:
+            return await self._send_cockpit_text(
+                msg,
+                "Usage : <code>/task décris la tâche</code>\nDétail : <code>/task op_xxx</code>",
+                role="preview",
+            )
+        if not task_id.startswith("op_"):
+            user_id = str(getattr(getattr(msg, "from_user", None), "id", "") or getattr(msg, "chat_id", ""))
+            pending = await asyncio.to_thread(
+                self._cockpit_api_sync,
+                "GET",
+                f"/api/internal/tasks/pilot-pending/{user_id}",
+                None,
+                20,
+            )
+            if pending.get("ok") and pending.get("pending") and (pending.get("task") or {}).get("id"):
+                pilot_task_id = str((pending.get("task") or {}).get("id"))
+                resumed = await asyncio.to_thread(
+                    self._cockpit_api_sync,
+                    "POST",
+                    f"/api/internal/tasks/{pilot_task_id}/pilot-answer",
+                    {
+                        "telegram_user_id": user_id,
+                        "chat_id": str(getattr(msg, "chat_id", "")),
+                        "answer": raw,
+                    },
+                    30,
+                )
+                if resumed.get("ok"):
+                    await self._send_cockpit_text(
+                        msg,
+                        "<b>🧭 Réponse Pilote reçue</b>\n\n"
+                        f"Tâche : <code>{_html.escape(pilot_task_id)}</code>\n"
+                        "Statut : <code>queued_plan</code>\n\n"
+                        "Je relance le worker avec ce contexte.",
+                        role="sticky",
+                    )
+                    asyncio.create_task(self._run_autopilot_worker_after_task_create(msg, pilot_task_id))
+                    return
+                return await self._send_cockpit_text(
+                    msg,
+                    "<b>Réponse Pilote non appliquée</b>\n\n<code>"
+                    + _html.escape(str(resumed.get("description") or resumed))[:1000]
+                    + "</code>",
+                    role="preview",
+                )
+            return await self._create_task_from_thread_command(msg, raw)
+        data = await asyncio.to_thread(self._cockpit_api_sync, "GET", f"/api/tasks/{task_id}", None, 20)
+        if data.get("ok") is False or data.get("detail"):
+            return await self._send_cockpit_text(msg, f"❌ Tâche introuvable : <code>{_html.escape(task_id)}</code>")
+        result = data.get("result") or {}
+        pr = ((result.get("pr") or {}).get("pr_url")) if isinstance(result, dict) else None
+        lines = [f"<b>📌 Tâche { _html.escape(data.get('id','')) }</b>", "", f"Repo : <code>{_html.escape(data.get('repo',''))}</code>", f"Statut : <b>{_html.escape(data.get('status',''))}</b>", f"Phase : <code>{_html.escape(str(data.get('current_phase') or ''))}</code>", f"Approval : <code>{_html.escape(str(data.get('approval_status') or ''))}</code>", f"Mode : {_html.escape(data.get('mode',''))}", f"Complexité : {_html.escape(data.get('complexity',''))}"]
+        if data.get("plan_md"):
+            lines.append("\n<b>Plan</b>\n<pre><code>" + _html.escape(str(data.get("plan_md"))[:1200]) + "</code></pre>")
+        if pr: lines.append(f"PR : { _html.escape(pr) }")
+        if data.get("preview_url"): lines.append(f"Preview : {_html.escape(data.get('preview_url'))}")
+        if data.get("deployment_url"): lines.append(f"Deploy : {_html.escape(data.get('deployment_url'))}")
+        lines.append(f"Resume : <code>{_html.escape(data.get('resume_md_path',''))}</code>")
+        await self._send_cockpit_text(msg, "\n".join(lines))
+
+    def _audit_task_text(self, active: dict, args: str = "") -> str:
+        repo = str(active.get("repo") or "repo actif").strip() or "repo actif"
+        thread_id = str(active.get("thread_id") or "").strip()
+        user_focus = (args or "").strip()
+        focus_line = f"\nFocus utilisateur : {user_focus}" if user_focus else ""
+        return (
+            f"Audit borné Repo Cockpit pour {repo}.\n"
+            "Objectif : inspecter l'état courant sans modifier le repo, identifier "
+            "les risques principaux, les tests/smokes utiles, et la prochaine "
+            "action sûre.\n"
+            f"Thread actif : {thread_id or 'inconnu'}."
+            f"{focus_line}\n"
+            "Contraintes : pas de déploiement, pas de restart service, pas de "
+            "mutation destructive. Produire un résumé court avec statut, phase, "
+            "preuves consultées et suite recommandée."
+        )
+
+    def _format_audit_started(self, *, job_id: str, task: dict, active: dict) -> str:
+        task_id = str(task.get("id") or "")
+        repo = str(task.get("repo") or active.get("repo") or "")
+        phase = str(task.get("current_phase") or task.get("status") or "queued_plan")
+        mode = str(task.get("mode") or active.get("thread_mode") or active.get("project_mode") or "ask_review")
+        lines = [
+            "<b>🔎 Audit Repo Cockpit lancé</b>",
+            "",
+            f"Job : <code>{_html.escape(job_id)}</code>",
+            f"Tâche : <code>{_html.escape(task_id)}</code>",
+            f"Repo : <code>{_html.escape(repo)}</code>",
+            f"Mode : <b>{_html.escape(self._mode_title(mode))}</b>",
+            f"Phase : <code>{_html.escape(phase)}</code>",
+            "",
+            "Je lance le worker en arrière-plan en dry-run. Le chat reste disponible.",
+            f"Suivi : <code>/status {_html.escape(task_id)}</code> · <code>/runs {_html.escape(task_id)}</code>",
+        ]
+        return "\n".join(lines)
+
+    async def _send_audit_command(self, msg: Message, args: str = "") -> None:
+        user_id, data, active = await self._get_active_cockpit_thread(msg)
+        if not data or not data.get("ok"):
+            return await self._send_cockpit_text(
+                msg,
+                "<b>🔎 Audit Repo Cockpit</b>\n\nImpossible de lire le thread actif : <code>"
+                + _html.escape(str((data or {}).get("description") or data))[:800]
+                + "</code>",
+                role="preview",
+            )
+        if not active:
+            return await self._send_cockpit_text(
+                msg,
+                "<b>🔎 Audit Repo Cockpit</b>\n\nAucun thread actif. Lance <code>/conv</code> puis choisis un repo.",
+                role="preview",
+            )
+
+        payload = {
+            "telegram_user_id": user_id,
+            "chat_id": str(getattr(msg, "chat_id", "")),
+            "task": self._audit_task_text(active, args),
+            "source": "telegram_audit_command",
+        }
+        task = await asyncio.to_thread(self._cockpit_api_sync, "POST", "/api/internal/tasks/from-thread", payload, 30)
+        if not task or not task.get("ok"):
+            return await self._send_cockpit_text(
+                msg,
+                "<b>🔎 Audit non lancé</b>\n\n<code>"
+                + _html.escape(str((task or {}).get("description") or task))[:900]
+                + "</code>",
+                role="preview",
+            )
+
+        job_id = f"audit_{datetime.now().strftime('%H%M%S')}_{os.urandom(2).hex()}"
+        await self._send_cockpit_text(
+            msg,
+            self._format_audit_started(job_id=job_id, task=task, active=active),
+            role="progress",
+        )
+
+        task_id = str(task.get("id") or "")
+        worker_task = asyncio.create_task(self._run_cockpit_audit_background(msg, task_id, job_id))
+        self._cockpit_background_tasks.add(worker_task)
+        worker_task.add_done_callback(self._cockpit_background_tasks.discard)
+
+    async def _run_cockpit_audit_background(self, msg: Message, task_id: str, job_id: str) -> None:
+        try:
+            worker = await asyncio.to_thread(
+                self._cockpit_api_sync,
+                "POST",
+                "/api/worker/run-once",
+                {"status": "queued_plan", "execute": False},
+                1800,
+            )
+            worker = worker or {}
+            worker_result = worker.get("result") if isinstance(worker.get("result"), dict) else {}
+            status = str(worker.get("status") or worker_result.get("status") or "done")
+            lines = [
+                "<b>🔎 Audit Repo Cockpit terminé</b>",
+                "",
+                f"Job : <code>{_html.escape(job_id)}</code>",
+                f"Tâche : <code>{_html.escape(task_id)}</code>",
+                f"Worker : <code>{_html.escape(status)}</code>",
+                "",
+                f"Suivi : <code>/status {_html.escape(task_id)}</code> · <code>/runs {_html.escape(task_id)}</code>",
+            ]
+            await self._send_cockpit_text(msg, "\n".join(lines), role="progress")
+        except Exception as exc:
+            await self._send_cockpit_text(
+                msg,
+                "<b>🔎 Audit Repo Cockpit bloqué</b>\n\n"
+                f"Job : <code>{_html.escape(job_id)}</code>\n"
+                f"Tâche : <code>{_html.escape(task_id)}</code>\n\n"
+                "<code>" + _html.escape(str(exc))[:1000] + "</code>",
+                role="progress",
+            )
+
+    async def _resolve_status_task_id(self, msg: Message, args: str = "") -> tuple[str | None, str | None]:
+        raw = (args or "").strip()
+        if raw:
+            token = raw.split()[0]
+            if token.startswith("op_"):
+                return token, None
+            return None, "Usage : <code>/status op_xxx</code> ou <code>/runs op_xxx</code>."
+
+        user_id, data, active = await self._get_active_cockpit_thread(msg)
+        if not data or not data.get("ok"):
+            return None, "Impossible de lire le thread actif : <code>" + _html.escape(str((data or {}).get("description") or data))[:800] + "</code>"
+        if not active:
+            return None, "Aucune conversation active. Lance <code>/conv</code> ou passe un id : <code>/status op_xxx</code>."
+
+        threads = await self._fetch_threads_for_user(user_id, "all")
+        active_thread_id = active.get("thread_id")
+        for thread in threads.get("threads") or []:
+            if thread.get("thread_id") == active_thread_id and thread.get("last_task_id"):
+                return str(thread.get("last_task_id")), None
+        return None, "La conversation active n'a pas encore de task. Crée une tâche avec <code>/task ...</code> ou utilise <code>/conv</code>."
+
+    def _status_badge(self, status: str | None) -> str:
+        value = str(status or "unknown")
+        if value in {"passed", "ready", "done", "completed"} or value.startswith("running"):
+            return "✅"
+        if value.startswith("blocked") or value in {"failed", "error"}:
+            return "🚨"
+        if value in {"queued", "pending"} or value.startswith("queued"):
+            return "⏳"
+        return "•"
+
+    def _latest_items(self, data: dict, key: str, limit: int = 3) -> list[dict]:
+        items = data.get(key) or []
+        if not isinstance(items, list):
+            return []
+        return items[:limit]
+
+    def _format_autonomy_status(self, data: dict) -> str:
+        task = data.get("task") or {}
+        status = str(task.get("status") or "")
+        error_events = data.get("error_events") or []
+        latest_error = {}
+        if self._status_is_problem(status):
+            latest_error = (data.get("latest_error") or (error_events[0] if isinstance(error_events, list) and error_events else {}))
+        lines = [
+            "<b>🛰️ Status autonomie</b>",
+            "",
+            f"Task : <code>{_html.escape(str(task.get('id') or data.get('task_id') or ''))}</code>",
+            f"Repo : <code>{_html.escape(str(task.get('repo') or ''))}</code>",
+            f"Statut : <b>{_html.escape(status)}</b>",
+            f"Phase : <code>{_html.escape(str(task.get('current_phase') or ''))}</code>",
+        ]
+        preview = task.get("preview_url") or task.get("deployment_url")
+        if preview:
+            label = "Preview non validée" if self._preview_is_blocked(status) else "Preview"
+            lines.append(f"{label} : {_html.escape(str(preview))}")
+        if latest_error:
+            lines.extend([
+                "",
+                "<b>Dernière erreur classée</b>",
+                f"Catégorie : <code>{_html.escape(str(latest_error.get('category') or ''))}</code>",
+                f"Runbook : <code>{_html.escape(str(latest_error.get('runbook') or ''))}</code>",
+                f"Humain requis : <code>{_html.escape(str(latest_error.get('human_action_required') or False))}</code>",
+            ])
+        provider_checks = self._latest_items(data, "provider_checks")
+        if provider_checks:
+            lines.extend(["", "<b>Provider checks</b>"])
+            for item in provider_checks:
+                lines.append(
+                    f"{self._status_badge(item.get('status'))} {_html.escape(str(item.get('provider') or ''))}/"
+                    f"{_html.escape(str(item.get('check_name') or ''))} : <code>{_html.escape(str(item.get('status') or ''))}</code>"
+                )
+        smokes = self._latest_items(data, "smoke_tests")
+        if smokes:
+            lines.extend(["", "<b>Smoke tests</b>"])
+            for item in smokes:
+                lines.append(f"{self._status_badge(item.get('status'))} <code>{_html.escape(str(item.get('status') or ''))}</code> · {_html.escape(str(item.get('url') or ''))[:120]}")
+        runbooks = self._latest_items(data, "runbooks_applied")
+        if runbooks:
+            lines.extend(["", "<b>Runbooks</b>"])
+            for item in runbooks:
+                lines.append(f"{self._status_badge(item.get('status'))} <code>{_html.escape(str(item.get('runbook') or ''))}</code> · {_html.escape(str(item.get('status') or ''))}")
+        lines.append("\nDétail : <code>/runs " + _html.escape(str(task.get("id") or data.get("task_id") or "")) + "</code>")
+        return "\n".join(lines)
+
+    def _format_runs_status(self, data: dict) -> str:
+        task = data.get("task") or {}
+        task_id = str(task.get("id") or data.get("task_id") or "")
+        lines = [
+            "<b>🧪 Runs / gates</b>",
+            "",
+            f"Task : <code>{_html.escape(task_id)}</code>",
+            f"Statut : <b>{_html.escape(str(task.get('status') or ''))}</b>",
+        ]
+        for section, title, name_key in [
+            ("task_runs", "Runs worker", "phase"),
+            ("repair_attempts", "Réparations", "runbook"),
+            ("smoke_tests", "Smoke tests", "url"),
+            ("runbooks_applied", "Runbooks appliqués", "runbook"),
+            ("deployments", "Deployments", "provider"),
+        ]:
+            items = self._latest_items(data, section, 6)
+            if not items:
+                continue
+            lines.extend(["", f"<b>{_html.escape(title)}</b>"])
+            for item in items:
+                label = str(item.get(name_key) or item.get("check_name") or item.get("id") or "")
+                status = str(item.get("status") or "")
+                lines.append(f"{self._status_badge(status)} <code>{_html.escape(label)[:80]}</code> · <b>{_html.escape(status)}</b>")
+        return "\n".join(lines)
+
+    def _format_autopilot_live_card(self, data: dict, *, elapsed_seconds: int) -> str:
+        progress = progress_from_autonomy(data, elapsed_seconds=elapsed_seconds)
+        rendered = render_progress_view(progress)
+        lines = ["<b>🚀 Autopilot Hermes</b>", ""]
+        for line in rendered.splitlines():
+            if line.startswith("⏳ "):
+                lines.append(f"<b>{_html.escape(line)}</b>")
+            elif line.startswith("Etat :"):
+                lines.append(_html.escape(line))
+            elif " : " in line:
+                key, value = line.split(" : ", 1)
+                lines.append(f"<b>{_html.escape(key)} :</b> {_html.escape(value)}")
+            else:
+                lines.append(_html.escape(line))
+        return "\n".join(lines)
+
+    def _autopilot_smoke_ok(self, data: dict, task: dict | None = None) -> bool:
+        task = task or (data.get("task") or {})
+        status = str(task.get("status") or "")
+        if status in {"deployed_preview", "completed", "done", "ready"}:
+            return True
+        smokes = data.get("smoke_tests") or []
+        if isinstance(smokes, list) and smokes:
+            latest = smokes[0]
+            return str(latest.get("status") or "").lower() in {"passed", "ready", "ok", "success"}
+        provider_checks = data.get("provider_checks") or []
+        if isinstance(provider_checks, list):
+            deploy_checks = [
+                item
+                for item in provider_checks
+                if str(item.get("provider") or "").lower() in {"vercel", "hosting"}
+                or "deploy" in str(item.get("check_name") or "").lower()
+            ]
+            if deploy_checks:
+                return str(deploy_checks[0].get("status") or "").lower() in {"passed", "ready", "ok", "success"}
+        return False
+
+    def _format_autopilot_final(self, task_id: str, worker: dict, task: dict, autonomy: dict) -> str:
+        result = worker.get("result") if isinstance(worker, dict) else {}
+        result = result if isinstance(result, dict) else {}
+        status = str(result.get("status") or task.get("status") or (autonomy.get("task") or {}).get("status") or "unknown")
+        preview = str(task.get("preview_url") or task.get("deployment_url") or (autonomy.get("task") or {}).get("preview_url") or (autonomy.get("task") or {}).get("deployment_url") or "")
+        smoke_ok = bool(preview) and self._autopilot_smoke_ok(autonomy, task)
+        lines = ["<b>✅ Autopilot terminé</b>" if smoke_ok else "<b>⚠️ Autopilot à reprendre</b>", ""]
+        lines.append(f"Tâche : <code>{_html.escape(task_id or '?')}</code>")
+        lines.append(f"Statut : <code>{_html.escape(status)}</code>")
+        repo = task.get("repo") or (autonomy.get("task") or {}).get("repo")
+        if repo:
+            lines.append(f"Repo : <code>{_html.escape(str(repo))}</code>")
+        if smoke_ok:
+            lines.extend(["", "Preview validée :", _html.escape(preview)])
+            lines.append("\nJ'ai gardé les boutons de suivi sur la carte au-dessus pour consulter les runs et le status.")
+            return "\n".join(lines)
+
+        lines.extend([
+            "",
+            "Je ne donne pas de lien final validé tant que deploy/smoke n'est pas OK.",
+            "Consulte <code>/runs " + _html.escape(task_id or "") + "</code> pour voir le point de blocage exact.",
+        ])
+        latest_error = autonomy.get("latest_error")
+        if not latest_error and isinstance(autonomy.get("error_events"), list) and autonomy.get("error_events"):
+            latest_error = autonomy.get("error_events")[0]
+        if isinstance(latest_error, dict):
+            category = latest_error.get("category")
+            runbook = latest_error.get("runbook")
+            if category or runbook:
+                lines.extend([
+                    "",
+                    "<b>Diagnostic</b>",
+                    f"Catégorie : <code>{_html.escape(str(category or ''))}</code>",
+                    f"Runbook : <code>{_html.escape(str(runbook or ''))}</code>",
+                ])
+        return "\n".join(lines)
+
+    def _preview_is_blocked(self, status: str) -> bool:
+        return status in {
+            "blocked_deploy",
+            "blocked_smoke",
+            "blocked_release_gate",
+            "blocked_pr_required",
+            "blocked_review_required",
+            "blocked_tests",
+        }
+
+    def _status_is_problem(self, status: str) -> bool:
+        value = str(status or "")
+        return value.startswith("blocked") or value in {"failed", "error"}
+
+    def _autonomy_keyboard(self, data: dict, view: str = "status") -> InlineKeyboardMarkup:
+        task = data.get("task") or {}
+        task_id = str(task.get("id") or data.get("task_id") or "")
+        status = str(task.get("status") or "")
+        preview = str(task.get("preview_url") or task.get("deployment_url") or "")
+        rows: list[list[InlineKeyboardButton]] = []
+        if preview.startswith(("https://", "http://")) and not self._preview_is_blocked(status):
+            rows.append([InlineKeyboardButton("Ouvrir preview", url=preview)])
+        if task_id:
+            if view == "runs":
+                rows.append([
+                    InlineKeyboardButton("Status", callback_data=f"rca:status:{task_id}"),
+                    InlineKeyboardButton("Rafraîchir", callback_data=f"rca:runs:{task_id}"),
+                ])
+            else:
+                rows.append([
+                    InlineKeyboardButton("Runs", callback_data=f"rca:runs:{task_id}"),
+                    InlineKeyboardButton("Rafraîchir", callback_data=f"rca:status:{task_id}"),
+                ])
+        rows.append([InlineKeyboardButton("Threads", callback_data="rct:list:all")])
+        return InlineKeyboardMarkup(rows)
+
+    async def _send_status_command(self, msg: Message, args: str = "") -> None:
+        task_id, error = await self._resolve_status_task_id(msg, args)
+        if error:
+            return await self._send_cockpit_text(msg, "<b>🛰️ Status autonomie</b>\n\n" + error, role="preview")
+        data = await asyncio.to_thread(self._cockpit_api_sync, "GET", f"/api/internal/tasks/{task_id}/autonomy", None, 20)
+        if not data or not data.get("ok"):
+            return await self._send_cockpit_text(msg, "<b>🛰️ Status autonomie</b>\n\nImpossible : <code>" + _html.escape(str((data or {}).get("description") or data))[:1000] + "</code>", role="preview")
+        await self._send_cockpit_panel(msg, self._format_autonomy_status(data), self._autonomy_keyboard(data, "status"), role="progress")
+
+    async def _send_runs_command(self, msg: Message, args: str = "") -> None:
+        task_id, error = await self._resolve_status_task_id(msg, args)
+        if error:
+            return await self._send_cockpit_text(msg, "<b>🧪 Runs / gates</b>\n\n" + error, role="preview")
+        data = await asyncio.to_thread(self._cockpit_api_sync, "GET", f"/api/internal/tasks/{task_id}/autonomy", None, 20)
+        if not data or not data.get("ok"):
+            return await self._send_cockpit_text(msg, "<b>🧪 Runs / gates</b>\n\nImpossible : <code>" + _html.escape(str((data or {}).get("description") or data))[:1000] + "</code>", role="preview")
+        await self._send_cockpit_panel(msg, self._format_runs_status(data), self._autonomy_keyboard(data, "runs"), role="progress")
+
+    def _dev_menu_text(self, section: str = "home") -> str:
+        if section == "github":
+            return (
+                "<b>🧑‍💻 GitHub sans friction</b>\n\n"
+                "<code>/new</code> : choisir un repo GitHub ou créer un nouveau projet.\n"
+                "Ensuite tu écris normalement : “corrige ce bug”, “ajoute cette page”, "
+                "“crée une branche et ouvre une PR”.\n\n"
+                "<code>/task ...</code> : lance un travail suivi sur le repo sélectionné.\n"
+                "<code>/runs</code> : montre où en est ce travail : tests, erreurs, blocage, deploy.\n"
+                "<code>/audit</code> : inspecte le repo ou la PR sans modifier le code.\n"
+                "<code>/prs</code> : liste les PR à relire ou merger.\n\n"
+                "Exemple : <code>/task crée une branche, corrige le bug de login, lance les tests, ouvre une PR et explique-moi le diff</code>"
+            )
+        if section == "ops":
+            return (
+                "<b>🛠️ Déploiement / maintenance</b>\n\n"
+                "<code>/vps</code> : état rapide du VPS.\n"
+                "<code>/updatecheck</code> : peut-on mettre Hermes à jour ?\n"
+                "<code>/watch vps</code> : alerte seulement si le VPS se dégrade.\n"
+                "<code>/watch releases owner/repo</code> : alerte nouvelle release.\n"
+                "<code>/watch list</code> : watchers actifs.\n"
+                "<code>/jobs</code> : toutes les tâches planifiées et leur livraison.\n\n"
+                "Règle simple : check d'abord, déploie ensuite. Pas de mutation automatique sans approbation."
+            )
+        if section == "learn":
+            return (
+                "<b>📚 Mode apprentissage</b>\n\n"
+                "Tu peux parler normalement : “explique-moi ce fichier”, “pourquoi ce test fail”, "
+                "“fais-moi un plan avant de modifier”, “résume-moi la PR”.\n\n"
+                "Commandes utiles : <code>/dev</code>, <code>/chat</code>, <code>/runs</code>, "
+                "<code>/audit</code>, <code>/clean</code>.\n\n"
+                "Objectif : comprendre ce que fait Hermes, pas subir une boîte noire."
+            )
+        return (
+            "<b>🧑‍💻 Dev cockpit simple</b>\n\n"
+            "<b>Créer / reprendre</b>\n"
+            "• <code>/new</code> : choisir un repo ou créer un projet.\n"
+            "• <code>/conv</code> : reprendre une conversation projet.\n\n"
+            "<b>Coder avec GitHub</b>\n"
+            "• <code>/new</code> sélectionne le repo GitHub.\n"
+            "• Message normal : petite question ou petite modif.\n"
+            "• <code>/task ...</code> : gros travail suivi, branche, tests, PR.\n"
+            "• <code>/runs</code> : statut du travail en cours.\n"
+            "• <code>/audit</code> : analyse repo/PR sans toucher au code.\n\n"
+            "<b>Ops utiles</b>\n"
+            "• <code>/vps</code>, <code>/updatecheck</code>, <code>/watch</code>, <code>/jobs</code>.\n\n"
+            "Si tu es perdu : lance <code>/dev</code>, puis choisis un bouton."
+        )
+
+    def _dev_menu_keyboard(self) -> InlineKeyboardMarkup:
+        return InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("Nouveau projet", callback_data="rcn:mode:ask_review"),
+                InlineKeyboardButton("Conversations", callback_data="rct:list:all"),
+            ],
+            [
+                InlineKeyboardButton("GitHub flow", callback_data="dev:github"),
+                InlineKeyboardButton("Ops / deploy", callback_data="dev:ops"),
+            ],
+            [
+                InlineKeyboardButton("Apprendre", callback_data="dev:learn"),
+                InlineKeyboardButton("Accueil", callback_data="dev:home"),
+            ],
+        ])
+
+    async def _send_dev_command(self, msg: Message, args: str = "") -> None:
+        section = (args or "home").strip().lower()
+        if section not in {"home", "github", "ops", "learn"}:
+            section = "home"
+        await self._send_cockpit_panel(
+            msg,
+            self._dev_menu_text(section),
+            self._dev_menu_keyboard(),
+            role="preview",
+        )
+
+    async def _handle_dev_callback(self, query, data: str) -> None:
+        section = data.split(":", 1)[1] if ":" in data else "home"
+        if section not in {"home", "github", "ops", "learn"}:
+            section = "home"
+        await query.answer(text="Menu dev")
+        text = self._dev_menu_text(section)
+        keyboard = self._dev_menu_keyboard()
+        try:
+            await query.edit_message_text(
+                text,
+                parse_mode=ParseMode.HTML,
+                reply_markup=keyboard,
+            )
+        except Exception as exc:
+            logger.warning("[%s] /dev callback edit failed; sending fallback: %s", self.name, exc)
+            query_message = getattr(query, "message", None)
+            if query_message is not None:
+                try:
+                    await query_message.reply_text(
+                        text,
+                        parse_mode=ParseMode.HTML,
+                        reply_markup=keyboard,
+                        **self._link_preview_kwargs(),
+                    )
+                except Exception:
+                    logger.exception("[%s] /dev callback fallback send failed", self.name)
+
+    def _telegram_origin(self, msg: Message) -> dict:
+        thread_id = getattr(msg, "message_thread_id", None)
+        return {
+            "platform": "telegram",
+            "chat_id": str(getattr(msg, "chat_id", "")),
+            "chat_name": str(getattr(getattr(msg, "chat", None), "title", "") or ""),
+            "thread_id": str(thread_id) if thread_id is not None else None,
+        }
+
+    def _watch_job_kind(self, job: dict) -> str | None:
+        script = str(job.get("script") or "")
+        if script == "github_release_watch.py":
+            return "releases"
+        if script == "vps_healthcheck.py":
+            return "vps"
+        return None
+
+    def _watch_repo_from_job(self, job: dict) -> str:
+        args = [str(item) for item in (job.get("script_args") or [])]
+        for index, item in enumerate(args):
+            if item == "--repo" and index + 1 < len(args):
+                return args[index + 1]
+        return ""
+
+    def _format_watch_jobs(self, jobs: list[dict]) -> str:
+        lines = ["<b>👀 Watchers</b>", ""]
+        watch_jobs = [job for job in jobs if self._watch_job_kind(job)]
+        if not watch_jobs:
+            lines.extend([
+                "Aucun watcher actif.",
+                "",
+                "Créer : <code>/watch releases owner/repo</code>",
+                "VPS : <code>/watch vps</code>",
+            ])
+            return "\n".join(lines)
+
+        for job in watch_jobs:
+            kind = self._watch_job_kind(job) or "watch"
+            repo = self._watch_repo_from_job(job)
+            label = repo if repo else kind
+            lines.append(
+                f"• <code>{_html.escape(str(job.get('id') or ''))}</code> · "
+                f"<b>{_html.escape(kind)}</b> · {_html.escape(label)} · "
+                f"<code>{_html.escape(str(job.get('schedule_display') or '?'))}</code>"
+            )
+        lines.extend([
+            "",
+            "Retirer : <code>/watch remove job_id</code>",
+        ])
+        return "\n".join(lines)
+
+    def _job_delivery_label(self, job: dict) -> str:
+        deliver = str(job.get("deliver") or "local")
+        origin = job.get("origin") if isinstance(job.get("origin"), dict) else {}
+        if deliver == "origin" and origin:
+            platform = str(origin.get("platform") or "origin")
+            chat_id = str(origin.get("chat_id") or "")
+            if platform == "telegram":
+                return "Telegram" + (f" {chat_id}" if chat_id else "")
+            return platform
+        return deliver
+
+    def _job_status_label(self, job: dict) -> str:
+        if not job.get("enabled", True):
+            return "paused"
+        return str(job.get("last_status") or job.get("state") or "scheduled")
+
+    def _format_scheduled_jobs(self, jobs: list[dict], *, limit: int = 12) -> str:
+        lines = ["<b>🗓️ Jobs planifiés</b>", ""]
+        if not jobs:
+            lines.extend([
+                "Aucun job planifié.",
+                "",
+                "Watchers simples : <code>/watch releases owner/repo</code> ou <code>/watch vps</code>",
+            ])
+            return "\n".join(lines)
+
+        for job in jobs[:limit]:
+            name = str(job.get("name") or "job")
+            job_id = str(job.get("id") or "")
+            schedule = str(job.get("schedule_display") or "?")
+            next_run = str(job.get("next_run_at") or "?")
+            status = self._job_status_label(job)
+            delivery = self._job_delivery_label(job)
+            no_agent = "no-agent" if job.get("no_agent") else "agent"
+            lines.append(
+                f"• <code>{_html.escape(job_id)}</code> · <b>{_html.escape(name)[:80]}</b>\n"
+                f"  {_html.escape(status)} · {_html.escape(no_agent)} · <code>{_html.escape(schedule)}</code>\n"
+                f"  next: <code>{_html.escape(next_run)[:32]}</code> · vers: {_html.escape(delivery)}"
+            )
+
+        if len(jobs) > limit:
+            lines.append(f"\n... {len(jobs) - limit} autre(s) job(s).")
+        lines.extend([
+            "",
+            "Gestion : <code>/jobs pause id</code> · <code>/jobs resume id</code> · <code>/jobs remove id</code>",
+            "Watchers seuls : <code>/watch list</code>",
+        ])
+        return "\n".join(lines)
+
+    def _jobs_keyboard(self, jobs: list[dict], *, limit: int = 8) -> InlineKeyboardMarkup | None:
+        if not jobs:
+            return None
+        rows: list[list[InlineKeyboardButton]] = []
+        for job in jobs[:limit]:
+            job_id = str(job.get("id") or "")
+            if not job_id:
+                continue
+            label = str(job.get("name") or job_id)[:22]
+            if job.get("enabled", True):
+                rows.append([
+                    InlineKeyboardButton(f"Pause {label}", callback_data=f"job:pause:{job_id}"),
+                    InlineKeyboardButton("Supprimer", callback_data=f"job:remove:{job_id}"),
+                ])
+            else:
+                rows.append([
+                    InlineKeyboardButton(f"Reprendre {label}", callback_data=f"job:resume:{job_id}"),
+                    InlineKeyboardButton("Supprimer", callback_data=f"job:remove:{job_id}"),
+                ])
+        rows.append([InlineKeyboardButton("Rafraîchir", callback_data="job:list")])
+        return InlineKeyboardMarkup(rows)
+
+    async def _send_jobs_panel(self, msg: Message) -> None:
+        from cron.jobs import list_jobs
+
+        jobs = await asyncio.to_thread(list_jobs, True)
+        keyboard = self._jobs_keyboard(jobs)
+        text = self._format_scheduled_jobs(jobs)
+        if keyboard is None:
+            await self._send_cockpit_text(msg, text, role="preview")
+        else:
+            await self._send_cockpit_panel(msg, text, keyboard, role="preview")
+
+    async def _send_jobs_command(self, msg: Message, args: str = "") -> None:
+        try:
+            tokens = shlex.split(args or "")
+        except ValueError:
+            tokens = (args or "").split()
+        verb = (tokens[0].lower() if tokens else "list")
+        if verb in {"list", "ls", "all", ""}:
+            return await self._send_jobs_panel(msg)
+
+        if verb in {"pause", "resume", "remove", "rm", "delete"}:
+            target = tokens[1] if len(tokens) > 1 else ""
+            if not target:
+                return await self._send_cockpit_text(
+                    msg,
+                    "Usage : <code>/jobs pause id</code>, <code>/jobs resume id</code> ou <code>/jobs remove id</code>",
+                    role="preview",
+                )
+            from cron.jobs import get_job, pause_job, remove_job, resume_job
+
+            before = await asyncio.to_thread(get_job, target)
+            if not before:
+                return await self._send_cockpit_text(
+                    msg,
+                    "Job introuvable. Fais <code>/jobs</code> pour voir les IDs.",
+                    role="preview",
+                )
+            if verb == "pause":
+                updated = await asyncio.to_thread(pause_job, target, "paused from Telegram /jobs")
+                action = "mis en pause"
+            elif verb == "resume":
+                updated = await asyncio.to_thread(resume_job, target)
+                action = "repris"
+            else:
+                ok = await asyncio.to_thread(remove_job, target)
+                updated = before if ok else None
+                action = "supprimé" if ok else "non supprimé"
+            title = str(before.get("name") or target)
+            status = self._job_status_label(updated or before)
+            return await self._send_cockpit_text(
+                msg,
+                f"<b>Job { _html.escape(action) }</b>\n\n"
+                f"<code>{_html.escape(target)}</code> · {_html.escape(title)}\n"
+                f"Statut : <code>{_html.escape(status)}</code>",
+                role="preview",
+            )
+
+        return await self._send_cockpit_text(
+            msg,
+            "Usage : <code>/jobs</code>, <code>/jobs pause id</code>, <code>/jobs resume id</code>, <code>/jobs remove id</code>",
+            role="preview",
+        )
+
+    async def _handle_jobs_callback(self, query, data: str) -> None:
+        parts = data.split(":", 2)
+        verb = parts[1] if len(parts) > 1 else "list"
+        job_id = parts[2] if len(parts) > 2 else ""
+        from cron.jobs import get_job, list_jobs, pause_job, remove_job, resume_job
+
+        if verb == "list":
+            await query.answer(text="Jobs")
+        elif verb in {"pause", "resume", "remove"}:
+            if not job_id:
+                await query.answer(text="Job invalide")
+                return
+            before = await asyncio.to_thread(get_job, job_id)
+            if not before:
+                await query.answer(text="Job introuvable")
+            elif verb == "pause":
+                await asyncio.to_thread(pause_job, job_id, "paused from Telegram UI")
+                await query.answer(text="Job en pause")
+            elif verb == "resume":
+                await asyncio.to_thread(resume_job, job_id)
+                await query.answer(text="Job repris")
+            else:
+                await asyncio.to_thread(remove_job, job_id)
+                await query.answer(text="Job supprimé")
+        else:
+            await query.answer(text="Action inconnue")
+            return
+
+        jobs = await asyncio.to_thread(list_jobs, True)
+        text = self._format_scheduled_jobs(jobs)
+        keyboard = self._jobs_keyboard(jobs)
+        try:
+            await query.edit_message_text(
+                text,
+                parse_mode=ParseMode.HTML,
+                reply_markup=keyboard,
+            )
+        except Exception as exc:
+            logger.warning("[%s] /jobs callback edit failed; sending fallback: %s", self.name, exc)
+            query_message = getattr(query, "message", None)
+            if query_message is not None:
+                try:
+                    await query_message.reply_text(
+                        text,
+                        parse_mode=ParseMode.HTML,
+                        reply_markup=keyboard,
+                        **self._link_preview_kwargs(),
+                    )
+                except Exception:
+                    logger.exception("[%s] /jobs callback fallback send failed", self.name)
+
+    async def _send_watch_command(self, msg: Message, args: str = "") -> None:
+        try:
+            tokens = shlex.split(args or "")
+        except ValueError:
+            tokens = (args or "").split()
+        verb = (tokens[0].lower() if tokens else "help")
+
+        if verb in {"help", ""}:
+            return await self._send_cockpit_text(
+                msg,
+                "<b>👀 Watchers simples</b>\n\n"
+                "Releases : <code>/watch releases owner/repo</code>\n"
+                "VPS : <code>/watch vps</code>\n"
+                "Liste : <code>/watch list</code>\n"
+                "Retirer : <code>/watch remove job_id</code>",
+                role="preview",
+            )
+
+        if verb in {"list", "ls"}:
+            from cron.jobs import list_jobs
+
+            jobs = await asyncio.to_thread(list_jobs, True)
+            return await self._send_cockpit_text(msg, self._format_watch_jobs(jobs), role="preview")
+
+        if verb in {"remove", "rm", "delete"}:
+            target = tokens[1] if len(tokens) > 1 else ""
+            if not target:
+                return await self._send_cockpit_text(msg, "Usage : <code>/watch remove job_id</code>", role="preview")
+            from cron.jobs import list_jobs, remove_job
+
+            jobs = await asyncio.to_thread(list_jobs, True)
+            matches = [
+                job for job in jobs
+                if str(job.get("id") or "") == target
+                or self._watch_repo_from_job(job).lower() == target.lower()
+            ]
+            matches = [job for job in matches if self._watch_job_kind(job)]
+            if not matches:
+                return await self._send_cockpit_text(
+                    msg,
+                    "Watcher introuvable. Fais <code>/watch list</code> pour voir les IDs.",
+                    role="preview",
+                )
+            if len(matches) > 1:
+                return await self._send_cockpit_text(
+                    msg,
+                    "Plusieurs watchers correspondent. Retire par ID :\n"
+                    + "\n".join(f"<code>{_html.escape(str(job.get('id')))}</code>" for job in matches),
+                    role="preview",
+                )
+            job = matches[0]
+            ok = await asyncio.to_thread(remove_job, str(job.get("id")))
+            title = "Watcher retiré" if ok else "Suppression impossible"
+            return await self._send_cockpit_text(
+                msg,
+                f"<b>{_html.escape(title)}</b>\n\n<code>{_html.escape(str(job.get('id') or ''))}</code>",
+                role="preview",
+            )
+
+        if verb in {"release", "releases", "github"}:
+            repo = tokens[1] if len(tokens) > 1 else ""
+            if "/" not in repo.strip("/"):
+                return await self._send_cockpit_text(
+                    msg,
+                    "Usage : <code>/watch releases owner/repo</code>",
+                    role="preview",
+                )
+            interval = "6"
+            include_prereleases = "false"
+            for token in tokens[2:]:
+                lower = token.lower()
+                if lower in {"1", "3", "6", "12", "24"}:
+                    interval = lower
+                elif lower in {"prerelease", "prereleases", "--prerelease", "--prereleases"}:
+                    include_prereleases = "true"
+            from hermes_cli.blueprint_cmd import handle_blueprint_command
+
+            result = await asyncio.to_thread(
+                handle_blueprint_command,
+                (
+                    f"github-release-watch repo={shlex.quote(repo.strip('/'))} "
+                    f"interval_hours={interval} include_prereleases={include_prereleases} "
+                    "max_items=5 deliver=origin"
+                ),
+                origin=self._telegram_origin(msg),
+                surface="gateway",
+            )
+            return await self._send_cockpit_text(msg, _html.escape(result.text), role="preview")
+
+        if verb in {"vps", "health", "healthcheck"}:
+            interval = tokens[1] if len(tokens) > 1 and tokens[1] in {"1", "3", "6", "12", "24"} else "6"
+            from hermes_cli.blueprint_cmd import handle_blueprint_command
+
+            result = await asyncio.to_thread(
+                handle_blueprint_command,
+                f"vps-healthcheck interval_hours={interval} deliver=origin",
+                origin=self._telegram_origin(msg),
+                surface="gateway",
+            )
+            return await self._send_cockpit_text(msg, _html.escape(result.text), role="preview")
+
+        return await self._send_cockpit_text(
+            msg,
+            "Commande inconnue. Essaie <code>/watch releases owner/repo</code>, <code>/watch vps</code> ou <code>/watch list</code>.",
+            role="preview",
+        )
+
+    async def _send_vps_command(self, msg: Message) -> None:
+        from hermes_cli.vps_status import collect_vps_overview, format_vps_overview_html
+
+        report = await asyncio.to_thread(collect_vps_overview)
+        await self._send_cockpit_text(msg, format_vps_overview_html(report), role="preview")
+
+    async def _send_updatecheck_command(self, msg: Message, args: str = "") -> None:
+        cached = "--cached" in (args or "")
+        timeout = 12 if "--slow" not in (args or "") else 25
+        from hermes_cli.updatecheck import collect_updatecheck, format_updatecheck_short
+        from hermes_constants import get_hermes_home
+
+        report = await asyncio.to_thread(
+            collect_updatecheck,
+            hermes_home=get_hermes_home(),
+            fresh=not cached,
+            fetch_timeout=timeout,
+        )
+        text = "<pre><code>" + _html.escape(format_updatecheck_short(report)) + "</code></pre>"
+        await self._send_cockpit_text(msg, text, role="preview")
+
+    async def _handle_autonomy_callback(self, query, data: str) -> None:
+        if data == "rca:prs":
+            payload = await asyncio.to_thread(self._cockpit_api_sync, "GET", "/api/internal/prs/pending?limit=10", None, 20)
+            if not payload or not payload.get("ok"):
+                await query.answer(text="Lecture PR impossible")
+                return
+            await query.answer(text="Mis à jour")
+            try:
+                await query.edit_message_text(
+                    self._format_pending_prs(payload)[:3900],
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=self._pending_prs_keyboard(payload),
+                    disable_web_page_preview=True,
+                )
+            except Exception:
+                pass
+            return
+
+        parts = data.split(":", 2)
+        verb = parts[1] if len(parts) > 1 else "status"
+        task_id = parts[2] if len(parts) > 2 else ""
+        if verb not in {"status", "runs", "prsum"} or not task_id.startswith("op_"):
+            await query.answer(text="Action inconnue")
+            return
+        payload = await asyncio.to_thread(self._cockpit_api_sync, "GET", f"/api/internal/tasks/{task_id}/autonomy", None, 20)
+        if not payload or not payload.get("ok"):
+            await query.answer(text="Lecture impossible")
+            try:
+                await query.edit_message_text(
+                    "<b>Repo Cockpit Autonomy</b>\n\nImpossible : <code>"
+                    + _html.escape(str((payload or {}).get("description") or payload))[:900]
+                    + "</code>",
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=None,
+                )
+            except Exception:
+                pass
+            return
+        await query.answer(text="Mis à jour")
+        if verb == "runs":
+            text = self._format_runs_status(payload)
+            keyboard = self._autonomy_keyboard(payload, verb)
+        elif verb == "prsum":
+            text = self._format_pr_summary(payload)
+            keyboard = self._autonomy_keyboard(payload, "status")
+        else:
+            text = self._format_autonomy_status(payload)
+            keyboard = self._autonomy_keyboard(payload, verb)
+        try:
+            await query.edit_message_text(
+                text[:3900],
+                parse_mode=ParseMode.HTML,
+                reply_markup=keyboard,
+                disable_web_page_preview=True,
+            )
+        except Exception:
+            pass
+
+
+    async def _create_task_from_thread_command(
+        self,
+        msg: Message,
+        task_text: str,
+        *,
+        mode: str | None = None,
+        intent: str | None = None,
+        parent_task_id: str | None = None,
+        source: str = "telegram_task_command",
+    ) -> None:
+        user_id = str(getattr(getattr(msg, "from_user", None), "id", "") or getattr(msg, "chat_id", ""))
+        payload = {
+            "telegram_user_id": user_id,
+            "chat_id": str(getattr(msg, "chat_id", "")),
+            "task": task_text,
+            "source": source,
+        }
+        if mode:
+            payload["mode"] = normalize_cockpit_mode(mode)
+        if intent:
+            payload["intent"] = str(intent)
+        if parent_task_id:
+            payload["parent_task_id"] = str(parent_task_id)
+        data = await asyncio.to_thread(self._cockpit_api_sync, "POST", "/api/internal/tasks/from-thread", payload, 30)
+        if not data.get("ok"):
+            return await self._send_cockpit_text(
+                msg,
+                "<b>📌 Tâche non créée</b>\n\n"
+                "Ouvre d'abord un chat projet avec <code>/new</code>, puis sélectionne un repo ou crée un projet.\n\n"
+                "<code>" + _html.escape(str(data.get("description") or data))[:900] + "</code>",
+                role="preview",
+            )
+        mode = normalize_cockpit_mode(data.get("mode"))
+        is_autonomous = mode in {"pilote", "autopilot"}
+        next_action = (
+            "Pilote lancé automatiquement"
+            if mode == "pilote"
+            else ("Autopilot lancé automatiquement" if mode == "autopilot" else "/worker execute")
+        )
+        text = (
+            "<b>📌 Tâche créée</b>\n\n"
+            f"ID : <code>{_html.escape(data.get('id',''))}</code>\n"
+            f"Repo : <code>{_html.escape(data.get('repo',''))}</code>\n"
+            f"Mode : <b>{_html.escape(self._mode_title(data.get('mode','ask_review')))}</b>\n"
+            f"Statut : <code>{_html.escape(data.get('status',''))}</code>\n"
+            f"Approval : <code>{_html.escape(str(data.get('approval_status') or ''))}</code>\n\n"
+            f"Prochaine étape : <code>{_html.escape(next_action)}</code>."
+        )
+        await self._send_cockpit_text(msg, text, role="sticky")
+        if is_autonomous:
+            asyncio.create_task(self._run_autopilot_worker_after_task_create(msg, data.get("id", "")))
+
+    async def _run_autopilot_worker_after_task_create(self, msg: Message, task_id: str) -> None:
+        started_at = time.monotonic()
+        chat_id = getattr(msg, "chat_id", None) or getattr(getattr(msg, "chat", None), "id", None)
+        live_message_id: int | None = None
+        last_live_text = ""
+
+        async def fetch_autonomy(timeout: int = 20) -> dict:
+            if not task_id:
+                return {"ok": False, "task": {"id": "", "status": "queued_plan", "mode": "autopilot"}}
+            data = await asyncio.to_thread(
+                self._cockpit_api_sync,
+                "GET",
+                f"/api/internal/tasks/{task_id}/autonomy",
+                None,
+                timeout,
+            )
+            if not data or not data.get("ok"):
+                return {
+                    "ok": False,
+                    "task": {"id": task_id, "status": "queued_plan", "mode": "autopilot"},
+                    "description": (data or {}).get("description") if isinstance(data, dict) else str(data),
+                }
+            return data
+
+        async def publish_live(data: dict, *, force: bool = False) -> None:
+            nonlocal live_message_id, last_live_text
+            elapsed = int(time.monotonic() - started_at)
+            text = self._format_autopilot_live_card(data, elapsed_seconds=elapsed)
+            if not force and text == last_live_text:
+                return
+            keyboard = self._autonomy_keyboard(data, "status")
+            if live_message_id and chat_id is not None:
+                edited = await self._edit_cockpit_panel(chat_id, live_message_id, text, keyboard)
+                if edited:
+                    last_live_text = text
+                    return
+            sent = await self._send_cockpit_panel(msg, text, keyboard, role="progress")
+            live_message_id = getattr(sent, "message_id", None) if sent else None
+            last_live_text = text
+
+        runtime_observer_state = {"signature": ""}
+
+        async def observe_runtime_signal(*, force: bool = False) -> dict:
+            """Attach fresh log errors to the active autonomous task while it is working."""
+            if not task_id:
+                return {}
+            from gateway.libre_orchestrator import scan_watch_logs
+
+            report = await asyncio.to_thread(scan_watch_logs, self._libre_watch_log_paths(), limit=30)
+            if str(report.get("status") or "green") == "green" or not report.get("items"):
+                return report
+            signature = self._libre_watch_signature(report)
+            if not force and (not signature or signature == runtime_observer_state.get("signature")):
+                return report
+            runtime_observer_state["signature"] = signature
+            try:
+                await asyncio.to_thread(
+                    post_runtime_observations,
+                    self._cockpit_api_sync,
+                    task_id=task_id,
+                    report=report,
+                    timeout=10,
+                    prefer_v2=True,
+                )
+            except Exception:
+                logger.debug("[%s] Runtime observation attach failed for %s", self.name, task_id, exc_info=True)
+            if not force:
+                await self._send_cockpit_text(
+                    msg,
+                    self._format_runtime_observation_notice(report),
+                    role="progress",
+                )
+            return report
+
+        initial = await fetch_autonomy(timeout=10)
+        await publish_live(initial, force=True)
+
+        try:
+            worker_task = asyncio.create_task(
+                asyncio.to_thread(
+                    self._cockpit_api_sync,
+                    "POST",
+                    "/api/worker/run-once",
+                    {
+                        "status": "queued_plan",
+                        "execute": True,
+                        "runtime_observer": {
+                            "enabled": True,
+                            "task_id": task_id,
+                            "source": "telegram_autonomous_worker",
+                            "mode": "during_work",
+                        },
+                    },
+                    1800,
+                )
+            )
+            last_phase = ""
+            while not worker_task.done():
+                elapsed = int(time.monotonic() - started_at)
+                interval = 12 if elapsed < 120 else 30
+                try:
+                    await asyncio.wait_for(asyncio.shield(worker_task), timeout=interval)
+                except asyncio.TimeoutError:
+                    pass
+                data = await fetch_autonomy(timeout=20)
+                await observe_runtime_signal()
+                task = data.get("task") or {}
+                phase = str(task.get("status") or task.get("current_phase") or "")
+                await publish_live(data, force=(phase != last_phase))
+                last_phase = phase
+
+            worker = await worker_task
+            await observe_runtime_signal(force=True)
+            result = worker.get("result") or {}
+            status = result.get("status") or worker.get("status")
+            task = await asyncio.to_thread(self._cockpit_api_sync, "GET", f"/api/tasks/{task_id}", None, 20) if task_id else {}
+            if isinstance(task, dict) and status and not task.get("status"):
+                task["status"] = status
+            autonomy = await fetch_autonomy(timeout=20)
+            await publish_live(autonomy, force=True)
+            await self._send_cockpit_text(
+                msg,
+                self._format_autopilot_final(task_id, worker, task if isinstance(task, dict) else {}, autonomy),
+                role="bot_reply",
+            )
+        except Exception as exc:
+            fallback = {
+                "ok": False,
+                "task": {"id": task_id, "status": "blocked_worker", "mode": "autopilot"},
+                "latest_error": {"category": "worker_exception", "runbook": "read_runs_and_logs"},
+            }
+            await publish_live(fallback, force=True)
+            await self._send_cockpit_text(
+                msg,
+                "<b>🚨 Autopilot bloqué</b>\n\n<code>" + _html.escape(str(exc))[:1200] + "</code>",
+                role="progress",
+            )
+
+    async def _send_approve_command(self, msg: Message, args: str = "") -> None:
+        task_id = (args or "").strip().split()[0] if args.strip() else ""
+        note = (args or "").strip()[len(task_id):].strip() if task_id else ""
+        if not task_id:
+            return await self._send_cockpit_text(msg, "Usage : <code>/approve op_xxx</code>", role="preview")
+        user_id = str(getattr(getattr(msg, "from_user", None), "id", "") or getattr(msg, "chat_id", ""))
+        data = await asyncio.to_thread(self._cockpit_api_sync, "POST", f"/api/internal/tasks/{task_id}/approve", {"actor": user_id, "note": note}, 20)
+        if not data.get("ok"):
+            return await self._send_cockpit_text(msg, "<b>Approval impossible</b>\n\n<code>" + _html.escape(str(data.get("description") or data))[:1000] + "</code>", role="progress")
+        await self._send_cockpit_text(
+            msg,
+            "<b>✅ Plan approuvé</b>\n\n"
+            f"Tâche : <code>{_html.escape(task_id)}</code>\n"
+            f"Statut : <code>{_html.escape(data.get('status',''))}</code>\n\n"
+            "Lance <code>/worker implementation</code> pour démarrer l'implémentation.",
+            role="sticky",
+        )
+
+    async def _send_worker_command(self, msg: Message, args: str = "") -> None:
+        words = (args or "").strip().split()
+        if words and words[0] in {"run", "run-once", "execute"}:
+            execute = words[0] == "execute" or "--execute" in words
+            data = await asyncio.to_thread(self._cockpit_api_sync, "POST", "/api/worker/run-once", {"status": "queued_plan", "execute": execute}, 1800)
+            return await self._send_cockpit_text(msg, "<b>⚙️ Worker run-once</b>\n\n<pre><code>" + _html.escape(json.dumps(data, ensure_ascii=False, indent=2)[-3000:]) + "</code></pre>")
+        if words and words[0] in {"implementation", "impl"}:
+            execute = "--dry-run" not in words
+            data = await asyncio.to_thread(self._cockpit_api_sync, "POST", "/api/worker/run-once", {"status": "queued_implementation", "execute": execute}, 1800)
+            return await self._send_cockpit_text(msg, "<b>⚙️ Worker run-once</b>\n\n<pre><code>" + _html.escape(json.dumps(data, ensure_ascii=False, indent=2)[-3000:]) + "</code></pre>")
+        data = await asyncio.to_thread(self._cockpit_api_sync, "GET", "/api/worker/status", None, 20)
+        lines = ["<b>⚙️ Worker Repo Cockpit</b>", "", f"Timer : <code>{_html.escape(str(data.get('timer_active','?')))}</code>", "Queue :"]
+        for k,v in (data.get("queue_counts") or {}).items(): lines.append(f"- {_html.escape(str(k))}: <b>{v}</b>")
+        lines.append("\nActions : <code>/worker run</code> dry-run · <code>/worker execute</code> réel")
+        await self._send_cockpit_text(msg, "\n".join(lines))
+
+    async def _send_quota_command(self, msg: Message) -> None:
+        q = await asyncio.to_thread(self._cockpit_api_sync, "GET", "/api/quota", None, 20)
+        main = (q.get("main") or {}).get("primary_remaining_percent") or q.get("main_primary_remaining")
+        spark = ((q.get("additional") or {}).get("gpt-5.3-codex-spark") or {}).get("primary_remaining_percent") or q.get("spark_primary_remaining")
+        await self._send_cockpit_text(msg, f"<b>📊 Quota</b>\n\nGPT-5.5/main : <b>{_html.escape(str(main))}%</b>\nSpark : <b>{_html.escape(str(spark))}%</b>\nSource : <code>{_html.escape(str(q.get('source','unknown')))}</code>")
+
+    async def _send_logs_command(self, msg: Message, args: str = "") -> None:
+        n = 60
+        try:
+            if args.strip(): n = max(10, min(int(args.strip().split()[0]), 200))
+        except Exception:
+            pass
+        data = await asyncio.to_thread(self._cockpit_api_sync, "GET", f"/api/logs?lines={n}", None, 20)
+        chunks = []
+        for item in (data.get("logs") or [])[:3]:
+            chunks.append(f"# {item.get('file')}\n" + "\n".join(item.get("lines") or [])[-2500:])
+        text = "\n\n".join(chunks) or "Aucun log worker."
+        await self._send_cockpit_text(msg, "<b>📜 Logs worker</b>\n\n<pre><code>" + _html.escape(text[-3300:]) + "</code></pre>")
+
+    def _libre_context_key(self, msg: Message, user_id: str | None = None) -> str:
+        chat_id = str(getattr(msg, "chat_id", "") or getattr(getattr(msg, "chat", None), "id", ""))
+        thread_id = str(getattr(msg, "message_thread_id", "") or "")
+        uid = str(user_id or getattr(getattr(msg, "from_user", None), "id", "") or chat_id)
+        return f"telegram:{chat_id}:{thread_id}:{uid}"
+
+    def _libre_store(self):
+        from hermes_constants import get_hermes_home
+        from gateway.libre_orchestrator import ActiveWorkStore
+
+        return ActiveWorkStore(get_hermes_home() / "libre" / "state.json")
+
+    def _libre_watch_log_paths(self) -> list:
+        from hermes_constants import get_hermes_home
+
+        home = get_hermes_home()
+        return [
+            home / "logs" / "gateway.log",
+            home / "logs" / "repo-cockpit.log",
+            home / "logs" / "errors.log",
+        ]
+
+    def _libre_watch_target(self):
+        return getattr(self.config, "home_channel", None)
+
+    def _libre_watch_signature(self, report: dict) -> str:
+        items = report.get("items") or []
+        return "\n".join(
+            f"{item.get('file','')}::{item.get('line','')}"
+            for item in items[:8]
+            if isinstance(item, dict)
+        )
+
+    def _format_runtime_observation_notice(self, report: dict) -> str:
+        items = report.get("items") or []
+        lines = [
+            "<b>🛠️ Erreur captée pendant le travail</b>",
+            "",
+            "Je ne fais pas un checkup séparé : je rattache ce signal à la tâche autonome en cours pour que l'agent le traite dans son contexte.",
+        ]
+        if items:
+            lines.append("")
+            for item in items[:3]:
+                path = str(item.get("file") or "").rsplit("/", 1)[-1]
+                line = str(item.get("line") or "")[-220:]
+                lines.append(f"- <code>{_html.escape(path)}</code> · <code>{_html.escape(line)}</code>")
+        return "\n".join(lines)
+
+    def _format_libre_watch_alert(self, report: dict) -> str:
+        lines = [
+            "<b>👁️ Watch Libre autonome</b>",
+            "",
+            "J'ai détecté un nouveau signal dans les logs sans attendre de commande.",
+            f"Statut : <b>{_html.escape(str(report.get('status') or 'attention'))}</b>",
+            f"Erreurs récentes : <b>{int(report.get('error_count') or 0)}</b>",
+        ]
+        items = report.get("items") or []
+        if items:
+            lines.extend(["", "<b>Derniers signaux</b>"])
+            for item in items[:5]:
+                path = str(item.get("file") or "").rsplit("/", 1)[-1]
+                line = str(item.get("line") or "")[-240:]
+                lines.append(f"- <code>{_html.escape(path)}</code> · <code>{_html.escape(line)}</code>")
+        lines.extend([
+            "",
+            "Action safe pour l'instant : alerte + déduplication. Prochaine couche : ouvrir automatiquement une mission de réparation en branche/worktree.",
+        ])
+        return "\n".join(lines)
+
+    async def _libre_watch_tick(self) -> bool:
+        from gateway.libre_orchestrator import scan_watch_logs
+
+        target = self._libre_watch_target()
+        if not target or not getattr(target, "chat_id", None):
+            return False
+        report = await asyncio.to_thread(scan_watch_logs, self._libre_watch_log_paths(), limit=30)
+        if str(report.get("status") or "green") == "green" or not report.get("items"):
+            return False
+        signature = self._libre_watch_signature(report)
+        if not signature or signature == getattr(self, "_libre_watch_last_signature", ""):
+            return False
+        self._libre_watch_last_signature = signature
+        metadata: Dict[str, Any] = {"notify": True, "non_conversational": True}
+        if getattr(target, "thread_id", None):
+            metadata["thread_id"] = str(target.thread_id)
+        result = await self.send(str(target.chat_id), self._format_libre_watch_alert(report), metadata=metadata)
+        return bool(result is None or getattr(result, "success", True))
+
+    async def _libre_watch_loop(self) -> None:
+        if self._libre_watch_initial_delay_seconds:
+            await asyncio.sleep(self._libre_watch_initial_delay_seconds)
+        while True:
+            try:
+                await self._libre_watch_tick()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.debug("[%s] Libre Watch autonomous tick failed: %s", self.name, exc, exc_info=True)
+            await asyncio.sleep(self._libre_watch_interval_seconds)
+
+    def _start_libre_watch_daemon(self) -> None:
+        if not getattr(self, "_libre_watch_enabled", True):
+            logger.info("[%s] Libre Watch autonomous daemon disabled by config", self.name)
+            return
+        if self._libre_watch_task and not self._libre_watch_task.done():
+            return
+        if not self._libre_watch_target() or not getattr(self._libre_watch_target(), "chat_id", None):
+            logger.info("[%s] Libre Watch autonomous daemon not started: no Telegram home channel", self.name)
+            return
+        self._libre_watch_task = asyncio.create_task(self._libre_watch_loop())
+        logger.info("[%s] Libre Watch autonomous daemon started", self.name)
+
+    async def _stop_libre_watch_daemon(self) -> None:
+        task = getattr(self, "_libre_watch_task", None)
+        if task and not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        self._libre_watch_task = None
+
+    async def _send_libre_watch_command(self, msg: Message) -> None:
+        from gateway.libre_orchestrator import scan_watch_logs
+
+        report = await asyncio.to_thread(scan_watch_logs, self._libre_watch_log_paths(), limit=20)
+        lines = [
+            "<b>👁️ Watch Libre</b>",
+            "",
+            f"Statut : <b>{_html.escape(str(report.get('status') or 'green'))}</b>",
+            f"Erreurs récentes : <b>{int(report.get('error_count') or 0)}</b>",
+        ]
+        items = report.get("items") or []
+        if items:
+            lines.extend(["", "<b>Derniers signaux</b>"])
+            for item in items[:5]:
+                path = str(item.get("file") or "").rsplit("/", 1)[-1]
+                line = str(item.get("line") or "")[-240:]
+                lines.append(f"- <code>{_html.escape(path)}</code> · <code>{_html.escape(line)}</code>")
+        else:
+            lines.append("\nAucun signal bloquant dans les logs surveillés.")
+        await self._send_cockpit_text(msg, "\n".join(lines), role="preview")
+
+    def _libre_handoff_from_active(self, active: dict | None) -> dict:
+        active = active or {}
+        return {
+            "repo": str(active.get("repo") or ""),
+            "mode": normalize_cockpit_mode(active.get("thread_mode") or active.get("project_mode") or "ask_review"),
+            "task": str(active.get("last_task_title") or active.get("last_task_id") or active.get("thread_title") or ""),
+            "task_id": str(active.get("last_task_id") or ""),
+            "parent_task_id": str(active.get("parent_task_id") or ""),
+            "thread_id": str(active.get("thread_id") or ""),
+        }
+
+    async def _persist_libre_handoff_to_cockpit(self, handoff: dict, key: str) -> dict | None:
+        task_id = str(handoff.get("task_id") or "")
+        if not task_id:
+            return None
+        payload = {
+            "reason": str(handoff.get("reason") or "/libre"),
+            "summary": str(handoff.get("summary") or "Handoff Libre"),
+            "resume_hints": handoff.get("resume_hints") if isinstance(handoff.get("resume_hints"), dict) else {
+                "repo": handoff.get("repo", ""),
+                "mode": handoff.get("mode", ""),
+                "task": handoff.get("task", ""),
+                "task_id": task_id,
+                "thread_id": handoff.get("thread_id", ""),
+            },
+            "conversation_key": key,
+            "source": "telegram_libre",
+            "payload": {"local_handoff_id": handoff.get("id")},
+        }
+        data = await asyncio.to_thread(self._cockpit_api_sync, "POST", f"/api/internal/tasks/{task_id}/handoff", payload, 20)
+        if data and data.get("ok") and isinstance(data.get("handoff"), dict):
+            try:
+                self._libre_store().cache_handoff(key, {**handoff, **data["handoff"], "source": "repo_cockpit"})
+            except Exception:
+                logger.debug("[%s] Failed to cache Repo Cockpit handoff", self.name, exc_info=True)
+        return data
+
+    async def _fetch_libre_handoff_from_cockpit(self, key: str, task_id: str | None = None) -> dict | None:
+        if task_id:
+            path = f"/api/internal/tasks/{task_id}/handoff"
+        else:
+            path = "/api/internal/handoffs/latest?conversation_key=" + urllib.parse.quote(key, safe="")
+        data = await asyncio.to_thread(self._cockpit_api_sync, "GET", path, None, 20)
+        if data and data.get("ok") and isinstance(data.get("handoff"), dict):
+            handoff = data["handoff"]
+            self._libre_store().cache_handoff(key, handoff)
+            return handoff
+        return None
+
+    async def _send_libre_command(self, msg: Message, args: str = "") -> None:
+        raw = (args or "").strip().lower()
+        if raw in {"watch", "logs", "selfcheck"}:
+            return await self._send_libre_watch_command(msg)
+
+        user_id = str(getattr(getattr(msg, "from_user", None), "id", "") or getattr(msg, "chat_id", ""))
+        key = self._libre_context_key(msg, user_id)
+        self._pilot_intake_states.pop(user_id, None)
+        self._repo_new_chat_choices.pop(user_id, None)
+
+        active = None
+        try:
+            _uid, data, active = await self._get_active_cockpit_thread(msg)
+        except Exception:
+            data = None
+            active = None
+
+        handoff_seed = self._libre_handoff_from_active(active)
+        store = self._libre_store()
+        if handoff_seed.get("repo") or handoff_seed.get("thread_id"):
+            store.set_active(key, **handoff_seed)
+        handoff = store.soft_close(key, reason="/libre")
+        cockpit_handoff = await self._persist_libre_handoff_to_cockpit(handoff, key)
+        if cockpit_handoff and cockpit_handoff.get("ok") and isinstance(cockpit_handoff.get("handoff"), dict):
+            handoff = {**handoff, **cockpit_handoff["handoff"]}
+        self._libre_chat_states[user_id] = {
+            "mode": "libre",
+            "key": key,
+            "last_handoff": handoff,
+            "active_repo": handoff_seed.get("repo", ""),
+            "ts": time.time(),
+        }
+
+        repo = handoff_seed.get("repo") or "aucun repo actif"
+        thread_id = handoff_seed.get("thread_id") or "—"
+        task_id = handoff.get("task_id") or "—"
+        previous_mode = self._mode_title(handoff_seed.get("mode") or "ask_review")
+        lines = [
+            "<b>✅ Mode libre activé</b>",
+            "",
+            "Je quitte le flow chantier/wizard actif sans hard reset.",
+            "Mémoire durable conservée. Historique utile conservé côté Hermes.",
+            "",
+            f"Repo précédent : <code>{_html.escape(repo)}</code>",
+            f"Mode précédent : <b>{_html.escape(previous_mode)}</b>",
+            f"Thread : <code>{_html.escape(thread_id)}</code>",
+            f"Task : <code>{_html.escape(str(task_id))}</code>",
+            "",
+            "Orchestration auto : je peux rester en chat normal, ou router vers Ask review / Pilote / Autopilot si ton message parle clairement d'un repo.",
+            "Observation runtime : pendant un travail autonome, je rattache les erreurs logs à la tâche en cours au lieu de faire des checkups hors contexte.",
+        ]
+        await self._send_cockpit_text(msg, "\n".join(lines), role="sticky")
+
+    async def _maybe_handle_libre_text(self, msg: Message, text: str) -> bool:
+        clean = (text or "").strip()
+        if not clean or clean.startswith("/"):
+            return False
+        user_id = str(getattr(getattr(msg, "from_user", None), "id", "") or getattr(msg, "chat_id", ""))
+        state = self._libre_chat_states.get(user_id) or {}
+        if state.get("mode") != "libre":
+            return False
+
+        from gateway.libre_orchestrator import classify_libre_message, extract_learning_policy
+
+        decision = classify_libre_message(clean)
+        if decision.action == "learn_policy":
+            policy = extract_learning_policy(clean) or {}
+            stored = self._libre_store().remember_policy(state.get("key") or self._libre_context_key(msg, user_id), policy, source="telegram_libre")
+            details = " · ".join(
+                f"{_html.escape(str(k))}=<code>{_html.escape(str(v))}</code>"
+                for k, v in stored.items()
+                if k in {"scope", "model", "reasoning_effort"}
+            )
+            await self._send_cockpit_text(
+                msg,
+                "<b>✅ Règle apprise</b>\n\n" + (details or "Préférence enregistrée."),
+                role="sticky",
+            )
+            return True
+
+        if decision.action == "switch_repo":
+            await self._send_cockpit_text(
+                msg,
+                "<b>🔁 Switch repo détecté</b>\n\n"
+                "Je garde la note de reprise du chantier précédent et j'ouvre le sélecteur de projet.\n"
+                "Choisis le repo, puis ton prochain message naturel deviendra la tâche.",
+                role="preview",
+            )
+            await self._send_new_command(msg, "pilote")
+            return True
+
+        if decision.action == "resume":
+            key = state.get("key") or self._libre_context_key(msg, user_id)
+            store = self._libre_store()
+            local_handoff = store.latest_handoff(key)
+            task_id = str((local_handoff or {}).get("task_id") or "")
+            handoff = await self._fetch_libre_handoff_from_cockpit(key, task_id=task_id or None)
+            if not handoff:
+                handoff = local_handoff
+            if not handoff:
+                await self._send_cockpit_text(
+                    msg,
+                    "<b>Reprise</b>\n\nJe n'ai pas encore de handoff fiable pour ce chat. Ouvre un chantier avec <code>/new</code>, ou donne-moi le repo explicitement.",
+                    role="preview",
+                )
+                return True
+            resume_hints = handoff.get("resume_hints") if isinstance(handoff.get("resume_hints"), dict) else {}
+            parent_task_id = str(handoff.get("task_id") or resume_hints.get("task_id") or "")
+            store.set_active(
+                key,
+                repo=handoff.get("repo") or resume_hints.get("repo") or "",
+                mode=handoff.get("mode") or resume_hints.get("mode") or "pilote",
+                task=handoff.get("summary") or resume_hints.get("task") or "",
+                task_id=parent_task_id,
+                parent_task_id=parent_task_id,
+                thread_id=handoff.get("thread_id") or resume_hints.get("thread_id") or "",
+            )
+            self._libre_chat_states[user_id] = {**state, "mode": "libre", "key": key, "last_handoff": handoff, "resume_parent_task_id": parent_task_id}
+            await self._send_cockpit_text(
+                msg,
+                "<b>🔁 Reprise retrouvée</b>\n\n"
+                f"Task source : <code>{_html.escape(parent_task_id or '—')}</code>\n"
+                f"Repo : <code>{_html.escape(str(handoff.get('repo') or resume_hints.get('repo') or '—'))}</code>\n"
+                f"Résumé : {_html.escape(str(handoff.get('summary') or 'Handoff retrouvé'))}\n\n"
+                "Ton prochain message de travail repo sera rattaché à ce lineage.",
+                role="sticky",
+            )
+            return True
+
+        if decision.action != "repo_task":
+            return False
+
+        user_id, data, active = await self._get_active_cockpit_thread(msg)
+        if not data or not data.get("ok") or not active:
+            await self._send_cockpit_text(
+                msg,
+                "<b>Mode libre</b>\n\nJe détecte une demande de travail repo, mais aucun repo actif n'est attaché.\n"
+                "Ouvre un chantier avec <code>/new</code> puis choisis un repo, ou donne-moi le repo explicitement.",
+                role="preview",
+            )
+            return True
+
+        await self._create_task_from_thread_command(
+            msg,
+            clean,
+            mode=decision.mode,
+            intent=decision.intent,
+            parent_task_id=str(state.get("resume_parent_task_id") or (state.get("last_handoff") or {}).get("task_id") or ""),
+            source="telegram_libre_router",
+        )
+        return True
+
+    async def _send_clean_command(self, msg: Message, args: str = "") -> None:
+        chat_id = str(getattr(msg, "chat_id", "") or getattr(getattr(msg, "chat", None), "id", ""))
+        cleanup_payload = {"chat_id": chat_id, "limit": 80, "roles": ["command_echo", "progress", "debug", "status", "preview"]}
+        data = await asyncio.to_thread(self._cockpit_api_sync, "POST", "/api/telegram/cleanup/execute", cleanup_payload, 60)
+        if not data.get("ok"):
+            return await self._send_cockpit_text(msg, "<b>🧹 Clear</b>\n\n❌ Nettoyage impossible : <code>" + _html.escape(str(data.get("description") or data))[:800] + "</code>", role="progress")
+        deleted = data.get("deleted") or []
+        failed = data.get("failed") or []
+        txt = (
+            "<b>🧹 Clear terminé</b>\n\n"
+            f"Bruit supprimé : <b>{len(deleted)}</b>\n"
+            f"Échecs : <b>{len(failed)}</b>\n\n"
+            "Réponses IA conservées."
+        )
+        if failed:
+            txt += "\n\n<details><summary>Échecs</summary><pre><code>" + _html.escape(json.dumps(failed[:10], ensure_ascii=False, indent=2)) + "</code></pre></details>"
+        await self._send_cockpit_text(msg, txt, role="progress")
+
+    async def _send_cleanchat_command(self, msg: Message, args: str = "") -> None:
+        await self._send_clean_command(msg, args)
+
+    async def _get_active_cockpit_thread(self, msg: Message) -> tuple[str, dict | None, dict | None]:
+        user_id = str(getattr(getattr(msg, "from_user", None), "id", "") or getattr(msg, "chat_id", ""))
+        data = await asyncio.to_thread(self._cockpit_api_sync, "GET", f"/api/internal/threads/active/{user_id}", None, 10)
+        return user_id, data, data.get("active") if data.get("ok") else None
+
+    async def _send_chat_status_command(self, msg: Message) -> None:
+        _user_id, data, active = await self._get_active_cockpit_thread(msg)
+        if not data or not data.get("ok"):
+            return await self._send_cockpit_text(
+                msg,
+                "<b>💬 Chat actif</b>\n\nImpossible de lire l'état Repo Cockpit : <code>"
+                + _html.escape(str((data or {}).get("description") or data))[:800]
+                + "</code>",
+                role="preview",
+            )
+        if not active:
+            return await self._send_cockpit_text(
+                msg,
+                "<b>💬 Chat actif</b>\n\nAucun thread actif. Lance <code>/new</code> pour choisir un projet ou créer un nouveau clavardage.",
+                role="preview",
+            )
+        lines = [
+            "<b>💬 Chat actif</b>",
+            "",
+            f"Projet : <code>{_html.escape(active.get('project_title') or active.get('project_id') or '')}</code>",
+            f"Repo : <code>{_html.escape(active.get('repo') or '')}</code>",
+            f"Mode : <b>{_html.escape(self._mode_title(active.get('thread_mode') or active.get('project_mode') or 'ask_review'))}</b>",
+            f"Thread : <code>{_html.escape(active.get('thread_id') or '')}</code>",
+            f"Statut : <b>{_html.escape(active.get('thread_status') or '')}</b>",
+            "",
+            "Actions : <code>/archive</code> range ce chat · <code>/delete</code> le supprime côté Cockpit.",
+        ]
+        await self._send_cockpit_text(msg, "\n".join(lines), role="preview")
+
+    async def _send_thread_action_command(self, msg: Message, action: str) -> None:
+        user_id, data, active = await self._get_active_cockpit_thread(msg)
+        title = "Archive" if action == "archive" else "Delete"
+        if not data or not data.get("ok"):
+            return await self._send_cockpit_text(
+                msg,
+                f"<b>{_html.escape(title)}</b>\n\nImpossible de lire le thread actif : <code>"
+                + _html.escape(str((data or {}).get("description") or data))[:800]
+                + "</code>",
+                role="progress",
+            )
+        if not active:
+            return await self._send_cockpit_text(
+                msg,
+                f"<b>{_html.escape(title)}</b>\n\nAucun thread actif à traiter. Lance <code>/new</code> pour ouvrir un clavardage.",
+                role="progress",
+            )
+        thread_id = active.get("thread_id")
+        payload = {"telegram_user_id": user_id, "note": f"telegram /{action}"}
+        result = await asyncio.to_thread(self._cockpit_api_sync, "POST", f"/api/internal/threads/{thread_id}/{action}", payload, 20)
+        if not result.get("ok"):
+            return await self._send_cockpit_text(
+                msg,
+                f"<b>{_html.escape(title)}</b>\n\nAction impossible : <code>"
+                + _html.escape(str(result.get("description") or result))[:900]
+                + "</code>",
+                role="progress",
+            )
+        verb = "archivé" if action == "archive" else "supprimé côté Cockpit"
+        text = (
+            f"<b>✅ Thread {verb}</b>\n\n"
+            f"Projet : <code>{_html.escape(active.get('project_title') or active.get('project_id') or '')}</code>\n"
+            f"Repo : <code>{_html.escape(active.get('repo') or '')}</code>\n"
+            f"Thread : <code>{_html.escape(thread_id or '')}</code>\n\n"
+            "Repo GitHub conservé. Messages Telegram conservés. Ce chat n'est plus le thread actif."
+        )
+        await self._send_cockpit_text(msg, text, role="sticky")
+
+    def _thread_status_title(self, status: str) -> str:
+        return {
+            "active": "Actifs",
+            "archived": "Archives",
+            "deleted": "Supprimés",
+            "all": "Tous",
+        }.get(status, "Actifs")
+
+    def _thread_mode_label(self, mode: str | None) -> str:
+        return self._mode_title(normalize_cockpit_mode(mode))
+
+    def _format_thread_activity_time(self, value: Any) -> str:
+        if value in (None, ""):
+            return ""
+        try:
+            timestamp = int(value)
+        except (TypeError, ValueError):
+            return str(value)
+        try:
+            return datetime.fromtimestamp(timestamp, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+        except (OverflowError, OSError, ValueError):
+            return str(value)
+
+    def _thread_list_text(self, data: dict, status: str) -> str:
+        threads = data.get("threads") or []
+        active_thread_id = data.get("active_thread_id")
+        lines = [
+            f"<b>🧵 Conversations Repo Cockpit — {_html.escape(self._thread_status_title(status))}</b>",
+            "",
+        ]
+        if not threads:
+            lines.extend([
+                "Aucune conversation dans cette vue.",
+                "",
+                "Lance <code>/new</code> pour créer un nouveau clavardage.",
+            ])
+            return "\n".join(lines)
+        for index, thread in enumerate(threads[:8], 1):
+            thread_id = str(thread.get("thread_id") or "")
+            marker = "⭐ " if thread_id == active_thread_id else ""
+            title = thread.get("thread_title") or thread.get("project_title") or thread.get("repo") or thread_id
+            repo = thread.get("repo") or ""
+            mode = self._thread_mode_label(thread.get("thread_mode") or thread.get("project_mode"))
+            state = thread.get("thread_status") or ""
+            task_state = thread.get("last_task_status") or "aucune tâche"
+            task_phase = thread.get("last_task_phase") or ""
+            preview = thread.get("preview_url") or thread.get("deployment_url") or ""
+            last_activity = (
+                thread.get("last_task_updated_at")
+                or thread.get("thread_updated_at")
+                or thread.get("thread_created_at")
+            )
+            last_activity_text = self._format_thread_activity_time(last_activity)
+            lines.extend([
+                f"{index}. {marker}<b>{_html.escape(str(title))}</b>",
+                f"   Repo : <code>{_html.escape(str(repo))}</code>",
+                f"   Mode : <b>{_html.escape(mode)}</b> · Statut : <b>{_html.escape(str(state))}</b>",
+                f"   Dernière tâche : <code>{_html.escape(str(task_state))}</code>"
+                + (f" · <code>{_html.escape(str(task_phase))}</code>" if task_phase else ""),
+            ])
+            if last_activity_text:
+                lines.append(f"   Dernière activité : <code>{_html.escape(last_activity_text)}</code>")
+            if preview:
+                lines.append(f"   Preview : {_html.escape(str(preview))}")
+            lines.append(f"   ID conversation : <code>{_html.escape(thread_id)}</code>")
+            lines.append("")
+        lines.append("Boutons : reprendre, archiver, supprimer ou restaurer côté Repo Cockpit.")
+        return "\n".join(lines)
+
+    def _thread_list_keyboard(self, threads: list[dict], status: str) -> InlineKeyboardMarkup:
+        rows: list[list[InlineKeyboardButton]] = [[
+            InlineKeyboardButton("Actifs", callback_data="rct:list:active"),
+            InlineKeyboardButton("Archives", callback_data="rct:list:archived"),
+            InlineKeyboardButton("Tous", callback_data="rct:list:all"),
+        ]]
+        for thread in threads[:8]:
+            thread_id = str(thread.get("thread_id") or "")
+            if not thread_id:
+                continue
+            short = thread_id.replace("thread_", "")[:8]
+            title = str(thread.get("thread_title") or thread.get("project_title") or thread.get("repo") or short)
+            clean_title = re.sub(r"\s+", " ", title).strip()
+            if len(clean_title) > 18:
+                clean_title = clean_title[:18].rstrip() + "…"
+            resume_label = f"Reprendre {clean_title}" if clean_title else f"Reprendre {short}"
+            thread_status = str(thread.get("thread_status") or status)
+            action_row = [InlineKeyboardButton(resume_label, callback_data=f"rct:activate:{thread_id}")]
+            if thread_status == "archived":
+                action_row.append(InlineKeyboardButton("Restaurer", callback_data=f"rct:restore:{thread_id}"))
+            elif thread_status == "deleted":
+                action_row.append(InlineKeyboardButton("Restaurer", callback_data=f"rct:restore:{thread_id}"))
+            else:
+                action_row.append(InlineKeyboardButton("Archiver", callback_data=f"rct:archive:{thread_id}"))
+                action_row.append(InlineKeyboardButton("Supprimer", callback_data=f"rct:delete:{thread_id}"))
+            rows.append(action_row)
+        rows.append([InlineKeyboardButton("Nouveau chat", callback_data="rcn:mode:ask_review")])
+        return InlineKeyboardMarkup(rows)
+
+    def _thread_action_keyboard(self, thread: dict) -> InlineKeyboardMarkup:
+        rows: list[list[InlineKeyboardButton]] = []
+        task_id = str(thread.get("last_task_id") or "")
+        preview = str(thread.get("preview_url") or thread.get("deployment_url") or "")
+        if preview.startswith(("https://", "http://")):
+            rows.append([InlineKeyboardButton("Ouvrir preview", url=preview)])
+        if task_id.startswith("op_"):
+            rows.append([
+                InlineKeyboardButton("Status", callback_data=f"rca:status:{task_id}"),
+                InlineKeyboardButton("Runs", callback_data=f"rca:runs:{task_id}"),
+            ])
+        rows.append([InlineKeyboardButton("Conversations", callback_data="rct:list:all")])
+        return InlineKeyboardMarkup(rows)
+
+    def _thread_resume_seed(self, thread: dict) -> str:
+        return "\n".join([
+            f"Conversation: {thread.get('thread_title') or thread.get('project_title') or thread.get('repo') or thread.get('thread_id')}",
+            f"Repo: {thread.get('repo') or ''}",
+            f"Mode: {self._thread_mode_label(thread.get('thread_mode') or thread.get('project_mode'))}",
+            f"Statut conversation: {thread.get('thread_status') or ''}",
+            f"Derniere task: {thread.get('last_task_id') or ''}",
+            f"Statut derniere task: {thread.get('last_task_status') or 'aucune tâche'}",
+            f"Phase derniere task: {thread.get('last_task_phase') or ''}",
+            f"Derniere activite: {self._format_thread_activity_time(thread.get('last_task_updated_at') or thread.get('thread_updated_at') or thread.get('thread_created_at'))}",
+            f"Preview: {thread.get('preview_url') or thread.get('deployment_url') or ''}",
+            "",
+            "Objectif: écrire un message de reprise personnalisé pour Telegram.",
+            "Règles de sortie strictes:",
+            "- Texte Telegram simple, sans Markdown, sans astérisques, sans gras, sans titre décoratif.",
+            "- Ne répète pas les identifiants techniques déjà listés plus haut sauf si utile.",
+            "- Sois concret: ce qui est prêt, ce qui bloque, quoi faire maintenant.",
+            "- Si tu n'as pas de preuve de tests ou de validations, dis-le clairement.",
+            "",
+            "Format exact attendu:",
+            "- Où on en est : ...",
+            "- Ce qui marche : ...",
+            "- Point bloquant : ...",
+            "- Prochaine action : ...",
+        ]).strip()
+
+    @staticmethod
+    def _clean_spark_resume_summary(content: str) -> str:
+        text = str(content or "").strip()
+        if not text:
+            return ""
+        # Spark may return Markdown even when asked not to. Telegram receives
+        # escaped HTML below, so strip lightweight Markdown before display.
+        text = re.sub(r"\*\*(.*?)\*\*", r"\1", text)
+        text = re.sub(r"__(.*?)__", r"\1", text)
+        text = re.sub(r"`([^`]+)`", r"\1", text)
+        text = re.sub(r"(?m)^\s*[-*]\s+", "- ", text)
+        text = re.sub(r"\n{3,}", "\n\n", text)
+        return text.strip()
+
+    def _spark_thread_resume_summary_sync(self, thread: dict) -> str | None:
+        script = "/home/hermes/repo-cockpit/scripts/spark_guard.py"
+        if not os.path.exists(script):
+            return None
+        try:
+            proc = subprocess.run(
+                [script, "summarize", "--reasoning", "high"],
+                input=self._thread_resume_seed(thread),
+                text=True,
+                capture_output=True,
+                timeout=55,
+                cwd="/home/hermes/repo-cockpit",
+            )
+        except Exception:
+            return None
+        if proc.returncode != 0:
+            return None
+        try:
+            payload = json.loads(proc.stdout or "{}")
+        except Exception:
+            return None
+        content = str(payload.get("content") or "").strip()
+        content = self._clean_spark_resume_summary(content)
+        return content[:1800] if content else None
+
+    async def _spark_thread_resume_summary(self, thread: dict) -> str | None:
+        return await asyncio.to_thread(self._spark_thread_resume_summary_sync, thread)
+
+    def _thread_resume_text(self, thread: dict, spark_summary: str | None = None) -> str:
+        title = thread.get("thread_title") or thread.get("project_title") or thread.get("repo") or thread.get("thread_id")
+        repo = thread.get("repo") or ""
+        mode = self._thread_mode_label(thread.get("thread_mode") or thread.get("project_mode"))
+        task_id = thread.get("last_task_id") or ""
+        task_state = thread.get("last_task_status") or "aucune tâche"
+        task_phase = thread.get("last_task_phase") or ""
+        last_activity = self._format_thread_activity_time(
+            thread.get("last_task_updated_at")
+            or thread.get("thread_updated_at")
+            or thread.get("thread_created_at")
+        )
+        preview = thread.get("preview_url") or thread.get("deployment_url") or ""
+        lines = [
+            "<b>✅ Conversation reprise</b>",
+            "",
+            f"On reprend <b>{_html.escape(str(title))}</b>.",
+            f"Repo : <code>{_html.escape(str(repo))}</code>",
+            f"Mode : <b>{_html.escape(mode)}</b>",
+        ]
+        if task_id:
+            lines.append(f"Dernière task : <code>{_html.escape(str(task_id))}</code>")
+        lines.append(
+            f"Point d'arrêt : <code>{_html.escape(str(task_state))}</code>"
+            + (f" · <code>{_html.escape(str(task_phase))}</code>" if task_phase else "")
+        )
+        if last_activity:
+            lines.append(f"Dernière activité : <code>{_html.escape(last_activity)}</code>")
+        if preview:
+            lines.append(f"Preview : {_html.escape(str(preview))}")
+        lines.append("")
+        if spark_summary:
+            lines.extend([
+                "<b>Résumé Spark</b>",
+                _html.escape(spark_summary),
+            ])
+        else:
+            lines.extend([
+                "<b>Résumé</b>",
+                "La conversation est active. Tu peux écrire directement la suite ici ; Hermes utilisera ce projet et ce contexte.",
+                "Si tu veux changer de mode ou démarrer autre chose, utilise <code>/new</code>.",
+            ])
+        return "\n".join(lines)
+
+    async def _send_thread_resume_message(self, query, thread: dict) -> None:
+        spark_summary = await self._spark_thread_resume_summary(thread)
+        try:
+            await query.message.reply_text(
+                self._thread_resume_text(thread, spark_summary),
+                parse_mode=ParseMode.HTML,
+                reply_markup=self._thread_action_keyboard(thread),
+                **self._link_preview_kwargs(),
+            )
+        except Exception:
+            pass
+
+    def _normalize_thread_status_arg(self, args: str) -> str:
+        token = (args or "").strip().split(maxsplit=1)[0].lower()
+        aliases = {
+            "active": "active",
+            "actif": "active",
+            "actifs": "active",
+            "archive": "archived",
+            "archives": "archived",
+            "archived": "archived",
+            "deleted": "deleted",
+            "delete": "deleted",
+            "supprime": "deleted",
+            "supprimés": "deleted",
+            "supprimes": "deleted",
+            "all": "all",
+            "tout": "all",
+            "tous": "all",
+        }
+        return aliases.get(token, "active")
+
+    async def _fetch_threads_for_user(self, user_id: str, status: str) -> dict:
+        return await asyncio.to_thread(
+            self._cockpit_api_sync,
+            "GET",
+            f"/api/internal/threads/{user_id}?status={status}&limit=8",
+            None,
+            12,
+        )
+
+    async def _send_threads_command(self, msg: Message, args: str = "") -> None:
+        user_id = str(getattr(getattr(msg, "from_user", None), "id", "") or getattr(msg, "chat_id", ""))
+        status = self._normalize_thread_status_arg(args)
+        data = await self._fetch_threads_for_user(user_id, status)
+        if not data or not data.get("ok"):
+            return await self._send_cockpit_text(
+                msg,
+                "<b>🧵 Conversations Repo Cockpit</b>\n\nImpossible de lire les conversations : <code>"
+                + _html.escape(str((data or {}).get("description") or data))[:900]
+                + "</code>",
+                role="preview",
+            )
+        await msg.reply_text(
+            self._thread_list_text(data, status),
+            parse_mode=ParseMode.HTML,
+            reply_markup=self._thread_list_keyboard(data.get("threads") or [], status),
+            **self._link_preview_kwargs(),
+        )
+
+    async def _send_conversations_command(self, msg: Message, args: str = "") -> None:
+        # /conv answers "show me my recent conversations", so default to all
+        # known Repo Cockpit conversation records.
+        await self._send_threads_command(msg, args or "all")
+
+    async def _send_rename_thread_command(self, msg: Message, args: str = "") -> None:
+        title = re.sub(r"\s+", " ", (args or "").strip())[:120]
+        if not title:
+            return await self._send_cockpit_text(
+                msg,
+                "Usage : <code>/renamechat Tennis map France</code>",
+                role="preview",
+            )
+        user_id, data, active = await self._get_active_cockpit_thread(msg)
+        if not data or not data.get("ok"):
+            return await self._send_cockpit_text(
+                msg,
+                "<b>✏️ Renommer chat</b>\n\nImpossible de lire le thread actif : <code>"
+                + _html.escape(str((data or {}).get("description") or data))[:800]
+                + "</code>",
+                role="preview",
+            )
+        if not active or not active.get("thread_id"):
+            return await self._send_cockpit_text(
+                msg,
+                "<b>✏️ Renommer chat</b>\n\nAucune conversation active. Lance <code>/conv</code> puis reprends un chat.",
+                role="preview",
+            )
+        payload = {"telegram_user_id": user_id, "title": title, "note": "telegram /renamechat"}
+        result = await asyncio.to_thread(
+            self._cockpit_api_sync,
+            "POST",
+            f"/api/internal/threads/{active.get('thread_id')}/rename",
+            payload,
+            20,
+        )
+        if not result.get("ok"):
+            return await self._send_cockpit_text(
+                msg,
+                "<b>✏️ Renommer chat</b>\n\nAction impossible : <code>"
+                + _html.escape(str(result.get("description") or result))[:900]
+                + "</code>",
+                role="preview",
+            )
+        await self._send_cockpit_text(
+            msg,
+            "<b>✅ Chat renommé</b>\n\n"
+            f"Ancien nom : <code>{_html.escape(str(result.get('old_title') or ''))}</code>\n"
+            f"Nouveau nom : <b>{_html.escape(str(result.get('title') or title))}</b>\n"
+            f"Thread : <code>{_html.escape(str(active.get('thread_id') or ''))}</code>",
+            role="sticky",
+        )
+
+    async def _handle_thread_callback(self, query, data: str, caller_id: str) -> None:
+        parts = data.split(":", 2)
+        verb = parts[1] if len(parts) > 1 else "list"
+        value = parts[2] if len(parts) > 2 else "active"
+        status = "active"
+        resumed_thread = None
+        if verb == "list":
+            status = self._normalize_thread_status_arg(value)
+            result = await self._fetch_threads_for_user(caller_id, status)
+            await query.answer(text=self._thread_status_title(status))
+        else:
+            if verb not in {"activate", "archive", "delete", "restore"}:
+                await query.answer(text="Action inconnue")
+                return
+            payload = {"telegram_user_id": caller_id, "note": f"telegram /conv {verb}"}
+            result = await asyncio.to_thread(
+                self._cockpit_api_sync,
+                "POST",
+                f"/api/internal/threads/{value}/{verb}",
+                payload,
+                20,
+            )
+            if not result.get("ok"):
+                await query.answer(text="Action impossible")
+                try:
+                    await query.edit_message_text(
+                        "<b>🧵 Conversations Repo Cockpit</b>\n\nErreur : <code>"
+                        + _html.escape(str(result.get("description") or result))[:900]
+                        + "</code>",
+                        parse_mode=ParseMode.HTML,
+                        reply_markup=None,
+                    )
+                except Exception:
+                    pass
+                return
+            labels = {
+                "activate": "Thread repris",
+                "archive": "Thread archivé",
+                "delete": "Thread supprimé",
+                "restore": "Thread restauré",
+            }
+            await query.answer(text=labels.get(verb, "OK"))
+            status = "all" if verb == "restore" else "active"
+            result = await self._fetch_threads_for_user(caller_id, status)
+            if verb == "activate":
+                for item in result.get("threads") or []:
+                    if str(item.get("thread_id") or "") == value:
+                        resumed_thread = item
+                        break
+        try:
+            await query.edit_message_text(
+                self._thread_list_text(result, status),
+                parse_mode=ParseMode.HTML,
+                reply_markup=self._thread_list_keyboard(result.get("threads") or [], status),
+                **self._link_preview_kwargs(),
+            )
+        except Exception:
+            pass
+        if verb == "activate" and resumed_thread:
+            await self._send_thread_resume_message(query, resumed_thread)
+
+    async def _send_serveurstatut(self, msg: Message) -> None:
+        """Send an operational VPS / Hermes / Repo Cockpit health report."""
+
+        def run_check(cmd: list[str], timeout: int = 8) -> tuple[bool, str]:
+            try:
+                proc = subprocess.run(
+                    cmd,
+                    text=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    timeout=timeout,
+                )
+                out = (proc.stdout or "").strip()
+                return proc.returncode == 0, out
+            except subprocess.TimeoutExpired:
+                return False, "timeout"
+            except Exception as exc:
+                return False, str(exc)
+
+        checks: list[tuple[str, bool, str]] = []
+
+        ok, out = run_check(["bash", "-lc", "XDG_RUNTIME_DIR=/run/user/$(id -u) systemctl --user is-active hermes-gateway"], 5)
+        checks.append(("Hermes Gateway", ok and out == "active", out))
+
+        ok, out = run_check(["bash", "-lc", "XDG_RUNTIME_DIR=/run/user/$(id -u) systemctl --user is-active hermes-repo-cockpit"], 5)
+        checks.append(("Repo Cockpit service", ok and out == "active", out))
+
+        ok, out = run_check(["python3", "-c", "import urllib.request; print(urllib.request.urlopen('http://127.0.0.1:8765/health', timeout=6).read().decode())"], 8)
+        checks.append(("Cockpit local /health", ok and '"ok":true' in out.replace(' ', ''), out[:160]))
+
+        ok, out = run_check(["python3", "-c", "import urllib.request; print(urllib.request.urlopen('https://cockpit.134.122.73.242.sslip.io/health', timeout=8).read().decode())"], 10)
+        checks.append(("Cockpit HTTPS /health", ok and '"ok":true' in out.replace(' ', ''), out[:160]))
+
+        ok, out = run_check(["gh", "auth", "status", "--hostname", "github.com"], 10)
+        gh_ok = ok and "Logged in to github.com" in out and "MFcv1" in out
+        checks.append(("GitHub CLI VPS", gh_ok, "MFcv1 connecté" if gh_ok else out[:220]))
+
+        ok, out = run_check(["python3", "-c", "import json, urllib.request; d=json.loads(urllib.request.urlopen('http://127.0.0.1:8765/api/capabilities', timeout=15).read()); q=d.get('quota') or {}; main=(q.get('main') or {}).get('primary_remaining_percent'); spark=((q.get('additional') or {}).get('GPT-5.3-Codex-Spark') or {}).get('primary_remaining_percent'); allowed=(q.get('main') or {}).get('allowed'); print(f\"main_remaining={main}% spark_remaining={spark}% main_allowed={allowed} source={q.get('source')}\")"], 18)
+        checks.append(("Codex quota + Spark guard", ok and "main_allowed=True" in out, out[:220]))
+
+        ok, out = run_check(["bash", "-lc", "df -h / | awk 'NR==2{print $5 \" used, \" $4 \" free\"}'"], 5)
+        checks.append(("Disque VPS", ok, out))
+
+        ok, out = run_check(["bash", "-lc", "uptime | sed 's/^ *//'"], 5)
+        checks.append(("Uptime/load", ok, out))
+
+        all_ok = all(item_ok for _, item_ok, _ in checks[:5])
+        title = "✅ Serveur opérationnel" if all_ok else "⚠️ Serveur partiellement OK"
+        html_lines = [f"<b>{_html.escape(title, quote=False)}</b>", ""]
+        plain_lines = [title, ""]
+        for name, item_ok, detail in checks:
+            icon = "✅" if item_ok else "❌"
+            clean = (detail or "").replace("\n", " | ")
+            if len(clean) > 260:
+                clean = clean[:257] + "..."
+            shown = clean or ("OK" if item_ok else "KO")
+            html_lines.append(
+                f"{icon} <b>{_html.escape(name, quote=False)}</b>: "
+                f"<code>{_html.escape(shown, quote=False)}</code>"
+            )
+            plain_lines.append(f"{icon} {name}: {shown}")
+
+        html_lines.append("")
+        html_lines.append("Raccourci cockpit : <b>/repo</b>")
+        plain_lines.append("")
+        plain_lines.append("Raccourci cockpit : /repo")
+
+        rich_rows = []
+        for name, item_ok, detail in checks:
+            clean = (detail or "").replace("\n", " | ")
+            if len(clean) > 220:
+                clean = clean[:217] + "..."
+            shown = clean or ("OK" if item_ok else "KO")
+            rich_rows.append(
+                "<tr>"
+                f"<td>{'✅' if item_ok else '❌'} {_html.escape(name, quote=False)}</td>"
+                f"<td><code>{_html.escape(shown, quote=False)}</code></td>"
+                "</tr>"
+            )
+        rich_html = (
+            f"<h1>{_html.escape(title, quote=False)}</h1>"
+            "<p><b>Repo Cockpit / Hermes VPS</b> — rapport opérationnel natif Telegram.</p>"
+            "<table bordered striped>"
+            "<tr><th>Check</th><th>Résultat</th></tr>"
+            + "".join(rich_rows)
+            + "</table>"
+            "<ul>"
+            "<li><input type=\"checkbox\" checked> Menu Telegram conservé</li>"
+            "<li><input type=\"checkbox\" checked> Raccourci cockpit via <code>/repo</code></li>"
+            "<li><input type=\"checkbox\" checked> Rich formatting actif si ce message affiche un tableau</li>"
+            "</ul>"
+            "<details><summary>À retenir</summary>"
+            "<p>Si le rendu riche échoue côté Telegram, le bot retombe automatiquement sur un message HTML classique.</p>"
+            "</details>"
+            "<footer>Raccourci cockpit : /repo</footer>"
+        )
+        if self._bot and hasattr(self._bot, "do_api_request"):
+            try:
+                rich_payload = {
+                    "chat_id": int(getattr(msg, "chat_id")),
+                    "rich_message": {"html": rich_html},
+                }
+                message_id = getattr(msg, "message_id", None)
+                if message_id is not None:
+                    rich_payload["reply_parameters"] = {"message_id": message_id}
+                rich_result = await self._bot.do_api_request("sendRichMessage", api_kwargs=rich_payload)
+                try:
+                    result_payload = rich_result.get("result") if isinstance(rich_result, dict) else None
+                    message_id = None
+                    if isinstance(result_payload, dict):
+                        message_id = result_payload.get("message_id")
+                    elif isinstance(rich_result, dict):
+                        message_id = rich_result.get("message_id")
+                    else:
+                        message_id = getattr(rich_result, "message_id", None)
+                    if message_id is not None:
+                        sent_obj = type("_Sent", (), {})()
+                        sent_obj.chat_id = getattr(msg, "chat_id", None)
+                        sent_obj.message_id = message_id
+                        sent_obj.chat = getattr(msg, "chat", None)
+                        await self._log_cockpit_message(msg, direction="outgoing", role="status", sent=sent_obj)
+                except Exception:
+                    pass
+                return
+            except Exception as exc:
+                if self._is_rich_fallback_error(exc):
+                    logger.debug("[%s] /serveurstatut rich render rejected: %s", self.name, exc)
+                else:
+                    logger.warning("[%s] /serveurstatut rich render failed; falling back to HTML: %s", self.name, exc)
+
+        try:
+            sent = await msg.reply_text(
+                "\n".join(html_lines),
+                parse_mode=ParseMode.HTML,
+                **self._link_preview_kwargs(),
+            )
+            await self._log_cockpit_message(msg, direction="outgoing", role="status", sent=sent)
+        except Exception as exc:
+            if self._is_bad_request_error(exc):
+                sent = await msg.reply_text("\n".join(plain_lines), **self._link_preview_kwargs())
+                await self._log_cockpit_message(msg, direction="outgoing", role="status", sent=sent)
+            else:
+                raise
+
+
+    async def _send_repo_cockpit_shortcut(self, msg: Message) -> None:
+        """Send the Repo Cockpit WebApp shortcut without replacing Telegram's command menu."""
+        cockpit_url = self._repo_cockpit_url("/")
+        button_kwargs = (
+            {"web_app": WebAppInfo(url=cockpit_url)}
+            if WebAppInfo is not None
+            else {"url": cockpit_url}
+        )
+        keyboard = InlineKeyboardMarkup([[
+            InlineKeyboardButton("🌐 Ouvrir Repo Cockpit", **button_kwargs)
+        ]])
+        html_text = (
+            "<b>🌐 Repo Cockpit</b>\n\n"
+            "Choisis un repo, puis le cockpit revient automatiquement dans ce chat."
+        )
+        plain_text = (
+            "🌐 Repo Cockpit\n\n"
+            "Choisis un repo, puis le cockpit revient automatiquement dans ce chat."
+        )
+        try:
+            await msg.reply_text(
+                html_text,
+                parse_mode=ParseMode.HTML,
+                reply_markup=keyboard,
+                **self._link_preview_kwargs(),
+            )
+        except Exception as exc:
+            if self._is_bad_request_error(exc):
+                await msg.reply_text(
+                    plain_text,
+                    reply_markup=keyboard,
+                    **self._link_preview_kwargs(),
+                )
+            else:
+                raise
+
+    async def _send_richdemo(self, msg: Message, template: str = "daily_digest") -> None:
+        """Send a Repo Cockpit Telegram Rich Message template demo."""
+        allowed = {
+            "repo_status", "pr_review", "ci_failure", "daily_digest",
+            "agent_progress", "handoff_before_cutoff", "media_report",
+        }
+        if template not in allowed:
+            template = "daily_digest"
+        try:
+            import urllib.request as _urlrequest
+            with _urlrequest.urlopen(
+                f"http://127.0.0.1:8765/api/rich/preview/{template}", timeout=10
+            ) as resp:
+                payload = json.loads(resp.read().decode("utf-8"))
+            rich_html = payload.get("html") or "<h1>Rich demo indisponible</h1>"
+        except Exception as exc:
+            await msg.reply_text(
+                f"❌ Rich demo indisponible: {exc}",
+                **self._link_preview_kwargs(),
+            )
+            return
+
+        if self._bot and hasattr(self._bot, "do_api_request"):
+            try:
+                api_payload = {
+                    "chat_id": int(getattr(msg, "chat_id")),
+                    "rich_message": {"html": rich_html},
+                }
+                message_id = getattr(msg, "message_id", None)
+                if message_id is not None:
+                    api_payload["reply_parameters"] = {"message_id": message_id}
+                await self._bot.do_api_request("sendRichMessage", api_kwargs=api_payload)
+                return
+            except Exception as exc:
+                if not self._is_rich_fallback_error(exc):
+                    logger.warning("[%s] /richdemo rich send failed; falling back: %s", self.name, exc)
+        await msg.reply_text(
+            "⚠️ Rich Message non disponible en fallback. Ouvre /serveurstatut ou consulte le backend /api/rich/preview/" + template,
+            **self._link_preview_kwargs(),
+        )
+
 
     async def _handle_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle incoming command messages."""
@@ -5927,6 +9188,91 @@ class TelegramAdapter(BasePlatformAdapter):
         if not self._should_process_message(msg, is_command=True):
             return
         await self._ensure_forum_commands(msg)
+
+        text = msg.text or ""
+        command_token = text.strip().split(maxsplit=1)[0].split("@", 1)[0].lower()
+        command_args = text.split(maxsplit=1)[1] if len(text.split(maxsplit=1)) > 1 else ""
+        await self._log_cockpit_message(msg, direction="incoming", role="command_echo", command=command_token)
+        if command_token in {"/new", "/newchat"}:
+            await self._send_new_command(msg, command_args)
+            return
+        if command_token in {"/libre", "/reset-libre", "/chatlibre"}:
+            await self._send_libre_command(msg, command_args)
+            return
+        if command_token == "/dev":
+            await self._send_dev_command(msg, command_args)
+            return
+        if command_token in {"/chat", "/current"}:
+            await self._send_chat_status_command(msg)
+            return
+        if command_token in {"/conv", "/convs", "/conversations"}:
+            await self._send_conversations_command(msg, command_args)
+            return
+        if command_token in {"/renamechat", "/renommerchat", "/threadname"}:
+            await self._send_rename_thread_command(msg, command_args)
+            return
+        if command_token in {"/archive", "/archivechat"}:
+            await self._send_thread_action_command(msg, "archive")
+            return
+        if command_token in {"/delete", "/deletechat"}:
+            await self._send_thread_action_command(msg, "delete")
+            return
+        if command_token == "/repo":
+            await self._send_repo_cockpit_shortcut(msg)
+            return
+        if command_token == "/serveurstatut":
+            await self._send_vps_command(msg)
+            return
+        if command_token in {"/vps", "/vpsstatus", "/serverstatus"}:
+            await self._send_vps_command(msg)
+            return
+        if command_token == "/watch":
+            await self._send_watch_command(msg, command_args)
+            return
+        if command_token == "/jobs":
+            await self._send_jobs_command(msg, command_args)
+            return
+        if command_token in {"/updatecheck", "/update-check"}:
+            await self._send_updatecheck_command(msg, command_args)
+            return
+        if command_token == "/tasks":
+            await self._send_tasks_command(msg, command_args)
+            return
+        if command_token in {"/prs", "/pulls", "/pr"}:
+            await self._send_pending_prs_command(msg, command_args)
+            return
+        if command_token in {"/audit", "/auditer"}:
+            await self._send_audit_command(msg, command_args)
+            return
+        if command_token == "/task":
+            await self._send_task_command(msg, command_args)
+            return
+        if command_token == "/status":
+            await self._send_status_command(msg, command_args)
+            return
+        if command_token == "/runs":
+            await self._send_runs_command(msg, command_args)
+            return
+        if command_token == "/approve":
+            await self._send_approve_command(msg, command_args)
+            return
+        if command_token == "/worker":
+            await self._send_worker_command(msg, command_args)
+            return
+        if command_token == "/quota":
+            await self._send_quota_command(msg)
+            return
+        if command_token == "/logs":
+            await self._send_logs_command(msg, command_args)
+            return
+        if command_token in {"/clear", "/clean", "/cleanchat"}:
+            await self._send_clean_command(msg, command_args)
+            return
+        if command_token == "/richdemo":
+            parts = (msg.text or "").strip().split(maxsplit=1)
+            template = parts[1].strip().split()[0] if len(parts) > 1 and parts[1].strip() else "daily_digest"
+            await self._send_richdemo(msg, template)
+            return
 
         event = self._build_message_event(msg, MessageType.COMMAND, update_id=update.update_id)
         event.text = self._clean_bot_trigger_text(event.text)
@@ -6064,6 +9410,11 @@ class TelegramAdapter(BasePlatformAdapter):
                 "[Telegram] Flushing text batch %s (%d chars)",
                 key, len(event.text or ""),
             )
+            original_msg = getattr(event, "_telegram_message", None)
+            if original_msg is not None and await self._maybe_handle_libre_text(original_msg, event.text or ""):
+                return
+            if original_msg is not None and await self._maybe_handle_pilot_intake_text(original_msg, event.text or ""):
+                return
             await self.handle_message(event)
         finally:
             if self._pending_text_batch_tasks.get(key) is current_task:
@@ -6139,11 +9490,11 @@ class TelegramAdapter(BasePlatformAdapter):
         msg_type = self._media_message_type(msg)
 
         event = self._build_message_event(msg, msg_type, update_id=update.update_id)
-        
+
         # Add caption as text
         if msg.caption:
             event.text = self._clean_bot_trigger_text(msg.caption)
-        
+
         # Handle stickers: describe via vision tool with caching
         if msg.sticker:
             await self._handle_sticker(msg, event)
@@ -6598,7 +9949,7 @@ class TelegramAdapter(BasePlatformAdapter):
         """
         chat = message.chat
         user = message.from_user
-        
+
         # Determine chat type.  Normalize through ``str`` so tests/mocks and
         # python-telegram-bot enum values both work (``ChatType.CHANNEL`` is
         # string-like, but mocks often provide plain strings).
@@ -6685,7 +10036,7 @@ class TelegramAdapter(BasePlatformAdapter):
             chat_topic=chat_topic,
             message_id=str(message.message_id),
         )
-        
+
         # Extract reply context if this message is a reply.
         # Prefer Telegram's native partial quote (message.quote, TextQuote)
         # so a user replying to a single selected substring of a prior
