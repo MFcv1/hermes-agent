@@ -416,3 +416,15 @@ python -m py_compile gateway/libre_orchestrator.py gateway/platforms/telegram.py
 - Rapport : `docs/project/PHASE1_FORMATTING_EXTRACTION_REPORT.md`.
 - Pas de sync/restart VPS effectué pour cette extraction partielle.
 - Prochaine extraction recommandée : `gateway/repo_cockpit_client.py`, avec tests de caractérisation avant déplacement.
+
+## Mise à jour 2026-07-06 — Autonomie V2 Phase 1 extraction client Repo Cockpit
+
+- Commit formatting Telegram poussé sur `origin/codex/ops-update-readiness`.
+- Deuxième extraction Phase 1 effectuée : logique HTTP Repo Cockpit sortie de `gateway/platforms/telegram.py` vers `gateway/repo_cockpit_client.py`.
+- `TelegramAdapter` garde les shims `_cockpit_api_sync()` et `_repo_cockpit_url()` pour limiter le diff ; ils délèguent au nouveau module.
+- Tests ajoutés : `tests/gateway/test_repo_cockpit_client.py`.
+- Validation : `224 passed in 3.54s` sur client, formatting, rich, Pilote, Libre, model picker, conv UX ; `py_compile` OK.
+- Impact inventaire : `gateway/platforms/telegram.py` = 9744 lignes / 258 symboles ; nouveau client = 75 lignes / 2 symboles.
+- Rapport : `docs/project/PHASE1_REPO_COCKPIT_CLIENT_REPORT.md`.
+- Pas de sync/restart VPS effectué pour cette extraction partielle.
+- Prochaine extraction recommandée : formatters de panels/status/PR summaries avant flows callbacks.

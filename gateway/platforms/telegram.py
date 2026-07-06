@@ -19,8 +19,7 @@ import re
 import shlex
 import subprocess
 import time
-import urllib.parse
-from urllib import request as _urlrequest, error as _urlerror
+from urllib import request as _urlrequest
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Set, Any
 
@@ -107,6 +106,7 @@ from gateway.platforms.telegram_network import (
     parse_fallback_ip_env,
 )
 from gateway.human_heartbeat import progress_from_autonomy, render_progress_view
+from gateway.repo_cockpit_client import RepoCockpitClient, cockpit_webapp_url
 from utils import atomic_replace
 
 _TELEGRAM_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
@@ -282,6 +282,7 @@ class TelegramAdapter(TelegramModelsConfigMixin, BasePlatformAdapter):
         super().__init__(config, Platform.TELEGRAM)
         self._app: Optional[Application] = None
         self._bot: Optional[Bot] = None
+        self._repo_cockpit_client = RepoCockpitClient()
         self._webhook_mode: bool = False
         self._mention_patterns = self._compile_mention_patterns()
         self._reply_to_mode: str = getattr(config, 'reply_to_mode', 'first') or 'first'
@@ -6007,16 +6008,7 @@ class TelegramAdapter(TelegramModelsConfigMixin, BasePlatformAdapter):
 
     def _cockpit_api_sync(self, method: str, path: str, payload: dict | None = None, timeout: int = 20) -> dict:
         """Call local Repo Cockpit backend without consuming LLM quota."""
-        url = "http://127.0.0.1:8765" + path
-        data = None if payload is None else json.dumps(payload, ensure_ascii=False).encode("utf-8")
-        req = _urlrequest.Request(url, data=data, headers={"Content-Type": "application/json"}, method=method)
-        try:
-            with _urlrequest.urlopen(req, timeout=timeout) as r:
-                return json.loads(r.read().decode("utf-8"))
-        except _urlerror.HTTPError as exc:
-            return {"ok": False, "error_code": exc.code, "description": exc.read().decode("utf-8", "replace")[:1200]}
-        except Exception as exc:
-            return {"ok": False, "description": str(exc)}
+        return self._repo_cockpit_client.api_sync(method, path, payload, timeout)
 
     async def _log_cockpit_message(self, msg: Message | None, *, direction: str, role: str, command: str | None = None, sent: Message | None = None) -> None:
         """Persist Telegram message ids in Repo Cockpit so /clean can delete known recent noise."""
@@ -6119,22 +6111,7 @@ class TelegramAdapter(TelegramModelsConfigMixin, BasePlatformAdapter):
         )
 
     def _repo_cockpit_url(self, path: str = "/", **params: str) -> str:
-        base = os.getenv(
-            "REPO_COCKPIT_URL",
-            "https://cockpit.134.122.73.242.sslip.io/?v=20260620-immediate-close",
-        )
-        parsed = urllib.parse.urlsplit(base)
-        clean_path = "/" + path.lstrip("/")
-        existing = dict(urllib.parse.parse_qsl(parsed.query, keep_blank_values=True))
-        existing.update({k: v for k, v in params.items() if v is not None})
-        existing["v"] = str(int(time.time()))
-        return urllib.parse.urlunsplit((
-            parsed.scheme,
-            parsed.netloc,
-            clean_path,
-            urllib.parse.urlencode(existing),
-            parsed.fragment,
-        ))
+        return cockpit_webapp_url(path, **params)
 
     def _new_chat_keyboard(self, mode: str) -> InlineKeyboardMarkup:
         mode = normalize_cockpit_mode(mode)
