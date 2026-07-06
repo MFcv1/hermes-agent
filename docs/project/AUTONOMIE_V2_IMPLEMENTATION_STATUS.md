@@ -17,8 +17,8 @@ Ces documents sont la source à suivre pour les prochaines sessions. En cas de c
 | Phase | Statut | Preuves |
 |---|---|---|
 | Phase 0 — stabilisation/inventaire | Terminé côté code local + déploiement VPS documenté | `PHASE0_COMPLETION_REPORT.md`, `gateway/deployment_info.py`, `scripts/inventory_symbols.py`, `docs/project/autonomie-v2-symbol-inventory.json` |
-| Phase 1 — extraction modules gateway | En cours | `PHASE1_FORMATTING_EXTRACTION_REPORT.md`, `PHASE1_REPO_COCKPIT_CLIENT_REPORT.md`, `PHASE1_REPO_COCKPIT_FORMATTERS_REPORT.md`, `PHASE1_REPO_COCKPIT_KEYBOARDS_REPORT.md` |
-| Phase 2 — observation bus + contrats | Pas commencé | Lire `docs/brain/03-implementation-contracts.md` avant d'écrire le contrat v2 |
+| Phase 1 — extraction modules gateway | Terminé côté code local, sync VPS non fait | `PHASE1_COMPLETION_REPORT.md` |
+| Phase 2 — observation bus + contrats | Prochaine phase | Lire `docs/brain/03-implementation-contracts.md` avant d'écrire le contrat v2 |
 | Phase 3 — worker runtime engine | Pas commencé | Aucun `CommandSpan`/state machine v2 extrait côté Cockpit dans ce repo |
 | Phase 4 — self-repair v2 | Pas commencé | Ne pas démarrer sans `policy_engine` + snapshot/rollback testés |
 | Phase 5 — memory/handoff unifié | Pas commencé | `ActiveWorkStore` JSON existe encore |
@@ -32,6 +32,8 @@ Ces documents sont la source à suivre pour les prochaines sessions. En cas de c
 - Formatters de panels/status/PR Repo Cockpit extraits dans `gateway/repo_cockpit_formatting.py`.
 - Builders de keyboards Repo Cockpit extraits dans `gateway/repo_cockpit_keyboards.py`.
 - Textes purs `/new` / Pilote / sélection repo / `/tasks` / audit dry-run extraits dans `gateway/repo_cockpit_text.py`.
+- Mixins extraits : `gateway/telegram_transport_mixin.py`, `gateway/telegram_inbound_filter_mixin.py`, `gateway/telegram_model_picker_mixin.py`, `gateway/telegram_conversations_mixin.py`, `gateway/repo_cockpit_telegram_mixin.py`.
+- `gateway/platforms/telegram.py` fait maintenant 1745 lignes.
 
 Le pattern actuel est volontairement conservateur :
 
@@ -42,27 +44,26 @@ Le pattern actuel est volontairement conservateur :
 
 ## Point de reprise recommandé
 
-Continuer Phase 1 avec une extraction mécanique, une seule responsabilité à la fois.
+Passer à la Phase 2 seulement après validation humaine du résultat local Phase 1.
 
-Prochaine cible proposée après l'extraction des textes :
+Prochaine cible :
 
 ```text
-helpers purs restants autour de Repo Cockpit, avant tout déplacement de callbacks
+Observation bus + contrats v2
 ```
 
 Ordre conseillé :
 
-1. Inventorier les fonctions restantes entre `_send_new_command()` et `/status` pour isoler les prochains candidats purs.
-2. Préférer les textes d'erreur/confirmation ou petits helpers de payload avant les handlers async.
-3. Garder les méthodes privées historiques comme shims.
-4. Ne pas déplacer `_handle_callback_query()` ni les flows async tant que les helpers purs ne sont pas sortis.
+1. Relire `docs/brain/03-implementation-contracts.md`.
+2. Formaliser le payload observation v2 et la compat v1.
+3. Implémenter fingerprint/dédup côté Repo Cockpit, pas dans Telegram.
+4. Ajouter `gateway/observation_reporter.py` seulement après le contrat serveur.
 
 ## À ne pas faire maintenant
 
-- Ne pas démarrer Phase 2 tant que Phase 1 n'a pas réduit davantage `gateway/platforms/telegram.py`.
-- Ne pas transformer `gateway/platforms/telegram.py` en package en une seule passe.
-- Ne pas ajouter de watcher global : toute observation doit rester attachée à un `task_id`.
 - Ne pas synchroniser/restart VPS sans validation humaine explicite.
+- Ne pas ajouter de watcher global : toute observation doit rester attachée à un `task_id`.
+- Ne pas démarrer le self-repair v2 avant PolicyEngine + snapshots + rollback testés.
 
 ## Commandes de vérification Phase 1
 
@@ -84,6 +85,11 @@ venv/bin/python -m pytest \
 
 venv/bin/python -m py_compile \
   gateway/platforms/telegram.py \
+  gateway/telegram_transport_mixin.py \
+  gateway/telegram_inbound_filter_mixin.py \
+  gateway/telegram_model_picker_mixin.py \
+  gateway/telegram_conversations_mixin.py \
+  gateway/repo_cockpit_telegram_mixin.py \
   gateway/platforms/telegram_formatting.py \
   gateway/repo_cockpit_client.py \
   gateway/repo_cockpit_formatting.py \
