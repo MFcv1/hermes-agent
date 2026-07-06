@@ -127,6 +127,20 @@ from gateway.repo_cockpit_keyboards import (
     repo_new_chat_keyboard,
     repo_selected_keyboard,
 )
+from gateway.repo_cockpit_text import (
+    audit_task_text,
+    format_audit_blocked,
+    format_audit_completed,
+    format_audit_started,
+    mode_note,
+    mode_title,
+    new_chat_text,
+    pilot_intent_title,
+    pilot_waiting_prompt_text,
+    project_created_text,
+    repo_selected_text,
+    tasks_list_text,
+)
 from utils import atomic_replace
 
 _TELEGRAM_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
@@ -6102,20 +6116,10 @@ class TelegramAdapter(TelegramModelsConfigMixin, BasePlatformAdapter):
                 return False
 
     def _mode_title(self, mode: str) -> str:
-        mode = normalize_cockpit_mode(mode)
-        if mode == "autopilot":
-            return "Autopilot"
-        if mode == "pilote":
-            return "Pilote"
-        return "Ask review"
+        return mode_title(mode)
 
     def _mode_note(self, mode: str) -> str:
-        mode = normalize_cockpit_mode(mode)
-        if mode == "autopilot":
-            return "peut merger automatiquement seulement après PR, gates, secret scan et review indépendante high"
-        if mode == "pilote":
-            return "cadre d'abord Architect/Deploy, pose les questions critiques, puis avance en autonomie avec PR et gates"
-        return "prépare, teste et ouvre une PR, puis attend ta validation avant merge"
+        return mode_note(mode)
 
     async def _get_cockpit_state(self, telegram_user_id: str) -> dict:
         return await asyncio.to_thread(self._cockpit_api_sync, "GET", f"/api/internal/state/{telegram_user_id}", None, 10)
@@ -6147,38 +6151,14 @@ class TelegramAdapter(TelegramModelsConfigMixin, BasePlatformAdapter):
         return selected if selected in {"low", "medium"} else "medium"
 
     def _pilot_intent_title(self, intent: str | None) -> str:
-        titles = {
-            "architect": "Architect / cadrage",
-            "deploy": "Déployer / vérifier prod",
-            "audit_repo": "Comprendre / auditer le repo",
-            "feature_work": "Modifier / ajouter une feature",
-            "debug_fix": "Corriger un bug",
-            "review_harden": "Refactor / sécuriser",
-            "pilot_discovery": "Je ne sais pas",
-        }
-        return titles.get(str(intent or ""), "Architect / cadrage")
+        return pilot_intent_title(intent)
 
     def _pilot_existing_intent_keyboard(self, mode: str = "pilote") -> InlineKeyboardMarkup:
         return pilot_existing_intent_keyboard(mode, button=InlineKeyboardButton, markup=InlineKeyboardMarkup)
 
     def _pilot_waiting_prompt_text(self, *, origin: str, intent: str, repo: str | None = None, user_id: str = "") -> str:
         reasoning = self._pilot_default_reasoning(user_id, origin, intent) if user_id else "high"
-        lines = [
-            "<b>🧭 Pilote prêt</b>",
-            "",
-            f"Source : <b>{'Start from scratch' if origin == 'from_scratch' else 'Projet GitHub existant'}</b>",
-            f"Route : <b>{_html.escape(self._pilot_intent_title(intent))}</b>",
-            f"Plan : <b>{_html.escape(reasoning)}</b>",
-        ]
-        if repo:
-            lines.append(f"Repo : <code>{_html.escape(repo)}</code>")
-        lines.extend([
-            "",
-            "Écris maintenant ce que tu veux que je fasse.",
-            "",
-            "Pas besoin de <code>/task</code> : ton prochain message devient la tâche Pilote.",
-        ])
-        return "\n".join(lines)
+        return pilot_waiting_prompt_text(origin=origin, intent=intent, reasoning=reasoning, repo=repo)
 
     def _pilot_slug_from_text(self, text: str) -> str:
         raw = re.sub(r"[^a-zA-Z0-9]+", "-", (text or "").lower()).strip("-")
@@ -6285,34 +6265,13 @@ class TelegramAdapter(TelegramModelsConfigMixin, BasePlatformAdapter):
         )
 
     def _repo_selected_text(self, repo: str, mode: str, thread_id: str | None = None) -> str:
-        mode = normalize_cockpit_mode(mode)
-        lines = [
-            "<b>✅ Repo sélectionné</b>",
-            "",
-            f"Repo : <code>{_html.escape(repo)}</code>",
-            f"Mode : <b>{_html.escape(self._mode_title(mode))}</b>",
-        ]
-        if thread_id:
-            lines.append(f"Conversation : <code>{_html.escape(str(thread_id))}</code>")
-        lines.extend([
-            "",
-            "Prochaine étape : envoie ta tâche directement dans ce chat.",
-        ])
-        return "\n".join(lines)
+        return repo_selected_text(repo, mode, thread_id)
 
     def _repo_selected_keyboard(self, mode: str) -> InlineKeyboardMarkup:
         return repo_selected_keyboard(mode, button=InlineKeyboardButton, markup=InlineKeyboardMarkup)
 
     def _new_chat_text(self, mode: str, selected_repo: str | None = None) -> str:
-        mode = normalize_cockpit_mode(mode)
-        repo_line = f"Repo actuel : <code>{_html.escape(selected_repo)}</code>" if selected_repo else "Repo actuel : <i>aucun repo sélectionné</i>"
-        return (
-            "<b>🧭 Nouveau chat Hermes</b>\n\n"
-            f"Mode : <b>{_html.escape(self._mode_title(mode))}</b>\n"
-            f"Effet : {_html.escape(self._mode_note(mode))}.\n"
-            f"{repo_line}\n\n"
-            "Choisis si ce clavardage part d'un repo GitHub existant ou d'un nouveau projet."
-        )
+        return new_chat_text(mode, selected_repo)
 
     async def _send_new_command(self, msg: Message, args: str = "") -> None:
         args = (args or "").strip()
@@ -6376,15 +6335,7 @@ class TelegramAdapter(TelegramModelsConfigMixin, BasePlatformAdapter):
                 "<b>❌ Création projet impossible</b>\n\n<code>" + _html.escape(str(data.get("description") or data))[:1200] + "</code>",
                 role="preview",
             )
-        text = (
-            "<b>✅ Nouveau projet créé</b>\n\n"
-            f"Projet : <code>{_html.escape(data.get('title',''))}</code>\n"
-            f"Repo : <code>{_html.escape(data.get('repo') or '')}</code>\n"
-            f"Mode : <b>{_html.escape(self._mode_title(data.get('mode','ask_review')))}</b>\n"
-            f"Thread : <code>{_html.escape(data.get('thread_id',''))}</code>\n\n"
-            "Tu peux maintenant écrire la tâche à réaliser dans ce chat."
-        )
-        await self._send_cockpit_text(msg, text, role="sticky")
+        await self._send_cockpit_text(msg, project_created_text(data), role="sticky")
         thread_id = str(data.get("thread_id") or "")
         if thread_id:
             self._cockpit_register_thread_llm_prefs(
@@ -6396,13 +6347,7 @@ class TelegramAdapter(TelegramModelsConfigMixin, BasePlatformAdapter):
     async def _send_tasks_command(self, msg: Message, args: str = "") -> None:
         data = await asyncio.to_thread(self._cockpit_api_sync, "GET", "/api/tasks?limit=12", None, 20)
         tasks = data.get("tasks") or []
-        if not tasks:
-            return await self._send_cockpit_text(msg, "<b>📋 Tâches</b>\n\nAucune tâche.")
-        lines = ["<b>📋 Tâches Repo Cockpit</b>", ""]
-        for t in tasks:
-            lines.append(f"<code>{_html.escape(t.get('id',''))}</code> · <b>{_html.escape(t.get('status',''))}</b> · {_html.escape(t.get('repo',''))}")
-        lines.append("\nDétail : <code>/task ID</code>")
-        await self._send_cockpit_text(msg, "\n".join(lines))
+        await self._send_cockpit_text(msg, tasks_list_text(tasks))
 
     def _pending_pr_label(self, item: dict) -> str:
         return pending_pr_label(item)
@@ -6436,40 +6381,10 @@ class TelegramAdapter(TelegramModelsConfigMixin, BasePlatformAdapter):
         return format_pr_summary(data)
 
     def _audit_task_text(self, active: dict, args: str = "") -> str:
-        repo = str(active.get("repo") or "repo actif").strip() or "repo actif"
-        thread_id = str(active.get("thread_id") or "").strip()
-        user_focus = (args or "").strip()
-        focus_line = f"\nFocus utilisateur : {user_focus}" if user_focus else ""
-        return (
-            f"Audit borné Repo Cockpit pour {repo}.\n"
-            "Objectif : inspecter l'état courant sans modifier le repo, identifier "
-            "les risques principaux, les tests/smokes utiles, et la prochaine "
-            "action sûre.\n"
-            f"Thread actif : {thread_id or 'inconnu'}."
-            f"{focus_line}\n"
-            "Contraintes : pas de déploiement, pas de restart service, pas de "
-            "mutation destructive. Produire un résumé court avec statut, phase, "
-            "preuves consultées et suite recommandée."
-        )
+        return audit_task_text(active, args)
 
     def _format_audit_started(self, *, job_id: str, task: dict, active: dict) -> str:
-        task_id = str(task.get("id") or "")
-        repo = str(task.get("repo") or active.get("repo") or "")
-        phase = str(task.get("current_phase") or task.get("status") or "queued_plan")
-        mode = str(task.get("mode") or active.get("thread_mode") or active.get("project_mode") or "ask_review")
-        lines = [
-            "<b>🔎 Audit Repo Cockpit lancé</b>",
-            "",
-            f"Job : <code>{_html.escape(job_id)}</code>",
-            f"Tâche : <code>{_html.escape(task_id)}</code>",
-            f"Repo : <code>{_html.escape(repo)}</code>",
-            f"Mode : <b>{_html.escape(self._mode_title(mode))}</b>",
-            f"Phase : <code>{_html.escape(phase)}</code>",
-            "",
-            "Je lance le worker en arrière-plan en dry-run. Le chat reste disponible.",
-            f"Suivi : <code>/status {_html.escape(task_id)}</code> · <code>/runs {_html.escape(task_id)}</code>",
-        ]
-        return "\n".join(lines)
+        return format_audit_started(job_id=job_id, task=task, active=active)
 
     async def _send_audit_command(self, msg: Message, args: str = "") -> None:
         user_id, data, active = await self._get_active_cockpit_thread(msg)
@@ -6528,23 +6443,15 @@ class TelegramAdapter(TelegramModelsConfigMixin, BasePlatformAdapter):
             worker = worker or {}
             worker_result = worker.get("result") if isinstance(worker.get("result"), dict) else {}
             status = str(worker.get("status") or worker_result.get("status") or "done")
-            lines = [
-                "<b>🔎 Audit Repo Cockpit terminé</b>",
-                "",
-                f"Job : <code>{_html.escape(job_id)}</code>",
-                f"Tâche : <code>{_html.escape(task_id)}</code>",
-                f"Worker : <code>{_html.escape(status)}</code>",
-                "",
-                f"Suivi : <code>/status {_html.escape(task_id)}</code> · <code>/runs {_html.escape(task_id)}</code>",
-            ]
-            await self._send_cockpit_text(msg, "\n".join(lines), role="progress")
+            await self._send_cockpit_text(
+                msg,
+                format_audit_completed(job_id=job_id, task_id=task_id, status=status),
+                role="progress",
+            )
         except Exception as exc:
             await self._send_cockpit_text(
                 msg,
-                "<b>🔎 Audit Repo Cockpit bloqué</b>\n\n"
-                f"Job : <code>{_html.escape(job_id)}</code>\n"
-                f"Tâche : <code>{_html.escape(task_id)}</code>\n\n"
-                "<code>" + _html.escape(str(exc))[:1000] + "</code>",
+                format_audit_blocked(job_id=job_id, task_id=task_id, error=str(exc)),
                 role="progress",
             )
 

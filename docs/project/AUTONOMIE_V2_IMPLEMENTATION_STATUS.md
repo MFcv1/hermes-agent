@@ -10,6 +10,8 @@ Branche : `codex/ops-update-readiness`
 3. `docs/brain/03-implementation-contracts.md` — contrats normatifs avant tout nouveau composant.
 4. Ce fichier — état réel déjà implémenté et prochain point de reprise.
 
+Ces documents sont la source à suivre pour les prochaines sessions. En cas de conflit entre un rapport de phase ancien et `AUDIT-AUTONOMIE-V2.md`/`docs/brain/03-implementation-contracts.md`, les contrats normatifs gagnent.
+
 ## État par phase
 
 | Phase | Statut | Preuves |
@@ -29,6 +31,7 @@ Branche : `codex/ops-update-readiness`
 - Client HTTP Repo Cockpit extrait dans `gateway/repo_cockpit_client.py`.
 - Formatters de panels/status/PR Repo Cockpit extraits dans `gateway/repo_cockpit_formatting.py`.
 - Builders de keyboards Repo Cockpit extraits dans `gateway/repo_cockpit_keyboards.py`.
+- Textes purs `/new` / Pilote / sélection repo / `/tasks` / audit dry-run extraits dans `gateway/repo_cockpit_text.py`.
 
 Le pattern actuel est volontairement conservateur :
 
@@ -41,17 +44,17 @@ Le pattern actuel est volontairement conservateur :
 
 Continuer Phase 1 avec une extraction mécanique, une seule responsabilité à la fois.
 
-Prochaine cible proposée :
+Prochaine cible proposée après l'extraction des textes :
 
 ```text
-textes Repo Cockpit / Pilot intake encore mêlés à TelegramAdapter
+helpers purs restants autour de Repo Cockpit, avant tout déplacement de callbacks
 ```
 
 Ordre conseillé :
 
-1. Extraire les textes purs liés à `/new` / Pilote dans un module dédié (`gateway/repo_cockpit_text.py` ou package équivalent).
-2. Garder les méthodes `_new_chat_text()`, `_repo_selected_text()`, `_pilot_waiting_prompt_text()` comme shims.
-3. Ajouter les tests de caractérisation avant de déplacer le code.
+1. Inventorier les fonctions restantes entre `_send_new_command()` et `/status` pour isoler les prochains candidats purs.
+2. Préférer les textes d'erreur/confirmation ou petits helpers de payload avant les handlers async.
+3. Garder les méthodes privées historiques comme shims.
 4. Ne pas déplacer `_handle_callback_query()` ni les flows async tant que les helpers purs ne sont pas sortis.
 
 ## À ne pas faire maintenant
@@ -66,6 +69,7 @@ Ordre conseillé :
 ```bash
 venv/bin/python -m pytest \
   tests/gateway/test_repo_cockpit_keyboards.py \
+  tests/gateway/test_repo_cockpit_text.py \
   tests/gateway/test_repo_cockpit_formatting.py \
   tests/gateway/test_repo_cockpit_client.py \
   tests/gateway/test_telegram_formatting_module.py \
@@ -83,5 +87,6 @@ venv/bin/python -m py_compile \
   gateway/platforms/telegram_formatting.py \
   gateway/repo_cockpit_client.py \
   gateway/repo_cockpit_formatting.py \
-  gateway/repo_cockpit_keyboards.py
+  gateway/repo_cockpit_keyboards.py \
+  gateway/repo_cockpit_text.py
 ```
