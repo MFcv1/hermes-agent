@@ -13,6 +13,8 @@ directement dans `docs/`).
 | `prompts/` | Prompts de cadrage envoyés aux agents (Claude Fable, Pilot Mode...) |
 | `handoffs/` | Handoffs inter-agents (Codex, Repo Cockpit STATE...) |
 | `notes/` | Notes de travail diverses |
+| `PHASE0_RESTART_PROCEDURE.md` | Procédure préparée pour restart VPS Phase 0 (validation humaine requise). |
+| `autonomie-v2-symbol-inventory.json` | Inventaire statique des symboles `gateway/run.py` et `gateway/platforms/telegram.py`. |
 
 ## Documents de référence (ailleurs)
 
