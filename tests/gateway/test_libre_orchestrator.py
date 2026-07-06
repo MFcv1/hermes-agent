@@ -41,7 +41,7 @@ def test_classify_libre_message_routes_confident_autopilot_request():
 def test_classify_libre_message_detects_repo_switch_request():
     decision = classify_libre_message("passe sur le repo Starter Pack Studio")
 
-    assert decision.action == "switch_repo"
+    assert decision.action == "repo_task"
     assert decision.mode == "pilote"
     assert decision.intent == "switch_repo"
 
@@ -60,6 +60,19 @@ def test_extract_learning_policy_detects_plan_model_reasoning():
     assert policy["scope"] == "planning"
     assert policy["model"] == "gpt-5.5"
     assert policy["reasoning_effort"] == "xhigh"
+
+
+def test_classify_libre_message_detects_policy_action():
+    decision = classify_libre_message("Pour les plans mets toi toujours en opus xhigh")
+
+    assert decision.action == "policy"
+    assert decision.intent == "learning_policy"
+
+
+def test_classify_libre_message_keeps_explanatory_deploy_as_chat():
+    decision = classify_libre_message("explique-moi comment fonctionne le deploy de mon app")
+
+    assert decision.action == "chat"
 
 
 def test_active_work_store_soft_close_keeps_handoff_note(tmp_path: Path):

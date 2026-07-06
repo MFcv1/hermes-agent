@@ -1260,6 +1260,7 @@ sous `docs/project/` et servent de source de reprise pour les agents :
 - `docs/project/PHASE3_WORKER_RUNTIME_ENGINE_REPORT.md` — Phase 3.
 - `docs/project/PHASE4_SELF_REPAIR_V2_REPORT.md` — Phase 4.
 - `docs/project/PHASE5_MEMORY_HANDOFF_STORE_REPORT.md` — Phase 5.
+- `docs/project/PHASE6_EVAL_HARNESS_REPORT.md` — Phase 6.
 
 Avant de poursuivre une phase, relire le rapport dédié et les contrats
 normatifs dans `docs/brain/03-implementation-contracts.md`.

@@ -21,7 +21,7 @@ from gateway.memory.handoff_store import HandoffStore
 class LibreDecision:
     """Routing decision for a natural Libre-mode message."""
 
-    action: str = "chat"  # chat | repo_task | resume | learn_policy
+    action: str = "chat"  # chat | repo_task | resume | status | policy
     mode: str = "libre"   # libre | ask_review | pilote | autopilot
     intent: str = "general"
     requires_active_repo: bool = False
@@ -33,7 +33,7 @@ def _normalize(text: str) -> str:
     return re.sub(r"\s+", " ", (text or "").strip().lower())
 
 
-def classify_libre_message(text: str) -> LibreDecision:
+def classify_libre_message(text: str, context: dict[str, Any] | None = None) -> LibreDecision:
     """Classify whether a Libre message should remain chat or become repo work.
 
     The router is deliberately conservative. It only captures messages with
@@ -42,57 +42,23 @@ def classify_libre_message(text: str) -> LibreDecision:
     """
 
     clean = _normalize(text)
+    context = context or {}
     if not clean:
         return LibreDecision(reason="empty")
 
     if extract_learning_policy(text):
         return LibreDecision(
-            action="learn_policy",
+            action="policy",
             mode="libre",
             intent="learning_policy",
             confidence=0.86,
             reason="explicit model/reasoning learning preference",
         )
 
-    resume_markers = (
-        "reprends",
-        "reprend",
-        "continue",
-        "continuons",
-        "où on en était",
-        "ou on en etait",
-        "chantier d'hier",
-        "reprise chantier",
-    )
-    deploy_markers = ("déploi", "deploi", "deploy", "prod", "preview", "vps")
     switch_markers = ("passe sur", "switch", "change de repo", "changer de repo", "reprends le repo", "reprend le repo")
-    bug_markers = ("bug", "corrige", "fix", "erreur", "crash", "cass", "répare", "repare")
-    feature_markers = ("ajoute", "implémente", "implemente", "feature", "modifie", "améliore", "ameliore")
-    repo_markers = ("repo", "github", "branche", "pr", "commit", "tests", "gateway", "cockpit", "vps")
-    autopilot_markers = ("autopilot", "tout seul", "sans friction", "si les tests passent", "go direct")
-    ask_review_markers = ("review", "relis", "analyse", "audit", "vérifie", "verifie")
-
-    has_repo_context = any(marker in clean for marker in repo_markers)
-    wants_switch = any(marker in clean for marker in switch_markers)
-    wants_deploy = any(marker in clean for marker in deploy_markers)
-    wants_bugfix = any(marker in clean for marker in bug_markers)
-    wants_feature = any(marker in clean for marker in feature_markers)
-    wants_review = any(marker in clean for marker in ask_review_markers)
-    wants_autopilot = any(marker in clean for marker in autopilot_markers)
-
-    if any(marker in clean for marker in resume_markers):
+    if any(marker in clean for marker in switch_markers):
         return LibreDecision(
-            action="resume",
-            mode="pilote",
-            intent="resume",
-            requires_active_repo=False,
-            confidence=0.84,
-            reason="resume intent detected",
-        )
-
-    if wants_switch:
-        return LibreDecision(
-            action="switch_repo",
+            action="repo_task",
             mode="pilote",
             intent="switch_repo",
             requires_active_repo=False,
@@ -100,23 +66,91 @@ def classify_libre_message(text: str) -> LibreDecision:
             reason="repo switch request detected",
         )
 
-    if not (wants_deploy or wants_bugfix or wants_feature or wants_review):
+    resume_markers = (
+        "reprends",
+        "reprend",
+        "continuons",
+        "où on en était",
+        "ou on en etait",
+        "chantier d'hier",
+        "reprise chantier",
+    )
+    deploy_markers = ("déploi", "deploi", "deploy", "prod", "preview", "vps")
+    bug_markers = ("bug", "corrige", "fix", "erreur", "crash", "cass", "répare", "repare", "ça casse", "ca casse")
+    feature_markers = ("ajoute", "implémente", "implemente", "feature", "modifie", "améliore", "ameliore", "prépare", "prepare", "pr propre")
+    repo_markers = ("repo", "github", "branche", "pr", "commit", "tests", "gateway", "cockpit", "vps")
+    autopilot_markers = ("autopilot", "tout seul", "sans friction", "si les tests passent", "go direct", "surveille", "corrige si")
+    ask_review_markers = ("review", "relis", "analyse", "audit", "vérifie", "verifie")
+    merge_markers = ("merge", "fusionne")
+    status_markers = ("ça avance", "ca avance", "status", "statut", "avancement", "t'en es où", "t en es ou", "où ça en est", "ou ca en est", "c'est fini", "c est fini", "tests passent")
+    chat_question_markers = ("explique", "c'est quoi", "c est quoi", "comment fonctionne", "différence", "difference", "t'en penses quoi", "tu penses quoi", "compréhension", "comprehension", "ma tête", "ma tete", " vs ")
+
+    has_repo_context = any(marker in clean for marker in repo_markers)
+    wants_deploy = any(marker in clean for marker in deploy_markers)
+    wants_bugfix = any(marker in clean for marker in bug_markers)
+    wants_feature = any(marker in clean for marker in feature_markers)
+    wants_review = any(marker in clean for marker in ask_review_markers)
+    if "preview" in clean and not any(marker in clean for marker in ("review du", "review le", "review cette", "review ce")):
+        wants_review = any(marker in clean for marker in ("relis", "analyse", "audit", "vérifie", "verifie"))
+    wants_merge = any(marker in clean for marker in merge_markers)
+    wants_autopilot = any(marker in clean for marker in autopilot_markers)
+    wants_status = any(marker in clean for marker in status_markers)
+    looks_like_chat_question = any(marker in clean for marker in chat_question_markers)
+
+    if wants_status and not wants_autopilot:
+        return LibreDecision(
+            action="status",
+            mode="libre",
+            intent="progress_status",
+            requires_active_repo=bool(context.get("active_task")),
+            confidence=0.83,
+            reason="status intent detected",
+        )
+
+    if looks_like_chat_question and not any(marker in clean for marker in ("corrige", "fix", "ajoute", "implémente", "implemente", "modifie", "déploie", "deploie", "deploy ce", "audit cette", "review du code")):
+        return LibreDecision(reason="knowledge question, not repo work", confidence=0.8)
+
+    if any(marker in clean for marker in resume_markers) or (clean.startswith("continue ") and not wants_autopilot):
+        return LibreDecision(
+            action="resume" if context.get("active_task", True) else "chat",
+            mode="pilote",
+            intent="resume" if context.get("active_task", True) else "general",
+            requires_active_repo=True,
+            confidence=0.84 if context.get("active_task", True) else 0.58,
+            reason="resume intent detected" if context.get("active_task", True) else "resume requested without active task",
+        )
+
+    if wants_autopilot and not (wants_deploy or wants_review):
+        return LibreDecision(
+            action="repo_task",
+            mode="autopilot",
+            intent="debug_fix" if wants_bugfix else ("feature_work" if wants_feature else "general"),
+            requires_active_repo=True,
+            confidence=0.78,
+            reason="autopilot intent detected",
+        )
+
+    if not (wants_deploy or wants_bugfix or wants_feature or wants_review or wants_merge):
         return LibreDecision(reason="no strong repo-work verb")
 
     intent = "general"
-    if wants_deploy:
+    if wants_review:
+        intent = "audit_repo"
+    elif wants_merge:
+        intent = "merge_request"
+    elif wants_deploy:
         intent = "deploy"
+    elif clean.startswith(("prépare", "prepare")):
+        intent = "feature_work"
     elif wants_bugfix:
         intent = "debug_fix"
     elif wants_feature:
         intent = "feature_work"
-    elif wants_review:
-        intent = "audit_repo"
 
     mode = "pilote"
     if wants_autopilot and not wants_deploy:
         mode = "autopilot"
-    elif wants_review and not (wants_bugfix or wants_feature or wants_deploy):
+    elif wants_review and not (wants_bugfix or wants_deploy):
         mode = "ask_review"
 
     return LibreDecision(
