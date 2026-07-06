@@ -1279,7 +1279,7 @@ class RepoCockpitTelegramMixin:
                     task_id=task_id,
                     report=report,
                     timeout=10,
-                    prefer_v2=False,
+                    prefer_v2=True,
                 )
             except Exception:
                 logger.debug("[%s] Runtime observation attach failed for %s", self.name, task_id, exc_info=True)

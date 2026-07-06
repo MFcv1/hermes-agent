@@ -18,7 +18,7 @@ Ces documents sont la source à suivre pour les prochaines sessions. En cas de c
 |---|---|---|
 | Phase 0 — stabilisation/inventaire | Terminé côté code local + déploiement VPS documenté | `PHASE0_COMPLETION_REPORT.md`, `gateway/deployment_info.py`, `scripts/inventory_symbols.py`, `docs/project/autonomie-v2-symbol-inventory.json` |
 | Phase 1 — extraction modules gateway | Terminé côté code local, sync VPS non fait | `PHASE1_COMPLETION_REPORT.md` |
-| Phase 2 — observation bus + contrats | En cours côté gateway, backend Cockpit restant | `PHASE2_OBSERVATION_BUS_REPORT.md` |
+| Phase 2 — observation bus + contrats | Terminé côté gateway + backend VPS | `PHASE2_OBSERVATION_BUS_REPORT.md` |
 | Phase 3 — worker runtime engine | Pas commencé | Aucun `CommandSpan`/state machine v2 extrait côté Cockpit dans ce repo |
 | Phase 4 — self-repair v2 | Pas commencé | Ne pas démarrer sans `policy_engine` + snapshot/rollback testés |
 | Phase 5 — memory/handoff unifié | Pas commencé | `ActiveWorkStore` JSON existe encore |
@@ -44,25 +44,24 @@ Le pattern actuel est volontairement conservateur :
 
 ## Point de reprise recommandé
 
-Continuer Phase 2 côté Repo Cockpit après validation de la brique gateway locale.
+Passer à la Phase 3 seulement après validation humaine du résultat Phase 2.
 
 Prochaine cible :
 
 ```text
-Observation bus serveur + contrats v2
+Worker runtime engine
 ```
 
 Ordre conseillé :
 
 1. Relire `docs/brain/03-implementation-contracts.md`.
-2. Implémenter `backend/runtime_observations.py` côté Repo Cockpit.
-3. Ajouter compat endpoint v1/v2.
-4. Implémenter fingerprint/dédup et masquage à l'ingestion.
-5. Basculer `gateway/observation_reporter.py` en `prefer_v2=True` seulement quand le serveur est validé.
+2. Relire `PHASE2_OBSERVATION_BUS_REPORT.md` pour les nouvelles tables et endpoints.
+3. Extraire `CommandSpan` / state machine worker selon Phase 3.
+4. Ne pas démarrer le self-repair v2 avant PolicyEngine + snapshots + rollback testés.
 
 ## À ne pas faire maintenant
 
-- Ne pas synchroniser/restart VPS sans validation humaine explicite.
+- Ne pas synchroniser/restart VPS sans validation humaine explicite, sauf reprise directe d'une phase déjà demandée en live.
 - Ne pas ajouter de watcher global : toute observation doit rester attachée à un `task_id`.
 - Ne pas démarrer le self-repair v2 avant PolicyEngine + snapshots + rollback testés.
 

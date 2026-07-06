@@ -12,18 +12,19 @@ Branche : `codex/ops-update-readiness`
   - masquage des secrets ;
   - interdiction des observations sans `task_id`.
 
-## Portée de cette passe locale
+## Portée réalisée
 
-Ce repo contient le gateway Hermes. Le backend Repo Cockpit mentionné par l'audit vit côté VPS (`/home/hermes/repo-cockpit`) et n'est pas présent dans ce checkout local.
-
-Cette passe implémente donc la brique gateway Phase 2 sans prétendre terminer la partie serveur :
+Phase 2 est terminée sur les deux côtés du flux :
 
 - helper gateway `gateway/observation_reporter.py` ;
 - payload v2 conforme au contrat ;
-- payload v1 conservé pour compatibilité avec le serveur Cockpit actuel ;
+- payload v1 conservé pour compatibilité de transition ;
 - masquage gateway avant émission ;
 - tests de contrat côté gateway ;
-- intégration du runtime observer Telegram via le helper, en mode v1 par défaut.
+- intégration du runtime observer Telegram via le helper, en mode v2 ;
+- backend Repo Cockpit VPS `/home/hermes/repo-cockpit` avec ingestion v1/v2 ;
+- fingerprint/dédup serveur avec fenêtre 30 min ;
+- table `runtime_observations` enrichie avec `fingerprint`, `count`, `first_seen`, `last_seen`, `raw_excerpt`, `phase`, `command`, `schema_version`.
 
 ## Comportement
 
@@ -42,9 +43,9 @@ Règles appliquées :
 - `task_id` obligatoire ;
 - `raw_excerpt` tronqué à 4000 caractères ;
 - `schema_version=2` pour le payload v2 ;
-- `fingerprint` omis par défaut : le serveur Cockpit reste responsable du calcul ;
+- `fingerprint` omis par défaut côté gateway : le serveur Cockpit reste responsable du calcul ;
 - v1 exact conservé : `{source, task_id, report, captured_at}` ;
-- `prefer_v2=False` par défaut tant que le backend Cockpit local n'est pas migré.
+- le runtime observer Telegram émet maintenant avec `prefer_v2=True`.
 
 ## Fichiers modifiés
 
@@ -57,28 +58,73 @@ docs/project/PHASE2_OBSERVATION_BUS_REPORT.md
 AGENTS.md
 ```
 
-## Reste à faire côté Repo Cockpit
+## Fichiers VPS modifiés
 
-À implémenter dans `/home/hermes/repo-cockpit`, pas dans ce checkout :
+Repo Cockpit :
 
 ```text
-backend/runtime_observations.py
-dedupe_fingerprint(raw)
-endpoint compat v1/v2
-table observations avec count/first_seen/last_seen
-test_observation_dedup.py
-test_observation_schema_compat.py
-secret_masking.py à l'ingestion
+/home/hermes/repo-cockpit/backend/app.py
+/home/hermes/repo-cockpit/backend/runtime_observations.py
+/home/hermes/repo-cockpit/backend/secret_masking.py
+/home/hermes/repo-cockpit/scripts/operation_worker.py
+/home/hermes/repo-cockpit/tests/test_observation_dedup.py
+/home/hermes/repo-cockpit/tests/test_observation_schema_compat.py
 ```
 
-## Validation locale
+Gateway live monolithe VPS, patch minimal sans déployer la Phase 1 complète :
 
-À lancer après modification :
+```text
+/home/hermes/.hermes/hermes-agent/gateway/platforms/telegram.py
+/home/hermes/.hermes/hermes-agent/gateway/observation_reporter.py
+```
+
+Backups créés :
+
+```text
+/home/hermes/repo-cockpit/backups/phase2-observations-20260706-200037
+/home/hermes/.hermes/hermes-agent/backups/phase2-observation-reporter-20260706-200351
+```
+
+## Validation
+
+Hermes gateway local :
 
 ```bash
+venv/bin/python -m py_compile gateway/observation_reporter.py gateway/repo_cockpit_telegram_mixin.py
 scripts/run_tests.sh tests/gateway/test_observation_reporter.py
 scripts/run_tests.sh tests/gateway/test_repo_cockpit_client.py
 scripts/run_tests.sh tests/gateway/test_telegram_pilot_mode.py
+```
+
+Résultat : 26 tests passés.
+
+Repo Cockpit live VPS :
+
+```bash
+PYTHONPATH=/home/hermes/repo-cockpit .venv/bin/python -m py_compile \
+  backend/secret_masking.py backend/runtime_observations.py backend/app.py \
+  scripts/operation_worker.py tests/test_observation_dedup.py tests/test_observation_schema_compat.py
+PYTHONPATH=/home/hermes/repo-cockpit .venv/bin/python tests/test_observation_dedup.py
+PYTHONPATH=/home/hermes/repo-cockpit .venv/bin/python tests/test_observation_schema_compat.py
+PYTHONPATH=/home/hermes/repo-cockpit .venv/bin/python tests/runtime_self_repair_smoke.py
+```
+
+Résultat : `PASS test_observation_dedup`, `PASS test_observation_schema_compat`, `runtime self-repair remote smoke OK`.
+
+Smoke endpoint live :
+
+```text
+10 erreurs identiques -> 1 observation count=10
+payload v2 avec phase/command -> observation attachée
+raw_excerpt > 4000 -> HTTP 422
+task inexistante -> HTTP 404
+```
+
+Services redémarrés et vérifiés :
+
+```text
+hermes-repo-cockpit.service active, /health OK
+hermes-gateway.service active après restart, aucun log d'erreur récent
 ```
 
 ## Rollback
@@ -87,4 +133,9 @@ scripts/run_tests.sh tests/gateway/test_telegram_pilot_mode.py
 git revert <commit-phase2-gateway-observation-reporter>
 ```
 
-Pas de rollback VPS nécessaire tant qu'aucun sync/restart n'a été fait.
+Rollback VPS manuel depuis les backups ci-dessus si nécessaire, puis :
+
+```bash
+sudo -u hermes XDG_RUNTIME_DIR=/run/user/$(id -u hermes) systemctl --user restart hermes-repo-cockpit.service
+sudo -u hermes XDG_RUNTIME_DIR=/run/user/$(id -u hermes) systemctl --user restart hermes-gateway.service
+```
