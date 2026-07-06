@@ -26,6 +26,14 @@ from typing import Dict, List, Optional, Set, Any
 
 logger = logging.getLogger(__name__)
 
+REPO_COCKPIT_MODES = {"ask_review", "pilote", "autopilot"}
+
+
+def normalize_cockpit_mode(mode: str | None) -> str:
+    """Return a supported Repo Cockpit mode, preserving the new Pilote flow."""
+    clean = str(mode or "").strip().lower()
+    return clean if clean in REPO_COCKPIT_MODES else "ask_review"
+
 try:
     from telegram import Update, Bot, Message, InlineKeyboardButton, InlineKeyboardMarkup
     try:
@@ -76,6 +84,7 @@ from pathlib import Path as _Path
 sys.path.insert(0, str(_Path(__file__).resolve().parents[2]))
 
 from gateway.config import Platform, PlatformConfig
+from gateway.platforms.telegram_models_config import TelegramModelsConfigMixin
 from gateway.platforms.base import (
     BasePlatformAdapter,
     MessageEvent,
@@ -350,7 +359,7 @@ def _wrap_markdown_tables(text: str) -> str:
     return '\n'.join(out)
 
 
-class TelegramAdapter(BasePlatformAdapter):
+class TelegramAdapter(TelegramModelsConfigMixin, BasePlatformAdapter):
     """
     Telegram bot adapter.
 
@@ -511,6 +520,25 @@ class TelegramAdapter(BasePlatformAdapter):
         # Repo Cockpit new-chat repo choices per Telegram user. Callback data is
         # capped by Telegram, so buttons carry short indexes into this map.
         self._repo_new_chat_choices: Dict[str, dict] = {}
+        # Pilot Intake guided workflow state (Telegram user id -> state).
+        # This keeps /new -> buttons -> natural prompt/replies command-free.
+        self._pilot_intake_states: Dict[str, dict] = {}
+        # Libre V2 state (Telegram user id -> soft orchestration state). Libre
+        # keeps durable memory and normal chat alive while closing transient
+        # repo/wizard state from the active Repo Cockpit flow.
+        self._libre_chat_states: Dict[str, dict] = {}
+        self._libre_watch_enabled: bool = self._coerce_bool_extra("libre_watch_enabled", False)
+        try:
+            self._libre_watch_interval_seconds = max(30.0, float(self.config.extra.get("libre_watch_interval_seconds", 300)))
+        except Exception:
+            self._libre_watch_interval_seconds = 300.0
+        try:
+            self._libre_watch_initial_delay_seconds = max(0.0, float(self.config.extra.get("libre_watch_initial_delay_seconds", 15)))
+        except Exception:
+            self._libre_watch_initial_delay_seconds = 15.0
+        self._libre_watch_task: Optional[asyncio.Task] = None
+        self._libre_watch_last_signature: str = ""
+        self._ensure_models_config_state()
         self._cockpit_background_tasks: set[asyncio.Task] = set()
         # Approval button state: message_id → session_key
         self._approval_state: Dict[int, str] = {}
@@ -2276,6 +2304,8 @@ class TelegramAdapter(BasePlatformAdapter):
                     self.name, topics_err, exc_info=True,
                 )
 
+            self._start_libre_watch_daemon()
+
             return True
 
         except Exception as e:
@@ -2287,6 +2317,7 @@ class TelegramAdapter(BasePlatformAdapter):
 
     async def disconnect(self) -> None:
         """Stop polling/webhook, cancel pending album flushes, and disconnect."""
+        await self._stop_libre_watch_daemon()
         pending_media_group_tasks = list(self._media_group_tasks.values())
         for task in pending_media_group_tasks:
             task.cancel()
@@ -3908,6 +3939,40 @@ class TelegramAdapter(BasePlatformAdapter):
         query_thread_id = getattr(query_message, "message_thread_id", None)
         query_user_name = getattr(query.from_user, "first_name", None)
 
+        # --- /models combined picker (msc:*) ---
+        if data.startswith("msc:"):
+            caller_id = str(getattr(query.from_user, "id", ""))
+            if not self._is_callback_user_authorized(
+                caller_id,
+                chat_id=query_chat_id,
+                chat_type=str(query_chat_type) if query_chat_type is not None else None,
+                thread_id=str(query_thread_id) if query_thread_id is not None else None,
+                user_name=query_user_name,
+            ):
+                await query.answer(text="⛔ Tu n'es pas autorisé à utiliser ce bouton.")
+                return
+            await self._handle_models_config_callback(
+                query, data, str(query_chat_id or "")
+            )
+            return
+
+        # --- Repo Cockpit model/reasoning quick picks (rcp:*) ---
+        if data.startswith("rcp:"):
+            caller_id = str(getattr(query.from_user, "id", ""))
+            if not self._is_callback_user_authorized(
+                caller_id,
+                chat_id=query_chat_id,
+                chat_type=str(query_chat_type) if query_chat_type is not None else None,
+                thread_id=str(query_thread_id) if query_thread_id is not None else None,
+                user_name=query_user_name,
+            ):
+                await query.answer(text="⛔ Tu n'es pas autorisé à utiliser ce bouton.")
+                return
+            parts = data.split(":")
+            mode = normalize_cockpit_mode(parts[3] if len(parts) > 3 else None)
+            await self._handle_cockpit_prefs_callback(query, data, caller_id, mode)
+            return
+
         # --- Repo Cockpit new-chat callbacks (rcn:verb:mode) ---
         if data.startswith("rcn:"):
             caller_id = str(getattr(query.from_user, "id", ""))
@@ -3922,8 +3987,9 @@ class TelegramAdapter(BasePlatformAdapter):
                 return
             parts = data.split(":", 2)
             verb = parts[1] if len(parts) > 1 else ""
-            mode = parts[2] if len(parts) > 2 and parts[2] in {"ask_review", "autopilot"} else "ask_review"
+            mode = normalize_cockpit_mode(parts[2] if len(parts) > 2 else None)
             if verb == "cancel":
+                self._pilot_intake_states.pop(caller_id, None)
                 await query.answer(text="Annulé")
                 try:
                     await query.edit_message_text("Nouveau chat annulé.", reply_markup=None)
@@ -3932,18 +3998,94 @@ class TelegramAdapter(BasePlatformAdapter):
                 return
             if verb == "mode":
                 await self._set_cockpit_mode(caller_id, mode, str(query_chat_id or ""))
+                await self._sync_cockpit_llm_prefs_to_api(caller_id, mode, str(query_chat_id or ""))
                 await query.answer(text=f"Mode: {self._mode_title(mode)}")
                 try:
                     await query.edit_message_text(
-                        self._new_chat_text(mode),
+                        self._new_chat_text_with_prefs(mode, caller_id),
                         parse_mode=ParseMode.HTML,
-                        reply_markup=self._new_chat_keyboard(mode),
+                        reply_markup=self._new_chat_keyboard_with_prefs(mode, caller_id),
+                    )
+                except Exception:
+                    pass
+                return
+            if verb == "pickmodel":
+                prefs = self._get_cockpit_llm_prefs(caller_id)
+                await query.answer()
+                try:
+                    await query.edit_message_text(
+                        "<b>Modèle pour cette tâche</b>\n\n" + self._llm_prefs_summary_html(prefs),
+                        parse_mode=ParseMode.HTML,
+                        reply_markup=self._build_cockpit_model_keyboard(mode),
+                    )
+                except Exception:
+                    pass
+                return
+            if verb == "pickreason":
+                prefs = self._get_cockpit_llm_prefs(caller_id)
+                await query.answer()
+                try:
+                    await query.edit_message_text(
+                        "<b>Réflexion pour cette tâche</b>\n\n" + self._llm_prefs_summary_html(prefs),
+                        parse_mode=ParseMode.HTML,
+                        reply_markup=self._build_cockpit_reason_keyboard(mode),
+                    )
+                except Exception:
+                    pass
+                return
+            if verb == "intent":
+                intent = parts[2].split(":", 1)[0] if len(parts) > 2 else "pilot_discovery"
+                # Data shape is rcn:intent:<intent>:<mode>; recover mode from tail if present.
+                subparts = data.split(":")
+                intent = subparts[2] if len(subparts) > 2 else "pilot_discovery"
+                mode = normalize_cockpit_mode(subparts[3] if len(subparts) > 3 else mode)
+                self._pilot_intake_states[caller_id] = {
+                    "awaiting": "repo",
+                    "mode": mode,
+                    "origin": "github_existing",
+                    "intent": intent,
+                    "chat_id": str(query_chat_id or ""),
+                    "ts": time.time(),
+                }
+                await self._set_cockpit_mode(caller_id, mode, str(query_chat_id or ""))
+                await query.answer(text="Choisis le repo")
+                cockpit_url = self._repo_cockpit_url("/select-repo", mode=mode)
+                repos_payload = await asyncio.to_thread(self._cockpit_api_sync, "GET", "/api/internal/repos", None, 20)
+                repos = repos_payload.get("repos") if isinstance(repos_payload, dict) else []
+                if not isinstance(repos, list):
+                    repos = []
+                self._repo_new_chat_choices[caller_id] = {
+                    "repos": repos,
+                    "mode": mode,
+                    "chat_id": str(query_chat_id or ""),
+                    "intent": intent,
+                    "ts": time.time(),
+                }
+                try:
+                    await query.edit_message_text(
+                        "<b>Projet GitHub existant</b>\n\n"
+                        f"Route : <b>{_html.escape(self._pilot_intent_title(intent))}</b>\n\n"
+                        "Choisis le repo MFcv1 à utiliser.",
+                        parse_mode=ParseMode.HTML,
+                        reply_markup=self._repo_new_chat_keyboard(caller_id, mode, repos, cockpit_url),
                     )
                 except Exception:
                     pass
                 return
             if verb == "existing":
                 await self._set_cockpit_mode(caller_id, mode, str(query_chat_id or ""))
+                if mode == "pilote":
+                    await query.answer(text="Choisis l'intention")
+                    try:
+                        await query.edit_message_text(
+                            "<b>Projet GitHub existant</b>\n\n"
+                            "Tu veux faire quoi sur ce repo ?",
+                            parse_mode=ParseMode.HTML,
+                            reply_markup=self._pilot_existing_intent_keyboard(mode),
+                        )
+                    except Exception:
+                        pass
+                    return
                 await query.answer(text="Repos MFcv1")
                 cockpit_url = self._repo_cockpit_url("/select-repo", mode=mode)
                 repos_payload = await asyncio.to_thread(self._cockpit_api_sync, "GET", "/api/internal/repos", None, 20)
@@ -3970,6 +4112,27 @@ class TelegramAdapter(BasePlatformAdapter):
                 return
             if verb == "scratch":
                 await self._set_cockpit_mode(caller_id, mode, str(query_chat_id or ""))
+                if mode == "pilote":
+                    self._pilot_intake_states[caller_id] = {
+                        "awaiting": "prompt",
+                        "mode": "pilote",
+                        "origin": "from_scratch",
+                        "intent": "architect",
+                        "chat_id": str(query_chat_id or ""),
+                        "ts": time.time(),
+                    }
+                    await query.answer(text="Écris le prompt")
+                    try:
+                        await query.edit_message_text(
+                            self._pilot_waiting_prompt_text(origin="from_scratch", intent="architect", user_id=caller_id),
+                            parse_mode=ParseMode.HTML,
+                            reply_markup=InlineKeyboardMarkup([[
+                                InlineKeyboardButton("Annuler", callback_data="rcn:cancel")
+                            ]]),
+                        )
+                    except Exception:
+                        pass
+                    return
                 await query.answer(text="Confirmation texte requise")
                 try:
                     await query.edit_message_text(
@@ -3999,7 +4162,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 await query.answer(text="⛔ Tu n'es pas autorisé à utiliser ce bouton.")
                 return
             parts = data.split(":", 2)
-            mode = parts[1] if len(parts) > 1 and parts[1] in {"ask_review", "autopilot"} else "ask_review"
+            mode = normalize_cockpit_mode(parts[1] if len(parts) > 1 else None)
             try:
                 index = int(parts[2]) if len(parts) > 2 else -1
             except ValueError:
@@ -4014,12 +4177,16 @@ class TelegramAdapter(BasePlatformAdapter):
                 await query.answer(text="Repo invalide")
                 return
             await query.answer(text="Sélection...")
+            prefs = self._get_cockpit_llm_prefs(caller_id)
             payload = {
                 "telegram_user_id": caller_id,
                 "chat_id": str(query_chat_id or choice_state.get("chat_id") or ""),
                 "repo": repo,
                 "mode": mode,
                 "notify": False,
+                "chat_model": prefs.get("model"),
+                "chat_provider": prefs.get("provider"),
+                "reasoning_effort": prefs.get("reasoning_effort"),
             }
             result = await asyncio.to_thread(self._cockpit_api_sync, "POST", "/api/internal/select", payload, 20)
             if not result.get("ok"):
@@ -4036,12 +4203,37 @@ class TelegramAdapter(BasePlatformAdapter):
                     pass
                 return
             self._repo_new_chat_choices.pop(caller_id, None)
-            try:
-                await query.edit_message_text(
-                    self._repo_selected_text(repo, mode, str(result.get("thread_id") or "")),
-                    parse_mode=ParseMode.HTML,
-                    reply_markup=self._repo_selected_keyboard(mode),
+            thread_id = str(result.get("thread_id") or "")
+            if thread_id:
+                self._cockpit_register_thread_llm_prefs(
+                    chat_id=str(query_chat_id or choice_state.get("chat_id") or ""),
+                    thread_id=thread_id,
+                    telegram_user_id=caller_id,
                 )
+            try:
+                if mode == "pilote":
+                    intent = str(choice_state.get("intent") or (self._pilot_intake_states.get(caller_id) or {}).get("intent") or "pilot_discovery")
+                    self._pilot_intake_states[caller_id] = {
+                        "awaiting": "prompt",
+                        "mode": mode,
+                        "origin": "github_existing",
+                        "intent": intent,
+                        "repo": repo,
+                        "chat_id": str(query_chat_id or choice_state.get("chat_id") or ""),
+                        "thread_id": thread_id,
+                        "ts": time.time(),
+                    }
+                    await query.edit_message_text(
+                        self._pilot_waiting_prompt_text(origin="github_existing", intent=intent, repo=repo, user_id=caller_id),
+                        parse_mode=ParseMode.HTML,
+                        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Annuler", callback_data="rcn:cancel")]]),
+                    )
+                else:
+                    await query.edit_message_text(
+                        self._repo_selected_text(repo, mode, str(result.get("thread_id") or "")),
+                        parse_mode=ParseMode.HTML,
+                        reply_markup=self._repo_selected_keyboard(mode),
+                    )
             except Exception:
                 pass
             return
@@ -6133,6 +6325,7 @@ class TelegramAdapter(BasePlatformAdapter):
 
         event = self._build_message_event(msg, MessageType.TEXT, update_id=update.update_id)
         event.text = self._clean_bot_trigger_text(event.text)
+        event._telegram_message = msg  # type: ignore[attr-defined]
         await self._cache_replied_media(msg, event)
         event = self._apply_telegram_group_observe_attribution(event)
         self._enqueue_text_event(event)
@@ -6223,17 +6416,26 @@ class TelegramAdapter(BasePlatformAdapter):
                 return False
 
     def _mode_title(self, mode: str) -> str:
-        return "Autopilot" if mode == "autopilot" else "Ask review"
+        mode = normalize_cockpit_mode(mode)
+        if mode == "autopilot":
+            return "Autopilot"
+        if mode == "pilote":
+            return "Pilote"
+        return "Ask review"
 
     def _mode_note(self, mode: str) -> str:
+        mode = normalize_cockpit_mode(mode)
         if mode == "autopilot":
             return "peut merger automatiquement seulement après PR, gates, secret scan et review indépendante high"
+        if mode == "pilote":
+            return "cadre d'abord Architect/Deploy, pose les questions critiques, puis avance en autonomie avec PR et gates"
         return "prépare, teste et ouvre une PR, puis attend ta validation avant merge"
 
     async def _get_cockpit_state(self, telegram_user_id: str) -> dict:
         return await asyncio.to_thread(self._cockpit_api_sync, "GET", f"/api/internal/state/{telegram_user_id}", None, 10)
 
     async def _set_cockpit_mode(self, telegram_user_id: str, mode: str, chat_id: str | None = None) -> dict:
+        mode = normalize_cockpit_mode(mode)
         return await asyncio.to_thread(
             self._cockpit_api_sync,
             "POST",
@@ -6261,13 +6463,17 @@ class TelegramAdapter(BasePlatformAdapter):
         ))
 
     def _new_chat_keyboard(self, mode: str) -> InlineKeyboardMarkup:
+        mode = normalize_cockpit_mode(mode)
         return InlineKeyboardMarkup([
             [
                 InlineKeyboardButton(("✓ Ask review" if mode == "ask_review" else "Ask review"), callback_data="rcn:mode:ask_review"),
+                InlineKeyboardButton(("✓ Pilote" if mode == "pilote" else "Pilote"), callback_data="rcn:mode:pilote"),
+            ],
+            [
                 InlineKeyboardButton(("✓ Autopilot" if mode == "autopilot" else "Autopilot"), callback_data="rcn:mode:autopilot"),
             ],
             [
-                InlineKeyboardButton("Projet GitHub MFcv1 existant", callback_data=f"rcn:existing:{mode}"),
+                InlineKeyboardButton("Projet GitHub existant", callback_data=f"rcn:existing:{mode}"),
             ],
             [
                 InlineKeyboardButton("Start from scratch", callback_data=f"rcn:scratch:{mode}"),
@@ -6276,6 +6482,149 @@ class TelegramAdapter(BasePlatformAdapter):
                 InlineKeyboardButton("Annuler", callback_data="rcn:cancel"),
             ],
         ])
+
+
+    def _pilot_default_reasoning(self, user_id: str, origin: str | None = None, intent: str | None = None) -> str:
+        prefs = self._get_cockpit_llm_prefs(user_id)
+        selected = str(prefs.get("reasoning_effort") or "medium").lower()
+        if selected in {"high", "xhigh"}:
+            return selected
+        if origin == "from_scratch" or intent in {"deploy", "review_harden"}:
+            return "high"
+        return selected if selected in {"low", "medium"} else "medium"
+
+    def _pilot_intent_title(self, intent: str | None) -> str:
+        titles = {
+            "architect": "Architect / cadrage",
+            "deploy": "Déployer / vérifier prod",
+            "audit_repo": "Comprendre / auditer le repo",
+            "feature_work": "Modifier / ajouter une feature",
+            "debug_fix": "Corriger un bug",
+            "review_harden": "Refactor / sécuriser",
+            "pilot_discovery": "Je ne sais pas",
+        }
+        return titles.get(str(intent or ""), "Architect / cadrage")
+
+    def _pilot_existing_intent_keyboard(self, mode: str = "pilote") -> InlineKeyboardMarkup:
+        mode = normalize_cockpit_mode(mode)
+        return InlineKeyboardMarkup([
+            [InlineKeyboardButton("Comprendre / auditer le repo", callback_data=f"rcn:intent:audit_repo:{mode}")],
+            [InlineKeyboardButton("Modifier / ajouter une feature", callback_data=f"rcn:intent:feature_work:{mode}")],
+            [InlineKeyboardButton("Corriger un bug", callback_data=f"rcn:intent:debug_fix:{mode}")],
+            [InlineKeyboardButton("Déployer / vérifier prod", callback_data=f"rcn:intent:deploy:{mode}")],
+            [InlineKeyboardButton("Refactor / sécuriser", callback_data=f"rcn:intent:review_harden:{mode}")],
+            [InlineKeyboardButton("Je ne sais pas", callback_data=f"rcn:intent:pilot_discovery:{mode}")],
+            [InlineKeyboardButton("Retour", callback_data=f"rcn:mode:{mode}"), InlineKeyboardButton("Annuler", callback_data="rcn:cancel")],
+        ])
+
+    def _pilot_waiting_prompt_text(self, *, origin: str, intent: str, repo: str | None = None, user_id: str = "") -> str:
+        reasoning = self._pilot_default_reasoning(user_id, origin, intent) if user_id else "high"
+        lines = [
+            "<b>🧭 Pilote prêt</b>",
+            "",
+            f"Source : <b>{'Start from scratch' if origin == 'from_scratch' else 'Projet GitHub existant'}</b>",
+            f"Route : <b>{_html.escape(self._pilot_intent_title(intent))}</b>",
+            f"Plan : <b>{_html.escape(reasoning)}</b>",
+        ]
+        if repo:
+            lines.append(f"Repo : <code>{_html.escape(repo)}</code>")
+        lines.extend([
+            "",
+            "Écris maintenant ce que tu veux que je fasse.",
+            "",
+            "Pas besoin de <code>/task</code> : ton prochain message devient la tâche Pilote.",
+        ])
+        return "\n".join(lines)
+
+    def _pilot_slug_from_text(self, text: str) -> str:
+        raw = re.sub(r"[^a-zA-Z0-9]+", "-", (text or "").lower()).strip("-")
+        raw = re.sub(r"-+", "-", raw)[:42].strip("-")
+        return raw or f"pilot-project-{int(time.time())}"
+
+    async def _pilot_create_scratch_and_task(self, msg: Message, task_text: str, state: dict) -> bool:
+        user_id = str(getattr(getattr(msg, "from_user", None), "id", "") or getattr(msg, "chat_id", ""))
+        title = self._pilot_slug_from_text(task_text)
+        prefs = self._get_cockpit_llm_prefs(user_id)
+        payload = {
+            "telegram_user_id": user_id,
+            "chat_id": str(getattr(msg, "chat_id", "")),
+            "title": title,
+            "mode": "pilote",
+            "visibility": "private",
+            "description": task_text[:600],
+            "create_repo": True,
+            "chat_model": prefs.get("model"),
+            "chat_provider": prefs.get("provider"),
+            "reasoning_effort": self._pilot_default_reasoning(user_id, "from_scratch", state.get("intent") or "architect"),
+        }
+        data = await asyncio.to_thread(self._cockpit_api_sync, "POST", "/api/internal/projects", payload, 90)
+        if not data.get("ok"):
+            await self._send_cockpit_text(
+                msg,
+                "<b>❌ Création projet impossible</b>\n\n<code>" + _html.escape(str(data.get("description") or data))[:1200] + "</code>",
+                role="preview",
+            )
+            return True
+        await self._send_cockpit_text(
+            msg,
+            "<b>✅ Projet Pilote créé</b>\n\n"
+            f"Repo : <code>{_html.escape(data.get('repo') or '')}</code>\n"
+            "Je crée maintenant la tâche autonome avec ton prompt.",
+            role="sticky",
+        )
+        thread_id = str(data.get("thread_id") or "")
+        if thread_id:
+            self._cockpit_register_thread_llm_prefs(
+                chat_id=str(getattr(msg, "chat_id", "")),
+                thread_id=thread_id,
+                telegram_user_id=user_id,
+            )
+        await self._create_task_from_thread_command(msg, task_text)
+        return True
+
+    async def _maybe_handle_pilot_intake_text(self, msg: Message, text: str) -> bool:
+        clean = (text or "").strip()
+        if not clean or clean.startswith("/"):
+            return False
+        user_id = str(getattr(getattr(msg, "from_user", None), "id", "") or getattr(msg, "chat_id", ""))
+        state = self._pilot_intake_states.get(user_id) or {}
+        if state.get("awaiting") == "prompt":
+            self._pilot_intake_states.pop(user_id, None)
+            origin = str(state.get("origin") or "existing_repo")
+            if origin == "from_scratch":
+                return await self._pilot_create_scratch_and_task(msg, clean, state)
+            await self._create_task_from_thread_command(msg, clean)
+            return True
+
+        # If a Pilote task is waiting for context, a natural message is the answer.
+        pending = await asyncio.to_thread(
+            self._cockpit_api_sync,
+            "GET",
+            f"/api/internal/tasks/pilot-pending/{user_id}",
+            None,
+            15,
+        )
+        if pending.get("ok") and pending.get("pending") and (pending.get("task") or {}).get("id"):
+            pilot_task_id = str((pending.get("task") or {}).get("id"))
+            result = await asyncio.to_thread(
+                self._cockpit_api_sync,
+                "POST",
+                f"/api/internal/tasks/{pilot_task_id}/pilot-answer",
+                {"telegram_user_id": user_id, "answer": clean},
+                20,
+            )
+            if result.get("ok"):
+                await self._send_cockpit_text(
+                    msg,
+                    "<b>🧭 Réponse Pilote reçue</b>\n\n"
+                    f"Tâche : <code>{_html.escape(pilot_task_id)}</code>\n"
+                    f"Statut : <code>{_html.escape(str(result.get('status') or 'queued_plan'))}</code>\n\n"
+                    "Je relance le worker avec ce contexte.",
+                    role="sticky",
+                )
+                asyncio.create_task(self._run_autopilot_worker_after_task_create(msg, pilot_task_id))
+                return True
+        return False
 
     def _repo_button_label(self, repo: dict) -> str:
         full_name = str(repo.get("nameWithOwner") or repo.get("name") or "Repo")
@@ -6287,6 +6636,7 @@ class TelegramAdapter(BasePlatformAdapter):
         return f"{clean} · {visibility}"
 
     def _repo_new_chat_keyboard(self, user_id: str, mode: str, repos: list[dict], cockpit_url: str) -> InlineKeyboardMarkup:
+        mode = normalize_cockpit_mode(mode)
         rows: list[list[InlineKeyboardButton]] = []
         for index, repo in enumerate(repos[:8]):
             if not isinstance(repo, dict) or not repo.get("nameWithOwner"):
@@ -6312,6 +6662,7 @@ class TelegramAdapter(BasePlatformAdapter):
         return InlineKeyboardMarkup(rows)
 
     def _repo_selected_text(self, repo: str, mode: str, thread_id: str | None = None) -> str:
+        mode = normalize_cockpit_mode(mode)
         lines = [
             "<b>✅ Repo sélectionné</b>",
             "",
@@ -6327,11 +6678,15 @@ class TelegramAdapter(BasePlatformAdapter):
         return "\n".join(lines)
 
     def _repo_selected_keyboard(self, mode: str) -> InlineKeyboardMarkup:
-        other_mode = "autopilot" if mode == "ask_review" else "ask_review"
+        mode = normalize_cockpit_mode(mode)
         return InlineKeyboardMarkup([
             [
                 InlineKeyboardButton("Changer repo", callback_data=f"rcn:existing:{mode}"),
-                InlineKeyboardButton("Changer mode", callback_data=f"rcn:mode:{other_mode}"),
+                InlineKeyboardButton("Ask review", callback_data="rcn:mode:ask_review"),
+            ],
+            [
+                InlineKeyboardButton("Pilote", callback_data="rcn:mode:pilote"),
+                InlineKeyboardButton("Autopilot", callback_data="rcn:mode:autopilot"),
             ],
             [
                 InlineKeyboardButton("Annuler", callback_data="rcn:cancel"),
@@ -6339,6 +6694,7 @@ class TelegramAdapter(BasePlatformAdapter):
         ])
 
     def _new_chat_text(self, mode: str, selected_repo: str | None = None) -> str:
+        mode = normalize_cockpit_mode(mode)
         repo_line = f"Repo actuel : <code>{_html.escape(selected_repo)}</code>" if selected_repo else "Repo actuel : <i>aucun repo sélectionné</i>"
         return (
             "<b>🧭 Nouveau chat Hermes</b>\n\n"
@@ -6354,28 +6710,43 @@ class TelegramAdapter(BasePlatformAdapter):
             return await self._create_scratch_project_from_command(msg, args[len("scratch "):])
         user_id = str(getattr(getattr(msg, "from_user", None), "id", "") or getattr(msg, "chat_id", ""))
         state = await self._get_cockpit_state(user_id)
-        mode = state.get("mode") if state.get("mode") in {"ask_review", "autopilot"} else "ask_review"
+        mode = normalize_cockpit_mode(state.get("mode"))
+        if args.lower() in REPO_COCKPIT_MODES:
+            mode = normalize_cockpit_mode(args)
+            await asyncio.to_thread(
+                self._cockpit_api_sync,
+                "POST",
+                "/api/internal/state",
+                {
+                    "telegram_user_id": user_id,
+                    "mode": mode,
+                    "chat_id": str(getattr(msg, "chat_id", "")),
+                },
+                10,
+            )
+            state["mode"] = mode
         await self._send_cockpit_panel(
             msg,
-            self._new_chat_text(mode, state.get("selected_repo")),
-            self._new_chat_keyboard(mode),
+            self._new_chat_text_with_prefs(mode, user_id, state.get("selected_repo")),
+            self._new_chat_keyboard_with_prefs(mode, user_id),
             role="preview",
         )
 
     async def _create_scratch_project_from_command(self, msg: Message, raw: str) -> None:
-        # Format: /new scratch repo-name | description | private|public | ask_review|autopilot
+        # Format: /new scratch repo-name | description | private|public | ask_review|pilote|autopilot
         parts = [p.strip() for p in raw.split("|")]
         title = parts[0] if parts else ""
         if not title:
             return await self._send_cockpit_text(
                 msg,
-                "<b>Start from scratch</b>\n\nUsage : <code>/new scratch nom-projet | description | private | ask_review</code>",
+                "<b>Start from scratch</b>\n\nUsage : <code>/new scratch nom-projet | description | private | pilote</code>",
                 role="preview",
             )
         description = parts[1] if len(parts) > 1 and parts[1] else title
         visibility = parts[2].lower() if len(parts) > 2 and parts[2].lower() in {"private", "public"} else "private"
-        mode = parts[3].lower() if len(parts) > 3 and parts[3].lower() in {"ask_review", "autopilot"} else "ask_review"
+        mode = normalize_cockpit_mode(parts[3] if len(parts) > 3 else None)
         user_id = str(getattr(getattr(msg, "from_user", None), "id", "") or getattr(msg, "chat_id", ""))
+        prefs = self._get_cockpit_llm_prefs(user_id)
         payload = {
             "telegram_user_id": user_id,
             "chat_id": str(getattr(msg, "chat_id", "")),
@@ -6384,6 +6755,9 @@ class TelegramAdapter(BasePlatformAdapter):
             "visibility": visibility,
             "description": description,
             "create_repo": True,
+            "chat_model": prefs.get("model"),
+            "chat_provider": prefs.get("provider"),
+            "reasoning_effort": prefs.get("reasoning_effort"),
         }
         data = await asyncio.to_thread(self._cockpit_api_sync, "POST", "/api/internal/projects", payload, 90)
         if not data.get("ok"):
@@ -6401,6 +6775,13 @@ class TelegramAdapter(BasePlatformAdapter):
             "Tu peux maintenant écrire la tâche à réaliser dans ce chat."
         )
         await self._send_cockpit_text(msg, text, role="sticky")
+        thread_id = str(data.get("thread_id") or "")
+        if thread_id:
+            self._cockpit_register_thread_llm_prefs(
+                chat_id=str(getattr(msg, "chat_id", "")),
+                thread_id=thread_id,
+                telegram_user_id=user_id,
+            )
 
     async def _send_tasks_command(self, msg: Message, args: str = "") -> None:
         data = await asyncio.to_thread(self._cockpit_api_sync, "GET", "/api/tasks?limit=12", None, 20)
@@ -6568,6 +6949,45 @@ class TelegramAdapter(BasePlatformAdapter):
                 role="preview",
             )
         if not task_id.startswith("op_"):
+            user_id = str(getattr(getattr(msg, "from_user", None), "id", "") or getattr(msg, "chat_id", ""))
+            pending = await asyncio.to_thread(
+                self._cockpit_api_sync,
+                "GET",
+                f"/api/internal/tasks/pilot-pending/{user_id}",
+                None,
+                20,
+            )
+            if pending.get("ok") and pending.get("pending") and (pending.get("task") or {}).get("id"):
+                pilot_task_id = str((pending.get("task") or {}).get("id"))
+                resumed = await asyncio.to_thread(
+                    self._cockpit_api_sync,
+                    "POST",
+                    f"/api/internal/tasks/{pilot_task_id}/pilot-answer",
+                    {
+                        "telegram_user_id": user_id,
+                        "chat_id": str(getattr(msg, "chat_id", "")),
+                        "answer": raw,
+                    },
+                    30,
+                )
+                if resumed.get("ok"):
+                    await self._send_cockpit_text(
+                        msg,
+                        "<b>🧭 Réponse Pilote reçue</b>\n\n"
+                        f"Tâche : <code>{_html.escape(pilot_task_id)}</code>\n"
+                        "Statut : <code>queued_plan</code>\n\n"
+                        "Je relance le worker avec ce contexte.",
+                        role="sticky",
+                    )
+                    asyncio.create_task(self._run_autopilot_worker_after_task_create(msg, pilot_task_id))
+                    return
+                return await self._send_cockpit_text(
+                    msg,
+                    "<b>Réponse Pilote non appliquée</b>\n\n<code>"
+                    + _html.escape(str(resumed.get("description") or resumed))[:1000]
+                    + "</code>",
+                    role="preview",
+                )
             return await self._create_task_from_thread_command(msg, raw)
         data = await asyncio.to_thread(self._cockpit_api_sync, "GET", f"/api/tasks/{task_id}", None, 20)
         if data.get("ok") is False or data.get("detail"):
@@ -7461,14 +7881,26 @@ class TelegramAdapter(BasePlatformAdapter):
             pass
 
 
-    async def _create_task_from_thread_command(self, msg: Message, task_text: str) -> None:
+    async def _create_task_from_thread_command(
+        self,
+        msg: Message,
+        task_text: str,
+        *,
+        mode: str | None = None,
+        intent: str | None = None,
+        source: str = "telegram_task_command",
+    ) -> None:
         user_id = str(getattr(getattr(msg, "from_user", None), "id", "") or getattr(msg, "chat_id", ""))
         payload = {
             "telegram_user_id": user_id,
             "chat_id": str(getattr(msg, "chat_id", "")),
             "task": task_text,
-            "source": "telegram_task_command",
+            "source": source,
         }
+        if mode:
+            payload["mode"] = normalize_cockpit_mode(mode)
+        if intent:
+            payload["intent"] = str(intent)
         data = await asyncio.to_thread(self._cockpit_api_sync, "POST", "/api/internal/tasks/from-thread", payload, 30)
         if not data.get("ok"):
             return await self._send_cockpit_text(
@@ -7478,8 +7910,13 @@ class TelegramAdapter(BasePlatformAdapter):
                 "<code>" + _html.escape(str(data.get("description") or data))[:900] + "</code>",
                 role="preview",
             )
-        is_autopilot = data.get("mode") == "autopilot"
-        next_action = "Autopilot lancé automatiquement" if is_autopilot else "/worker execute"
+        mode = normalize_cockpit_mode(data.get("mode"))
+        is_autonomous = mode in {"pilote", "autopilot"}
+        next_action = (
+            "Pilote lancé automatiquement"
+            if mode == "pilote"
+            else ("Autopilot lancé automatiquement" if mode == "autopilot" else "/worker execute")
+        )
         text = (
             "<b>📌 Tâche créée</b>\n\n"
             f"ID : <code>{_html.escape(data.get('id',''))}</code>\n"
@@ -7490,7 +7927,7 @@ class TelegramAdapter(BasePlatformAdapter):
             f"Prochaine étape : <code>{_html.escape(next_action)}</code>."
         )
         await self._send_cockpit_text(msg, text, role="sticky")
-        if is_autopilot:
+        if is_autonomous:
             asyncio.create_task(self._run_autopilot_worker_after_task_create(msg, data.get("id", "")))
 
     async def _run_autopilot_worker_after_task_create(self, msg: Message, task_id: str) -> None:
@@ -7533,6 +7970,45 @@ class TelegramAdapter(BasePlatformAdapter):
             live_message_id = getattr(sent, "message_id", None) if sent else None
             last_live_text = text
 
+        runtime_observer_state = {"signature": ""}
+
+        async def observe_runtime_signal(*, force: bool = False) -> dict:
+            """Attach fresh log errors to the active autonomous task while it is working."""
+            if not task_id:
+                return {}
+            from gateway.libre_orchestrator import scan_watch_logs
+
+            report = await asyncio.to_thread(scan_watch_logs, self._libre_watch_log_paths(), limit=30)
+            if str(report.get("status") or "green") == "green" or not report.get("items"):
+                return report
+            signature = self._libre_watch_signature(report)
+            if not force and (not signature or signature == runtime_observer_state.get("signature")):
+                return report
+            runtime_observer_state["signature"] = signature
+            observation_payload = {
+                "source": "telegram_runtime_observer",
+                "task_id": task_id,
+                "report": report,
+                "captured_at": int(time.time()),
+            }
+            try:
+                await asyncio.to_thread(
+                    self._cockpit_api_sync,
+                    "POST",
+                    f"/api/internal/tasks/{task_id}/runtime-observations",
+                    observation_payload,
+                    10,
+                )
+            except Exception:
+                logger.debug("[%s] Runtime observation attach failed for %s", self.name, task_id, exc_info=True)
+            if not force:
+                await self._send_cockpit_text(
+                    msg,
+                    self._format_runtime_observation_notice(report),
+                    role="progress",
+                )
+            return report
+
         initial = await fetch_autonomy(timeout=10)
         await publish_live(initial, force=True)
 
@@ -7542,7 +8018,16 @@ class TelegramAdapter(BasePlatformAdapter):
                     self._cockpit_api_sync,
                     "POST",
                     "/api/worker/run-once",
-                    {"status": "queued_plan", "execute": True},
+                    {
+                        "status": "queued_plan",
+                        "execute": True,
+                        "runtime_observer": {
+                            "enabled": True,
+                            "task_id": task_id,
+                            "source": "telegram_autonomous_worker",
+                            "mode": "during_work",
+                        },
+                    },
                     1800,
                 )
             )
@@ -7555,12 +8040,14 @@ class TelegramAdapter(BasePlatformAdapter):
                 except asyncio.TimeoutError:
                     pass
                 data = await fetch_autonomy(timeout=20)
+                await observe_runtime_signal()
                 task = data.get("task") or {}
                 phase = str(task.get("status") or task.get("current_phase") or "")
                 await publish_live(data, force=(phase != last_phase))
                 last_phase = phase
 
             worker = await worker_task
+            await observe_runtime_signal(force=True)
             result = worker.get("result") or {}
             status = result.get("status") or worker.get("status")
             task = await asyncio.to_thread(self._cockpit_api_sync, "GET", f"/api/tasks/{task_id}", None, 20) if task_id else {}
@@ -7638,6 +8125,263 @@ class TelegramAdapter(BasePlatformAdapter):
             chunks.append(f"# {item.get('file')}\n" + "\n".join(item.get("lines") or [])[-2500:])
         text = "\n\n".join(chunks) or "Aucun log worker."
         await self._send_cockpit_text(msg, "<b>📜 Logs worker</b>\n\n<pre><code>" + _html.escape(text[-3300:]) + "</code></pre>")
+
+    def _libre_context_key(self, msg: Message, user_id: str | None = None) -> str:
+        chat_id = str(getattr(msg, "chat_id", "") or getattr(getattr(msg, "chat", None), "id", ""))
+        thread_id = str(getattr(msg, "message_thread_id", "") or "")
+        uid = str(user_id or getattr(getattr(msg, "from_user", None), "id", "") or chat_id)
+        return f"telegram:{chat_id}:{thread_id}:{uid}"
+
+    def _libre_store(self):
+        from hermes_constants import get_hermes_home
+        from gateway.libre_orchestrator import ActiveWorkStore
+
+        return ActiveWorkStore(get_hermes_home() / "libre" / "state.json")
+
+    def _libre_watch_log_paths(self) -> list:
+        from hermes_constants import get_hermes_home
+
+        home = get_hermes_home()
+        return [
+            home / "logs" / "gateway.log",
+            home / "logs" / "repo-cockpit.log",
+            home / "logs" / "errors.log",
+        ]
+
+    def _libre_watch_target(self):
+        return getattr(self.config, "home_channel", None)
+
+    def _libre_watch_signature(self, report: dict) -> str:
+        items = report.get("items") or []
+        return "\n".join(
+            f"{item.get('file','')}::{item.get('line','')}"
+            for item in items[:8]
+            if isinstance(item, dict)
+        )
+
+    def _format_runtime_observation_notice(self, report: dict) -> str:
+        items = report.get("items") or []
+        lines = [
+            "<b>🛠️ Erreur captée pendant le travail</b>",
+            "",
+            "Je ne fais pas un checkup séparé : je rattache ce signal à la tâche autonome en cours pour que l'agent le traite dans son contexte.",
+        ]
+        if items:
+            lines.append("")
+            for item in items[:3]:
+                path = str(item.get("file") or "").rsplit("/", 1)[-1]
+                line = str(item.get("line") or "")[-220:]
+                lines.append(f"- <code>{_html.escape(path)}</code> · <code>{_html.escape(line)}</code>")
+        return "\n".join(lines)
+
+    def _format_libre_watch_alert(self, report: dict) -> str:
+        lines = [
+            "<b>👁️ Watch Libre autonome</b>",
+            "",
+            "J'ai détecté un nouveau signal dans les logs sans attendre de commande.",
+            f"Statut : <b>{_html.escape(str(report.get('status') or 'attention'))}</b>",
+            f"Erreurs récentes : <b>{int(report.get('error_count') or 0)}</b>",
+        ]
+        items = report.get("items") or []
+        if items:
+            lines.extend(["", "<b>Derniers signaux</b>"])
+            for item in items[:5]:
+                path = str(item.get("file") or "").rsplit("/", 1)[-1]
+                line = str(item.get("line") or "")[-240:]
+                lines.append(f"- <code>{_html.escape(path)}</code> · <code>{_html.escape(line)}</code>")
+        lines.extend([
+            "",
+            "Action safe pour l'instant : alerte + déduplication. Prochaine couche : ouvrir automatiquement une mission de réparation en branche/worktree.",
+        ])
+        return "\n".join(lines)
+
+    async def _libre_watch_tick(self) -> bool:
+        from gateway.libre_orchestrator import scan_watch_logs
+
+        target = self._libre_watch_target()
+        if not target or not getattr(target, "chat_id", None):
+            return False
+        report = await asyncio.to_thread(scan_watch_logs, self._libre_watch_log_paths(), limit=30)
+        if str(report.get("status") or "green") == "green" or not report.get("items"):
+            return False
+        signature = self._libre_watch_signature(report)
+        if not signature or signature == getattr(self, "_libre_watch_last_signature", ""):
+            return False
+        self._libre_watch_last_signature = signature
+        metadata: Dict[str, Any] = {"notify": True, "non_conversational": True}
+        if getattr(target, "thread_id", None):
+            metadata["thread_id"] = str(target.thread_id)
+        result = await self.send(str(target.chat_id), self._format_libre_watch_alert(report), metadata=metadata)
+        return bool(result is None or getattr(result, "success", True))
+
+    async def _libre_watch_loop(self) -> None:
+        if self._libre_watch_initial_delay_seconds:
+            await asyncio.sleep(self._libre_watch_initial_delay_seconds)
+        while True:
+            try:
+                await self._libre_watch_tick()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.debug("[%s] Libre Watch autonomous tick failed: %s", self.name, exc, exc_info=True)
+            await asyncio.sleep(self._libre_watch_interval_seconds)
+
+    def _start_libre_watch_daemon(self) -> None:
+        if not getattr(self, "_libre_watch_enabled", True):
+            logger.info("[%s] Libre Watch autonomous daemon disabled by config", self.name)
+            return
+        if self._libre_watch_task and not self._libre_watch_task.done():
+            return
+        if not self._libre_watch_target() or not getattr(self._libre_watch_target(), "chat_id", None):
+            logger.info("[%s] Libre Watch autonomous daemon not started: no Telegram home channel", self.name)
+            return
+        self._libre_watch_task = asyncio.create_task(self._libre_watch_loop())
+        logger.info("[%s] Libre Watch autonomous daemon started", self.name)
+
+    async def _stop_libre_watch_daemon(self) -> None:
+        task = getattr(self, "_libre_watch_task", None)
+        if task and not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        self._libre_watch_task = None
+
+    async def _send_libre_watch_command(self, msg: Message) -> None:
+        from gateway.libre_orchestrator import scan_watch_logs
+
+        report = await asyncio.to_thread(scan_watch_logs, self._libre_watch_log_paths(), limit=20)
+        lines = [
+            "<b>👁️ Watch Libre</b>",
+            "",
+            f"Statut : <b>{_html.escape(str(report.get('status') or 'green'))}</b>",
+            f"Erreurs récentes : <b>{int(report.get('error_count') or 0)}</b>",
+        ]
+        items = report.get("items") or []
+        if items:
+            lines.extend(["", "<b>Derniers signaux</b>"])
+            for item in items[:5]:
+                path = str(item.get("file") or "").rsplit("/", 1)[-1]
+                line = str(item.get("line") or "")[-240:]
+                lines.append(f"- <code>{_html.escape(path)}</code> · <code>{_html.escape(line)}</code>")
+        else:
+            lines.append("\nAucun signal bloquant dans les logs surveillés.")
+        await self._send_cockpit_text(msg, "\n".join(lines), role="preview")
+
+    def _libre_handoff_from_active(self, active: dict | None) -> dict:
+        active = active or {}
+        return {
+            "repo": str(active.get("repo") or ""),
+            "mode": normalize_cockpit_mode(active.get("thread_mode") or active.get("project_mode") or "ask_review"),
+            "task": str(active.get("last_task_title") or active.get("last_task_id") or active.get("thread_title") or ""),
+            "thread_id": str(active.get("thread_id") or ""),
+        }
+
+    async def _send_libre_command(self, msg: Message, args: str = "") -> None:
+        raw = (args or "").strip().lower()
+        if raw in {"watch", "logs", "selfcheck"}:
+            return await self._send_libre_watch_command(msg)
+
+        user_id = str(getattr(getattr(msg, "from_user", None), "id", "") or getattr(msg, "chat_id", ""))
+        key = self._libre_context_key(msg, user_id)
+        self._pilot_intake_states.pop(user_id, None)
+        self._repo_new_chat_choices.pop(user_id, None)
+
+        active = None
+        try:
+            _uid, data, active = await self._get_active_cockpit_thread(msg)
+        except Exception:
+            data = None
+            active = None
+
+        handoff_seed = self._libre_handoff_from_active(active)
+        store = self._libre_store()
+        if handoff_seed.get("repo") or handoff_seed.get("thread_id"):
+            store.set_active(key, **handoff_seed)
+        handoff = store.soft_close(key, reason="/libre")
+        self._libre_chat_states[user_id] = {
+            "mode": "libre",
+            "key": key,
+            "last_handoff": handoff,
+            "active_repo": handoff_seed.get("repo", ""),
+            "ts": time.time(),
+        }
+
+        repo = handoff_seed.get("repo") or "aucun repo actif"
+        thread_id = handoff_seed.get("thread_id") or "—"
+        previous_mode = self._mode_title(handoff_seed.get("mode") or "ask_review")
+        lines = [
+            "<b>✅ Mode libre activé</b>",
+            "",
+            "Je quitte le flow chantier/wizard actif sans hard reset.",
+            "Mémoire durable conservée. Historique utile conservé côté Hermes.",
+            "",
+            f"Repo précédent : <code>{_html.escape(repo)}</code>",
+            f"Mode précédent : <b>{_html.escape(previous_mode)}</b>",
+            f"Thread : <code>{_html.escape(thread_id)}</code>",
+            "",
+            "Orchestration auto : je peux rester en chat normal, ou router vers Ask review / Pilote / Autopilot si ton message parle clairement d'un repo.",
+            "Observation runtime : pendant un travail autonome, je rattache les erreurs logs à la tâche en cours au lieu de faire des checkups hors contexte.",
+        ]
+        await self._send_cockpit_text(msg, "\n".join(lines), role="sticky")
+
+    async def _maybe_handle_libre_text(self, msg: Message, text: str) -> bool:
+        clean = (text or "").strip()
+        if not clean or clean.startswith("/"):
+            return False
+        user_id = str(getattr(getattr(msg, "from_user", None), "id", "") or getattr(msg, "chat_id", ""))
+        state = self._libre_chat_states.get(user_id) or {}
+        if state.get("mode") != "libre":
+            return False
+
+        from gateway.libre_orchestrator import classify_libre_message, extract_learning_policy
+
+        decision = classify_libre_message(clean)
+        if decision.action == "learn_policy":
+            policy = extract_learning_policy(clean) or {}
+            stored = self._libre_store().remember_policy(state.get("key") or self._libre_context_key(msg, user_id), policy, source="telegram_libre")
+            details = " · ".join(
+                f"{_html.escape(str(k))}=<code>{_html.escape(str(v))}</code>"
+                for k, v in stored.items()
+                if k in {"scope", "model", "reasoning_effort"}
+            )
+            await self._send_cockpit_text(
+                msg,
+                "<b>✅ Règle apprise</b>\n\n" + (details or "Préférence enregistrée."),
+                role="sticky",
+            )
+            return True
+
+        if decision.action == "switch_repo":
+            await self._send_cockpit_text(
+                msg,
+                "<b>🔁 Switch repo détecté</b>\n\n"
+                "Je garde la note de reprise du chantier précédent et j'ouvre le sélecteur de projet.\n"
+                "Choisis le repo, puis ton prochain message naturel deviendra la tâche.",
+                role="preview",
+            )
+            await self._send_new_command(msg, "pilote")
+            return True
+
+        if decision.action != "repo_task":
+            return False
+
+        user_id, data, active = await self._get_active_cockpit_thread(msg)
+        if not data or not data.get("ok") or not active:
+            await self._send_cockpit_text(
+                msg,
+                "<b>Mode libre</b>\n\nJe détecte une demande de travail repo, mais aucun repo actif n'est attaché.\n"
+                "Ouvre un chantier avec <code>/new</code> puis choisis un repo, ou donne-moi le repo explicitement.",
+                role="preview",
+            )
+            return True
+
+        await self._create_task_from_thread_command(
+            msg,
+            clean,
+            mode=decision.mode,
+            intent=decision.intent,
+            source="telegram_libre_router",
+        )
+        return True
 
     async def _send_clean_command(self, msg: Message, args: str = "") -> None:
         chat_id = str(getattr(msg, "chat_id", "") or getattr(getattr(msg, "chat", None), "id", ""))
@@ -7741,7 +8485,7 @@ class TelegramAdapter(BasePlatformAdapter):
         }.get(status, "Actifs")
 
     def _thread_mode_label(self, mode: str | None) -> str:
-        return "Autopilot" if mode == "autopilot" else "Ask review"
+        return self._mode_title(normalize_cockpit_mode(mode))
 
     def _format_thread_activity_time(self, value: Any) -> str:
         if value in (None, ""):
@@ -8369,6 +9113,9 @@ class TelegramAdapter(BasePlatformAdapter):
         if command_token in {"/new", "/newchat"}:
             await self._send_new_command(msg, command_args)
             return
+        if command_token in {"/libre", "/reset-libre", "/chatlibre"}:
+            await self._send_libre_command(msg, command_args)
+            return
         if command_token == "/dev":
             await self._send_dev_command(msg, command_args)
             return
@@ -8580,6 +9327,11 @@ class TelegramAdapter(BasePlatformAdapter):
                 "[Telegram] Flushing text batch %s (%d chars)",
                 key, len(event.text or ""),
             )
+            original_msg = getattr(event, "_telegram_message", None)
+            if original_msg is not None and await self._maybe_handle_libre_text(original_msg, event.text or ""):
+                return
+            if original_msg is not None and await self._maybe_handle_pilot_intake_text(original_msg, event.text or ""):
+                return
             await self.handle_message(event)
         finally:
             if self._pending_text_batch_tasks.get(key) is current_task:

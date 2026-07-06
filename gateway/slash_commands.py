@@ -1617,6 +1617,173 @@ class GatewaySlashCommandsMixin:
 
         return await _finish_switch()
 
+    async def _apply_session_model_reasoning_pick(
+        self,
+        *,
+        event: MessageEvent,
+        session_key: str,
+        model_id: str,
+        provider_slug: str,
+        reasoning_effort: str,
+        persist_global: bool = False,
+    ) -> str:
+        """Session-scoped model switch plus reasoning effort (Telegram /models)."""
+        from gateway.run import _load_gateway_config
+        from hermes_cli.model_switch import switch_model as _switch_model
+
+        cfg = _load_gateway_config() or {}
+        model_cfg = cfg.get("model", {}) if isinstance(cfg.get("model"), dict) else {}
+        current_model = model_cfg.get("default", "") if isinstance(model_cfg, dict) else ""
+        current_provider = model_cfg.get("provider", "openrouter") if isinstance(model_cfg, dict) else "openrouter"
+        current_base_url = model_cfg.get("base_url", "") if isinstance(model_cfg, dict) else ""
+        current_api_key = model_cfg.get("api_key", "") if isinstance(model_cfg, dict) else ""
+        user_provs = cfg.get("providers")
+        try:
+            from hermes_cli.config import get_compatible_custom_providers
+            custom_provs = get_compatible_custom_providers(cfg)
+        except Exception:
+            custom_provs = cfg.get("custom_providers")
+
+        result = _switch_model(
+            raw_input=model_id,
+            current_provider=current_provider,
+            current_model=current_model,
+            current_base_url=current_base_url,
+            current_api_key=current_api_key,
+            is_global=persist_global,
+            explicit_provider=provider_slug,
+            user_providers=user_provs,
+            custom_providers=custom_provs,
+        )
+        if not result.success:
+            return t("gateway.model.error_prefix", error=result.error_message)
+
+        self._session_model_overrides[session_key] = {
+            "model": result.new_model,
+            "provider": result.target_provider,
+            "api_key": result.api_key,
+            "base_url": result.base_url,
+            "api_mode": result.api_mode,
+        }
+
+        from gateway.telegram_model_quick_picks import reasoning_config_for_effort
+
+        parsed = reasoning_config_for_effort((reasoning_effort or "medium").strip().lower())
+        if parsed is not None:
+            self._set_session_reasoning_override(session_key, parsed)
+            self._reasoning_config = parsed
+
+        self._evict_cached_agent(session_key)
+        effort_label = reasoning_effort or "medium"
+        return (
+            f"✓ Modèle : `{result.new_model}` ({result.target_provider})\n"
+            f"✓ Réflexion (session) : **{effort_label}**"
+        )
+
+    async def _handle_models_command(self, event: MessageEvent) -> Optional[str]:
+        """Handle /models — combined model + reasoning picker on Telegram."""
+        raw_args = (event.get_command_args() or "").strip()
+        source = self._normalize_source_for_session_key(event.source)
+        session_key = self._session_key_for_source(source)
+
+        if raw_args:
+            parts = raw_args.split()
+            model_part = parts[0]
+            effort = parts[1].lower() if len(parts) > 1 else "medium"
+            if effort not in {"none", "minimal", "low", "medium", "high", "xhigh"}:
+                effort = "medium"
+            explicit_provider = None
+            if "--provider" in parts:
+                try:
+                    explicit_provider = parts[parts.index("--provider") + 1]
+                except (ValueError, IndexError):
+                    pass
+            from hermes_cli.model_switch import switch_model as _switch_model, parse_model_flags
+            from gateway.run import _load_gateway_config
+
+            model_input, prov_flag, _, _, _ = parse_model_flags(raw_args)
+            provider = explicit_provider or prov_flag or ""
+            cfg = _load_gateway_config() or {}
+            model_cfg = cfg.get("model", {}) if isinstance(cfg.get("model"), dict) else {}
+            cur_model = model_cfg.get("default", "") if isinstance(model_cfg, dict) else ""
+            cur_provider = model_cfg.get("provider", "openrouter") if isinstance(model_cfg, dict) else "openrouter"
+            cur_base = model_cfg.get("base_url", "") if isinstance(model_cfg, dict) else ""
+            cur_key = model_cfg.get("api_key", "") if isinstance(model_cfg, dict) else ""
+            sw = _switch_model(
+                raw_input=model_input or model_part,
+                current_provider=cur_provider,
+                current_model=cur_model,
+                current_base_url=cur_base,
+                current_api_key=cur_key,
+                is_global=False,
+                explicit_provider=provider or None,
+                user_providers=cfg.get("providers"),
+                custom_providers=cfg.get("custom_providers"),
+            )
+            if not sw.success:
+                return t("gateway.model.error_prefix", error=sw.error_message)
+            return await self._apply_session_model_reasoning_pick(
+                event=event,
+                session_key=session_key,
+                model_id=sw.new_model,
+                provider_slug=sw.target_provider,
+                reasoning_effort=effort,
+                persist_global=False,
+            )
+
+        adapter = self.adapters.get(source.platform)
+        send_picker = getattr(adapter, "send_models_config_picker", None) if adapter else None
+        if not send_picker:
+            return (
+                "Utilise `/model` pour changer de modèle et `/reasoning <niveau>` "
+                "(none, low, medium, high, xhigh) pour la réflexion."
+            )
+
+        override = self._session_model_overrides.get(session_key, {})
+        cfg = None
+        try:
+            from gateway.run import _load_gateway_config
+            cfg = _load_gateway_config() or {}
+        except Exception:
+            cfg = {}
+        model_cfg = cfg.get("model", {}) if isinstance(cfg, dict) else {}
+        current_model = override.get("model") or (model_cfg.get("default") if isinstance(model_cfg, dict) else "")
+        current_provider = override.get("provider") or (model_cfg.get("provider") if isinstance(model_cfg, dict) else "")
+
+        rc = self._resolve_session_reasoning_config(source=event.source, session_key=session_key)
+        if rc and rc.get("enabled") is False:
+            current_effort = "none"
+        elif rc:
+            current_effort = str(rc.get("effort") or "medium")
+        else:
+            current_effort = "medium"
+
+        _self = self
+        _session_key = session_key
+
+        async def _on_apply(_chat_id: str, model_id: str, provider_slug: str, effort: str) -> str:
+            return await _self._apply_session_model_reasoning_pick(
+                event=event,
+                session_key=_session_key,
+                model_id=model_id,
+                provider_slug=provider_slug,
+                reasoning_effort=effort,
+                persist_global=False,
+            )
+
+        metadata = self._thread_metadata_for_source(source, self._reply_anchor_for_event(event))
+        result = await send_picker(
+            chat_id=str(source.chat_id),
+            current_model=current_model or "",
+            current_provider=current_provider or "",
+            current_reasoning=current_effort,
+            on_apply=_on_apply,
+            metadata=metadata,
+        )
+        if getattr(result, "success", False):
+            return None
+        return f"Impossible d'ouvrir le sélecteur : {getattr(result, 'error', 'erreur')}"
+
     async def _handle_codex_runtime_command(self, event: MessageEvent) -> str:
         """Handle /codex-runtime command in the gateway.
 
@@ -3695,6 +3862,16 @@ class GatewaySlashCommandsMixin:
         lines.append("")
         lines.append("Invoke a bundle with `/<slug>` to load all its skills.")
         return "\n".join(lines)
+
+    async def _handle_myskills_command(self, event: MessageEvent) -> str:
+        """Handle /myskills — list personal extension skills (incl. /learn)."""
+        try:
+            from hermes_cli.myskills_cmd import handle_myskills_command
+
+            return handle_myskills_command(surface="gateway")
+        except Exception as exc:
+            logger.warning("Myskills command failed: %s", exc)
+            return f"Myskills command failed: {exc}"
 
     async def _handle_approve_command(self, event: MessageEvent) -> Optional[str]:
         """Handle /approve command — unblock waiting agent thread(s).

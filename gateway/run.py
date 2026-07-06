@@ -3959,6 +3959,70 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         else:
             self._session_reasoning_overrides[session_key] = dict(reasoning_config)
 
+    def _apply_pending_cockpit_thread_prefs(
+        self,
+        source: "SessionSource",
+        session_key: str,
+    ) -> None:
+        """Apply model/reasoning chosen during Repo Cockpit /new to this topic session."""
+        from gateway.cockpit_thread_prefs import pop_pending
+        from gateway.session import Platform
+        from gateway.telegram_model_quick_picks import reasoning_config_for_effort
+        from hermes_cli.model_switch import switch_model as _switch_model
+
+        if source.platform != Platform.TELEGRAM:
+            return
+        thread_id = getattr(source, "thread_id", None)
+        if not thread_id or not session_key:
+            return
+        entry = pop_pending(
+            platform="telegram",
+            chat_id=str(source.chat_id),
+            thread_id=str(thread_id),
+        )
+        if not entry or not entry.get("model"):
+            return
+        cfg = _load_gateway_config() or {}
+        model_cfg = cfg.get("model") if isinstance(cfg.get("model"), dict) else {}
+        if not isinstance(model_cfg, dict):
+            model_cfg = {}
+        result = _switch_model(
+            raw_input=str(entry["model"]),
+            current_provider=str(model_cfg.get("provider") or "openrouter"),
+            current_model=str(model_cfg.get("default") or ""),
+            current_base_url=str(model_cfg.get("base_url") or ""),
+            current_api_key=str(model_cfg.get("api_key") or ""),
+            is_global=False,
+            explicit_provider=str(entry.get("provider") or ""),
+            user_providers=cfg.get("providers") or {},
+            custom_providers=cfg.get("custom_providers"),
+        )
+        if not result.success:
+            logger.warning(
+                "Cockpit thread prefs: model switch failed for %s: %s",
+                session_key,
+                result.error_message,
+            )
+            return
+        self._session_model_overrides[session_key] = {
+            "model": result.new_model,
+            "provider": result.target_provider,
+            "api_key": result.api_key,
+            "base_url": result.base_url,
+            "api_mode": result.api_mode,
+        }
+        effort = str(entry.get("reasoning_effort") or "medium")
+        parsed = reasoning_config_for_effort(effort)
+        if parsed is not None:
+            self._set_session_reasoning_override(session_key, parsed)
+        self._evict_cached_agent(session_key)
+        logger.info(
+            "Applied cockpit LLM prefs to session %s: %s / %s",
+            session_key,
+            result.new_model,
+            effort,
+        )
+
     @staticmethod
     def _load_service_tier() -> str | None:
         """Load Priority Processing setting from config.yaml.
@@ -7783,7 +7847,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 return "No active agent — /steer queued for the next turn."
 
             # /model must not be used while the agent is running.
-            if _cmd_def_inner and _cmd_def_inner.name == "model":
+            if _cmd_def_inner and _cmd_def_inner.name in {"model", "models"}:
                 return "Agent is running — wait or /stop first, then switch models."
 
             # /codex-runtime must not be used while the agent is running.
@@ -8168,6 +8232,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if canonical == "model":
             return await self._handle_model_command(event)
 
+        if canonical == "models":
+            return await self._handle_models_command(event)
+
         if canonical == "codex-runtime":
             return await self._handle_codex_runtime_command(event)
 
@@ -8179,6 +8246,26 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         if canonical == "suggestions":
             return await self._handle_suggestions_command(event)
+
+        if canonical == "learn":
+            _learn_result = await self._handle_learn_command(event)
+            _learn_seed = getattr(_learn_result, "agent_seed", None)
+            if _learn_seed:
+                _ack = getattr(_learn_result, "text", "") or ""
+                if _ack:
+                    try:
+                        adapter = self.adapters.get(source.platform)
+                        if adapter:
+                            _ack_meta = self._thread_metadata_for_source(source)
+                            await adapter.send(str(source.chat_id), _ack, metadata=_ack_meta)
+                    except Exception:
+                        logger.debug("learn ack send failed", exc_info=True)
+                try:
+                    event.text = _learn_seed
+                except Exception:
+                    return getattr(_learn_result, "text", "") or None
+            else:
+                return getattr(_learn_result, "text", "") or None
 
         if canonical == "blueprint":
             _blueprint_result = await self._handle_blueprint_command(event)
@@ -8257,6 +8344,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         if canonical == "bundles":
             return await self._handle_bundles_command(event)
+
+        if canonical == "myskills":
+            return await self._handle_myskills_command(event)
 
         if canonical == "approve":
             return await self._handle_approve_command(event)
@@ -8588,6 +8678,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # matches the consume key at the run_conversation site — even if the
         # session store overrides build_session_key's default behavior.
         session_key = self._session_key_for_source(source)
+        self._apply_pending_cockpit_thread_prefs(source, session_key)
         # Reset only this session's per-call buffer; other sessions may be
         # concurrently preparing multimodal turns on the same runner.
         self._consume_pending_native_image_paths(session_key)
@@ -10512,6 +10603,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except Exception as e:
             logger.debug("suggestions command failed: %s", e)
             return f"Suggestions command failed: {e}"
+
+
+    async def _handle_learn_command(self, event: MessageEvent):
+        """Handle /learn in the gateway (desktop app, Telegram, etc.)."""
+        args = (event.get_command_args() or "").strip()
+        try:
+            from hermes_cli.learn_cmd import handle_learn_command
+
+            return handle_learn_command(args, surface="gateway")
+        except Exception as e:
+            logger.debug("learn command failed: %s", e)
+            from hermes_cli.learn_cmd import LearnCommandResult
+
+            return LearnCommandResult(f"Learn command failed: {e}")
 
     async def _handle_blueprint_command(self, event: MessageEvent):
         """Handle /blueprint in the gateway.

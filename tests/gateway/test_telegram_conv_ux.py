@@ -44,12 +44,15 @@ def test_repo_selected_keyboard_has_compact_followup_actions(monkeypatch):
     rows = markup.inline_keyboard
 
     assert [[button.text for button in row] for row in rows] == [
-        ["Changer repo", "Changer mode"],
+        ["Changer repo", "Ask review"],
+        ["Pilote", "Autopilot"],
         ["Annuler"],
     ]
     assert rows[0][0].callback_data == "rcn:existing:ask_review"
-    assert rows[0][1].callback_data == "rcn:mode:autopilot"
-    assert rows[1][0].callback_data == "rcn:cancel"
+    assert rows[0][1].callback_data == "rcn:mode:ask_review"
+    assert rows[1][0].callback_data == "rcn:mode:pilote"
+    assert rows[1][1].callback_data == "rcn:mode:autopilot"
+    assert rows[2][0].callback_data == "rcn:cancel"
 
 
 def test_audit_task_text_is_bounded_and_readonly():
