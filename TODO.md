@@ -19,8 +19,8 @@ Source : `docs/project/TELEMETRY_STORE_REPORT.md`
 
 ## Priorité 2 — Evals alimentées par traces propres
 
-- Relier les batches d'evals aux événements `events`.
-- Enregistrer pour chaque eval :
+- [x] Relier les batches d'evals aux événements `events`.
+- [x] Enregistrer pour chaque eval :
   - `task_id` / `run_id` ;
   - type d'eval ;
   - modèle ;
@@ -33,6 +33,8 @@ Source : `docs/project/TELEMETRY_STORE_REPORT.md`
 
 ## Priorité 3 — Autonomie basée sur l'historique
 
+- [x] Poser le heartbeat Self-Ops périodique VPS dans `events(kind=selfops_sample)`.
+- [x] Exposer les événements telemetry récents par task.
 - Construire une synthèse périodique des événements par task :
   - ce qui a marché ;
   - ce qui a échoué ;

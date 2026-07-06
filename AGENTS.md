@@ -1265,6 +1265,7 @@ sous `docs/project/` et servent de source de reprise pour les agents :
 - `docs/project/RUNBOOK_REGISTRY_REPORT.md` — Quick win 9.
 - `docs/project/TELEMETRY_STORE_REPORT.md` — Quick win 11.
 - `docs/project/COST_DASHBOARD_REPORT.md` — Quick win 12.
+- `docs/project/SELFOPS_TELEMETRY_AUTONOMY_REPORT.md` — Quick win 13.
 
 Avant de poursuivre une phase, relire le rapport dédié et les contrats
 normatifs dans `docs/brain/03-implementation-contracts.md`.

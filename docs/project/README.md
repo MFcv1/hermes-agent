@@ -30,6 +30,7 @@ directement dans `docs/`).
 | `RUNBOOK_REGISTRY_REPORT.md` | Rapport quick win 9 VPS : registry de runbooks YAML validés, table `runbooks`. |
 | `TELEMETRY_STORE_REPORT.md` | Rapport quick win 11 VPS : store `events`, coûts journaliers, sink telemetry gateway. |
 | `COST_DASHBOARD_REPORT.md` | Rapport quick win 12 VPS : dashboard coût jour/task/modèle depuis telemetry. |
+| `SELFOPS_TELEMETRY_AUTONOMY_REPORT.md` | Rapport quick win 13 VPS : heartbeat self-ops, timeline telemetry, eval events, cost guard. |
 | `AUTONOMIE_V2_IMPLEMENTATION_STATUS.md` | Point de reprise consolidé : phases, preuves, prochaine cible. |
 | `autonomie-v2-symbol-inventory.json` | Inventaire statique des symboles `gateway/run.py` et `gateway/platforms/telegram.py`. |
 
