@@ -398,3 +398,14 @@ python -m py_compile gateway/libre_orchestrator.py gateway/platforms/telegram.py
 - Pas encore d’auto-commit/stash avant switch : handoff soft-close seulement.
 - Prompt d’audit Claude Fable généré : `docs/CLAUDE_FABLE_AUTONOMY_AUDIT_PROMPT.md` côté Hermes local, à utiliser pour obtenir architecture cible + plan de refactor autonomie/polyvalence.
 
+## Mise à jour 2026-07-06 — Autonomie V2 Phase 0 terminée
+
+- Commit Phase 0 poussé : `cc28c1084e feat(phase0): expose deploy health and inventory symbols`.
+- VPS redémarré après backup : `hermes-gateway.service` et `hermes-repo-cockpit.service` actifs.
+- Backup principal : `/home/hermes/restart-backups/autonomie-v2-phase0-pre-restart-20260706-160418`.
+- Repo Cockpit `/health` expose `git_sha=eaa0df9b122373bcbac7ddfaea05daed2cbac8f2` et `started_at`.
+- Gateway runtime status vérifié : `running`, Telegram `connected`, env `HERMES_GIT_SHA=cc28c1084eeeaad13a6f714c71b1b4b7b4be95d7`.
+- Repo Cockpit n’était pas un git checkout : initialisation d’un repo git local de snapshot, avec runtime dirs ignorés (`data/`, `workspaces/`, `runs/`, `supabase/.temp/`, `.venv/`).
+- Rapport complet : `docs/project/PHASE0_COMPLETION_REPORT.md`.
+- Limite connue : le Gateway live Telegram ne publie pas `:8642/health` car `api_server` n’est pas activé ; le code health est prêt, mais la preuve live est via `gateway.status` + systemd env.
+- Prochain départ Phase 1 recommandé : extraction minimale du formatting/OutboundReport Telegram avec tests de caractérisation avant déplacement.
