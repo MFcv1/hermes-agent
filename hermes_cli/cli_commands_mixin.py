@@ -1570,6 +1570,16 @@ class CLICommandsMixin:
             f"Manage with `hermes bundles`.{_RST}"
         )
 
+    def _handle_myskills_command(self, cmd: str) -> None:
+        """In-session ``/myskills`` — personal / learn skills on disk."""
+        from cli import _cprint
+        try:
+            from hermes_cli.myskills_cmd import handle_myskills_command
+
+            _cprint(handle_myskills_command(surface="cli"))
+        except Exception as exc:
+            _cprint(f"\033[1;31mMyskills failed: {exc}\033[0m")
+
     def _handle_browser_command(self, cmd: str):
         """Handle /browser connect|disconnect|status — manage live Chromium-family CDP connection."""
         import platform as _plat
@@ -2386,3 +2396,24 @@ class CLICommandsMixin:
         else:
             _cprint(f"Unknown voice subcommand: {subcommand}")
             _cprint("Usage: /voice [on|off|tts|status]")
+
+    def _handle_learn_command(self, command: str):
+        """Handle /learn — author a skill from URLs, files, or a brief."""
+        import shlex
+        from cli import _cprint
+
+        try:
+            tokens = shlex.split(command)[1:] if command else []
+        except ValueError:
+            tokens = (command or "").split()[1:]
+        args = " ".join(shlex.quote(t) for t in tokens)
+        try:
+            from hermes_cli.learn_cmd import handle_learn_command
+
+            result = handle_learn_command(args, surface="cli")
+        except Exception as e:
+            _cprint(f"Learn command failed: {e}")
+            return
+        self._console_print(result.text)
+        if result.agent_seed:
+            self._pending_agent_seed = result.agent_seed

@@ -391,13 +391,16 @@ def list_archived_skill_names() -> List[str]:
     return sorted({p.name for p in archive_root.iterdir() if p.is_dir()})
 
 
-def _read_skill_name(skill_md: Path, fallback: str) -> str:
-    """Parse the `name:` field from a SKILL.md YAML frontmatter."""
+def _read_skill_frontmatter_field(skill_md: Path, field: str, fallback: str = "") -> str:
+    """Parse a simple scalar field from SKILL.md YAML frontmatter."""
     try:
-        text = skill_md.read_text(encoding="utf-8", errors="replace")[:4000]
+        text = skill_md.read_text(encoding="utf-8", errors="replace")[:8000]
     except OSError:
         return fallback
     in_frontmatter = False
+    prefix = f"{field}:"
+    collecting = False
+    value_lines: list[str] = []
     for line in text.split("\n"):
         stripped = line.strip()
         if stripped == "---":
@@ -405,11 +408,31 @@ def _read_skill_name(skill_md: Path, fallback: str) -> str:
                 break
             in_frontmatter = True
             continue
-        if in_frontmatter and stripped.startswith("name:"):
-            value = stripped.split(":", 1)[1].strip().strip("\"'")
-            if value:
-                return value
+        if not in_frontmatter:
+            continue
+        if collecting:
+            if line.startswith(" ") or line.startswith("\t"):
+                value_lines.append(stripped)
+                continue
+            break
+        if stripped.startswith(prefix):
+            rest = stripped.split(":", 1)[1].strip()
+            if rest in ("|", ">"):
+                collecting = True
+                continue
+            return rest.strip("\"'") or fallback
+    if value_lines:
+        return " ".join(value_lines).strip() or fallback
     return fallback
+
+
+def _read_skill_name(skill_md: Path, fallback: str) -> str:
+    """Parse the `name:` field from a SKILL.md YAML frontmatter."""
+    return _read_skill_frontmatter_field(skill_md, "name", fallback) or fallback
+
+
+def _read_skill_description(skill_md: Path) -> str:
+    return _read_skill_frontmatter_field(skill_md, "description", "")
 
 
 def is_agent_created(skill_name: str) -> bool:
@@ -857,6 +880,88 @@ def provenance(skill_name: str) -> str:
     if is_bundled(skill_name):
         return "bundled"
     return "agent"
+
+
+def list_personal_skill_names() -> List[str]:
+    """Skills installed locally that are not hub/bundled built-ins.
+
+    These are the user's extensions: ``/learn`` output, agent ``skill_manage``,
+    or hand-authored copies under ``~/.hermes/skills/``.
+    """
+    base = _skills_dir()
+    if not base.exists():
+        return []
+    hub = _read_hub_installed_names()
+    bundled = _read_bundled_manifest_names()
+    names: List[str] = []
+    for skill_md in base.rglob("SKILL.md"):
+        if is_excluded_skill_path(skill_md):
+            continue
+        try:
+            skill_md.relative_to(base)
+        except ValueError:
+            continue
+        name = _read_skill_name(skill_md, fallback=skill_md.parent.name)
+        if name in hub or name in bundled:
+            continue
+        if is_protected_builtin(name):
+            continue
+        names.append(name)
+    return sorted(set(names))
+
+
+def _skill_origin_label(skill_name: str, record: Dict[str, Any], skill_md: Path) -> str:
+    if record.get("created_by") == "agent" or record.get("agent_created") is True:
+        return "créé par l'agent (/learn ou skill_manage)"
+    meta = _read_skill_frontmatter_field(skill_md, "metadata", "")
+    try:
+        head = skill_md.read_text(encoding="utf-8", errors="replace")[:4000]
+    except OSError:
+        head = ""
+    if "source: learn" in head or "source:learn" in head.replace(" ", ""):
+        return "via /learn"
+    if (record.get("patch_count") or 0) > 0 or (record.get("use_count") or 0) > 0:
+        return "modifié par l'agent"
+    return "skill perso (local)"
+
+
+def myskills_report() -> List[Dict[str, Any]]:
+    """Rows for ``/myskills``: name, description, path, usage hints."""
+    base = _skills_dir()
+    data = load_usage()
+    by_name: Dict[str, Path] = {}
+    for skill_md in base.rglob("SKILL.md"):
+        if is_excluded_skill_path(skill_md):
+            continue
+        name = _read_skill_name(skill_md, fallback=skill_md.parent.name)
+        if name not in list_personal_skill_names():
+            continue
+        by_name[name] = skill_md
+
+    rows: List[Dict[str, Any]] = []
+    for name in sorted(by_name.keys()):
+        skill_md = by_name[name]
+        raw = data.get(name)
+        rec: Dict[str, Any] = raw if isinstance(raw, dict) else {}
+        try:
+            rel = str(skill_md.parent.relative_to(base))
+        except ValueError:
+            rel = str(skill_md.parent)
+        rows.append(
+            {
+                "name": name,
+                "description": _read_skill_description(skill_md),
+                "relative_dir": rel,
+                "pinned": bool(rec.get("pinned")),
+                "origin_label": _skill_origin_label(name, rec, skill_md),
+                "last_activity_at": latest_activity_at(rec) if rec else None,
+            }
+        )
+    rows.sort(
+        key=lambda r: (r.get("last_activity_at") or "", r["name"]),
+        reverse=True,
+    )
+    return rows
 
 
 def usage_report() -> List[Dict[str, Any]]:
