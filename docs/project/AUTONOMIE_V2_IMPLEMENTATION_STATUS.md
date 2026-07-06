@@ -83,19 +83,20 @@ Quick wins réalisés après la Phase 7 :
 
 - Quick win 9 — Skill / Runbook Registry : `RUNBOOK_REGISTRY_REPORT.md`.
 - Quick win 11 — Telemetry Store : `TELEMETRY_STORE_REPORT.md`.
+- Quick win 12 — Cost Dashboard : `COST_DASHBOARD_REPORT.md`.
 
 Prochaine cible possible :
 
 ```text
-VPS Self-Ops heartbeat / intégration cost dashboard
+VPS Self-Ops heartbeat
 ```
 
 Ordre conseillé :
 
 1. Relire `docs/brain/03-implementation-contracts.md`.
-2. Relire `PHASE7_AUTONOMY_STATUS_UX_REPORT.md`, `RUNBOOK_REGISTRY_REPORT.md` et `TELEMETRY_STORE_REPORT.md`.
+2. Relire `PHASE7_AUTONOMY_STATUS_UX_REPORT.md`, `RUNBOOK_REGISTRY_REPORT.md`, `TELEMETRY_STORE_REPORT.md` et `COST_DASHBOARD_REPORT.md`.
 3. Relire `docs/brain/04-cost-engine.md` et `docs/brain/05-vps-selfops.md`.
-4. Brancher le dashboard sur `/api/internal/costs/daily` ou ajouter un heartbeat VPS explicite.
+4. Ajouter un heartbeat VPS explicite qui écrit dans `events(kind=selfops_sample)`.
 5. Garder les événements metadata-only ; jamais de secrets ni messages complets.
 
 ## À ne pas faire maintenant
