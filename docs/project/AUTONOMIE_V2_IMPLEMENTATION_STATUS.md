@@ -20,7 +20,7 @@ Ces documents sont la source à suivre pour les prochaines sessions. En cas de c
 | Phase 1 — extraction modules gateway | Terminé côté code local, sync VPS non fait | `PHASE1_COMPLETION_REPORT.md` |
 | Phase 2 — observation bus + contrats | Terminé côté gateway + backend VPS | `PHASE2_OBSERVATION_BUS_REPORT.md` |
 | Phase 3 — worker runtime engine | Terminé côté backend/worker VPS | `PHASE3_WORKER_RUNTIME_ENGINE_REPORT.md` |
-| Phase 4 — self-repair v2 | Pas commencé | Ne pas démarrer sans `policy_engine` + snapshot/rollback testés |
+| Phase 4 — self-repair v2 | Terminé côté backend/worker VPS | `PHASE4_SELF_REPAIR_V2_REPORT.md` |
 | Phase 5 — memory/handoff unifié | Pas commencé | `ActiveWorkStore` JSON existe encore |
 | Phase 6 — eval harness | Pas commencé | À créer après extraction orchestrator/classifier |
 | Phase 7 — dashboard/admin UX | Pas commencé | À repousser après les fondations |
@@ -42,29 +42,37 @@ Le pattern actuel est volontairement conservateur :
 - les nouveaux modules sont purs ou injectent leurs dépendances Telegram ;
 - chaque extraction a un test de caractérisation dédié.
 
+## Phase 4 déjà faite
+
+- `policies.yaml` ajouté côté Repo Cockpit avec `feature_flags.self_repair_v2`.
+- `backend/policy_engine.py` ajouté : unknown action -> `ask_human`, secrets -> `ask_human`, repair auto seulement en `autopilot` severity <= medium.
+- `scripts/worker/self_repair.py` ajouté : replay déterministe, snapshot git `repair/<task>/<attempt>`, budget par task, rollback `git reset --hard` + `git clean -fd`.
+- `operation_worker.py` bascule vers v2 si le flag est actif ; l'ancien chemin V1 reste derrière le flag.
+- Tests live : policy, e2e repair, rollback on worsen, budget exhausted, secret escalation no repair.
+
 ## Point de reprise recommandé
 
-Passer à la Phase 4 seulement après validation humaine du résultat Phase 3.
+Passer à la Phase 5 après validation humaine du résultat Phase 4.
 
 Prochaine cible :
 
 ```text
-Self-repair v2
+Memory / handoff unifié
 ```
 
 Ordre conseillé :
 
 1. Relire `docs/brain/03-implementation-contracts.md`.
-2. Relire `PHASE2_OBSERVATION_BUS_REPORT.md` et `PHASE3_WORKER_RUNTIME_ENGINE_REPORT.md`.
-3. Implémenter `policy_engine.py` + `policies.yaml`.
-4. Ajouter snapshots/rollback par tentative avant tout repair automatique plus ambitieux.
-5. Garder le budget de repair par task, pas par observation.
+2. Relire `PHASE2_OBSERVATION_BUS_REPORT.md`, `PHASE3_WORKER_RUNTIME_ENGINE_REPORT.md` et `PHASE4_SELF_REPAIR_V2_REPORT.md`.
+3. Remplacer `ActiveWorkStore` JSON par une source durable unifiée.
+4. Brancher les handoffs worker/gateway sur cette source.
+5. Garder la compatibilité lecture avec les anciens fichiers JSON jusqu'à migration complète.
 
 ## À ne pas faire maintenant
 
 - Ne pas synchroniser/restart VPS sans validation humaine explicite, sauf reprise directe d'une phase déjà demandée en live.
 - Ne pas ajouter de watcher global : toute observation doit rester attachée à un `task_id`.
-- Ne pas démarrer le self-repair v2 avant PolicyEngine + snapshots + rollback testés.
+- Ne pas étendre le self-repair v2 à des actions externes tant que la policy ne les autorise pas explicitement.
 
 ## Commandes de vérification Phase 1
 
