@@ -79,19 +79,23 @@ Le pattern actuel est volontairement conservateur :
 
 La roadmap principale Autonomie V2 est terminée jusqu'à la Phase 7.
 
+Quick wins réalisés après la Phase 7 :
+
+- Quick win 9 — Skill / Runbook Registry : `RUNBOOK_REGISTRY_REPORT.md`.
+
 Prochaine cible possible :
 
 ```text
-Quick win 9 — Skill / Runbook Registry
+Quick win 11 — Telemetry Store
 ```
 
 Ordre conseillé :
 
 1. Relire `docs/brain/03-implementation-contracts.md`.
-2. Relire `PHASE6_EVAL_HARNESS_REPORT.md` et `PHASE7_AUTONOMY_STATUS_UX_REPORT.md`.
-3. Implémenter `repo-cockpit/runbooks/*.yaml` + loader `backend/runbooks.py`.
-4. Tester le schéma runbook : verify et rollback obligatoires.
-5. Ne pas ajouter d'action dangereuse hors policy explicite.
+2. Relire `PHASE6_EVAL_HARNESS_REPORT.md`, `PHASE7_AUTONOMY_STATUS_UX_REPORT.md` et `RUNBOOK_REGISTRY_REPORT.md`.
+3. Créer `repo-cockpit/backend/telemetry.py` + table append-only `events`.
+4. Stocker des métadonnées et références uniquement ; jamais de secrets ni messages complets.
+5. Brancher les evals/dashboard sur cette source sans casser le cache prompt.
 
 ## À ne pas faire maintenant
 
