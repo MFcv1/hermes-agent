@@ -10,6 +10,7 @@ from gateway.libre_orchestrator import (
     extract_learning_policy,
     scan_watch_logs,
 )
+from gateway.memory.handoff_store import HandoffStore
 
 
 def test_classify_libre_message_keeps_normal_chat_free():
@@ -45,6 +46,13 @@ def test_classify_libre_message_detects_repo_switch_request():
     assert decision.intent == "switch_repo"
 
 
+def test_classify_libre_message_detects_resume_intent():
+    decision = classify_libre_message("reprends le chantier d'hier")
+
+    assert decision.action == "resume"
+    assert decision.intent == "resume"
+
+
 def test_extract_learning_policy_detects_plan_model_reasoning():
     policy = extract_learning_policy("Pour les plans importants mets toi en GPT-5.5 xhigh")
 
@@ -62,6 +70,7 @@ def test_active_work_store_soft_close_keeps_handoff_note(tmp_path: Path):
         repo="MFcv1/hermes-agent",
         mode="pilote",
         task="Améliorer /new",
+        task_id="op_123",
         thread_id="thread_123",
     )
 
@@ -70,7 +79,32 @@ def test_active_work_store_soft_close_keeps_handoff_note(tmp_path: Path):
     assert "MFcv1/hermes-agent" in note["summary"]
     assert note["reason"] == "/libre"
     assert store.get_active(key)["mode"] == "libre"
-    assert store.get_active(key)["last_handoff"]["thread_id"] == "thread_123"
+    assert note["task_id"] == "op_123"
+    assert store.latest_handoff(key)["thread_id"] == "thread_123"
+
+
+def test_handoff_store_migrates_legacy_json_and_consumes(tmp_path: Path):
+    legacy = tmp_path / "state.json"
+    legacy.write_text(
+        """
+        {
+          "contexts": {"telegram:100::42": {"repo": "MFcv1/demo", "mode": "pilote", "task_id": "op_old"}},
+          "handoffs": [{"id": "handoff_old", "conversation_key": "telegram:100::42", "task_id": "op_old", "summary": "old handoff", "created_at": 1}],
+          "policies": []
+        }
+        """,
+        encoding="utf-8",
+    )
+    store = HandoffStore(tmp_path / "handoffs.sqlite", legacy_json_path=legacy)
+
+    active = store.get_active("telegram:100::42")
+    latest = store.latest_handoff("telegram:100::42")
+    consumed = store.mark_consumed("telegram:100::42")
+
+    assert active["repo"] == "MFcv1/demo"
+    assert latest["task_id"] == "op_old"
+    assert consumed["consumed_at"] is not None
+    assert store.latest_handoff("telegram:100::42") is None
 
 
 def test_scan_watch_logs_reports_repeated_errors(tmp_path: Path):

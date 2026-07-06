@@ -9,19 +9,19 @@ use them without growing the model tool schema or rebuilding prompts mid-session
 
 from __future__ import annotations
 
-import json
 import re
-import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
+
+from gateway.memory.handoff_store import HandoffStore
 
 
 @dataclass(frozen=True)
 class LibreDecision:
     """Routing decision for a natural Libre-mode message."""
 
-    action: str = "chat"  # chat | repo_task | learn_policy
+    action: str = "chat"  # chat | repo_task | resume | learn_policy
     mode: str = "libre"   # libre | ask_review | pilote | autopilot
     intent: str = "general"
     requires_active_repo: bool = False
@@ -54,6 +54,16 @@ def classify_libre_message(text: str) -> LibreDecision:
             reason="explicit model/reasoning learning preference",
         )
 
+    resume_markers = (
+        "reprends",
+        "reprend",
+        "continue",
+        "continuons",
+        "où on en était",
+        "ou on en etait",
+        "chantier d'hier",
+        "reprise chantier",
+    )
     deploy_markers = ("déploi", "deploi", "deploy", "prod", "preview", "vps")
     switch_markers = ("passe sur", "switch", "change de repo", "changer de repo", "reprends le repo", "reprend le repo")
     bug_markers = ("bug", "corrige", "fix", "erreur", "crash", "cass", "répare", "repare")
@@ -69,6 +79,16 @@ def classify_libre_message(text: str) -> LibreDecision:
     wants_feature = any(marker in clean for marker in feature_markers)
     wants_review = any(marker in clean for marker in ask_review_markers)
     wants_autopilot = any(marker in clean for marker in autopilot_markers)
+
+    if any(marker in clean for marker in resume_markers):
+        return LibreDecision(
+            action="resume",
+            mode="pilote",
+            intent="resume",
+            requires_active_repo=False,
+            confidence=0.84,
+            reason="resume intent detected",
+        )
 
     if wants_switch:
         return LibreDecision(
@@ -144,79 +164,30 @@ def extract_learning_policy(text: str) -> dict[str, str] | None:
 
 
 class ActiveWorkStore:
-    """Tiny JSON store for active Libre work context and handoff notes."""
+    """Compatibility facade over the Phase 5 SQLite handoff store."""
 
     def __init__(self, path: str | Path):
         self.path = Path(path)
-
-    def _load(self) -> dict[str, Any]:
-        if not self.path.exists():
-            return {"contexts": {}, "policies": [], "handoffs": []}
-        try:
-            data = json.loads(self.path.read_text(encoding="utf-8"))
-        except Exception:
-            return {"contexts": {}, "policies": [], "handoffs": []}
-        if not isinstance(data, dict):
-            return {"contexts": {}, "policies": [], "handoffs": []}
-        data.setdefault("contexts", {})
-        data.setdefault("policies", [])
-        data.setdefault("handoffs", [])
-        return data
-
-    def _save(self, data: dict[str, Any]) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = self.path.with_suffix(self.path.suffix + ".tmp")
-        tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
-        tmp.replace(self.path)
+        sqlite_path = self.path.with_suffix(".sqlite") if self.path.suffix == ".json" else self.path
+        self._store = HandoffStore(sqlite_path, legacy_json_path=self.path if self.path.suffix == ".json" else None)
 
     def get_active(self, key: str) -> dict[str, Any]:
-        data = self._load()
-        ctx = (data.get("contexts") or {}).get(str(key))
-        return dict(ctx) if isinstance(ctx, dict) else {"mode": "libre"}
+        return self._store.get_active(key)
 
     def set_active(self, key: str, **updates: Any) -> dict[str, Any]:
-        data = self._load()
-        contexts = data.setdefault("contexts", {})
-        ctx = dict(contexts.get(str(key)) or {})
-        ctx.update({k: v for k, v in updates.items() if v not in (None, "")})
-        ctx.setdefault("mode", "libre")
-        ctx["updated_at"] = int(time.time())
-        contexts[str(key)] = ctx
-        self._save(data)
-        return ctx
+        return self._store.set_active(key, **updates)
 
     def soft_close(self, key: str, *, reason: str = "/libre") -> dict[str, Any]:
-        data = self._load()
-        contexts = data.setdefault("contexts", {})
-        current = dict(contexts.get(str(key)) or {})
-        handoff = {
-            "created_at": int(time.time()),
-            "reason": reason,
-            "repo": current.get("repo", ""),
-            "mode": current.get("mode", ""),
-            "task": current.get("task", ""),
-            "thread_id": current.get("thread_id", ""),
-        }
-        repo = handoff["repo"] or "aucun repo actif"
-        mode = handoff["mode"] or "mode inconnu"
-        task = handoff["task"] or "aucune tâche résumée"
-        handoff["summary"] = f"Soft-close {repo} ({mode}) — reprise: {task}"
-        data.setdefault("handoffs", []).append(handoff)
-        contexts[str(key)] = {
-            "mode": "libre",
-            "updated_at": int(time.time()),
-            "last_handoff": handoff,
-        }
-        self._save(data)
-        return handoff
+        return self._store.soft_close(key, reason=reason)
+
+    def latest_handoff(self, key: str, *, include_consumed: bool = False) -> dict[str, Any] | None:
+        return self._store.latest_handoff(key, include_consumed=include_consumed)
+
+    def cache_handoff(self, key: str, handoff: dict[str, Any]) -> dict[str, Any]:
+        return self._store.cache_handoff(key, handoff)
 
     def remember_policy(self, key: str, policy: dict[str, str], *, source: str = "telegram") -> dict[str, str]:
-        data = self._load()
-        stored = dict(policy)
-        stored.update({"key": str(key), "source": source, "created_at": str(int(time.time()))})
-        data.setdefault("policies", []).append(stored)
-        self._save(data)
-        return stored
+        return self._store.remember_policy(key, policy, source=source)
 
 
 def scan_watch_logs(paths: Iterable[str | Path], *, limit: int = 30) -> dict[str, Any]:

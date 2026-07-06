@@ -24,6 +24,7 @@ directement dans `docs/`).
 | `PHASE2_OBSERVATION_BUS_REPORT.md` | Rapport Phase 2 locale : reporter gateway, payload v2, compat v1, masquage. |
 | `PHASE3_WORKER_RUNTIME_ENGINE_REPORT.md` | Rapport Phase 3 VPS : state machine, runs, CommandSpan, corrélation observations. |
 | `PHASE4_SELF_REPAIR_V2_REPORT.md` | Rapport Phase 4 VPS : policy engine, self-repair v2, snapshots, rollback, budget. |
+| `PHASE5_MEMORY_HANDOFF_STORE_REPORT.md` | Rapport Phase 5 VPS : handoffs Cockpit, cache SQLite gateway, reprise via parent task. |
 | `AUTONOMIE_V2_IMPLEMENTATION_STATUS.md` | Point de reprise consolidé : phases, preuves, prochaine cible. |
 | `autonomie-v2-symbol-inventory.json` | Inventaire statique des symboles `gateway/run.py` et `gateway/platforms/telegram.py`. |
 

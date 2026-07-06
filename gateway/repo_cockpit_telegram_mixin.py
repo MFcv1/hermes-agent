@@ -1175,6 +1175,7 @@ class RepoCockpitTelegramMixin:
         *,
         mode: str | None = None,
         intent: str | None = None,
+        parent_task_id: str | None = None,
         source: str = "telegram_task_command",
     ) -> None:
         user_id = str(getattr(getattr(msg, "from_user", None), "id", "") or getattr(msg, "chat_id", ""))
@@ -1188,6 +1189,8 @@ class RepoCockpitTelegramMixin:
             payload["mode"] = normalize_cockpit_mode(mode)
         if intent:
             payload["intent"] = str(intent)
+        if parent_task_id:
+            payload["parent_task_id"] = str(parent_task_id)
         data = await asyncio.to_thread(self._cockpit_api_sync, "POST", "/api/internal/tasks/from-thread", payload, 30)
         if not data.get("ok"):
             return await self._send_cockpit_text(

@@ -21,7 +21,7 @@ Ces documents sont la source à suivre pour les prochaines sessions. En cas de c
 | Phase 2 — observation bus + contrats | Terminé côté gateway + backend VPS | `PHASE2_OBSERVATION_BUS_REPORT.md` |
 | Phase 3 — worker runtime engine | Terminé côté backend/worker VPS | `PHASE3_WORKER_RUNTIME_ENGINE_REPORT.md` |
 | Phase 4 — self-repair v2 | Terminé côté backend/worker VPS | `PHASE4_SELF_REPAIR_V2_REPORT.md` |
-| Phase 5 — memory/handoff unifié | Pas commencé | `ActiveWorkStore` JSON existe encore |
+| Phase 5 — memory/handoff unifié | Terminé côté backend/gateway VPS | `PHASE5_MEMORY_HANDOFF_STORE_REPORT.md` |
 | Phase 6 — eval harness | Pas commencé | À créer après extraction orchestrator/classifier |
 | Phase 7 — dashboard/admin UX | Pas commencé | À repousser après les fondations |
 
@@ -50,29 +50,39 @@ Le pattern actuel est volontairement conservateur :
 - `operation_worker.py` bascule vers v2 si le flag est actif ; l'ancien chemin V1 reste derrière le flag.
 - Tests live : policy, e2e repair, rollback on worsen, budget exhausted, secret escalation no repair.
 
+## Phase 5 déjà faite
+
+- Table `handoffs` côté Repo Cockpit + endpoints internes task-scoped.
+- `operation_queue.parent_task_id` ajouté pour garder le lineage de reprise.
+- `gateway/memory/handoff_store.py` ajouté : cache SQLite avec migration de l'ancien JSON `ActiveWorkStore`.
+- `/libre` écrit maintenant un handoff lié au dernier `task_id` Cockpit quand disponible.
+- Le classifieur Libre reconnaît l'intention `resume`; la task suivante peut être créée avec `parent_task_id`.
+- Tests live : `test_handoff_roundtrip`, gateway smoke, anciens tests Phase 2/3/4.
+
 ## Point de reprise recommandé
 
-Passer à la Phase 5 après validation humaine du résultat Phase 4.
+Passer à la Phase 6 après validation humaine du résultat Phase 5.
 
 Prochaine cible :
 
 ```text
-Memory / handoff unifié
+Eval harness + golden scenarios
 ```
 
 Ordre conseillé :
 
 1. Relire `docs/brain/03-implementation-contracts.md`.
-2. Relire `PHASE2_OBSERVATION_BUS_REPORT.md`, `PHASE3_WORKER_RUNTIME_ENGINE_REPORT.md` et `PHASE4_SELF_REPAIR_V2_REPORT.md`.
-3. Remplacer `ActiveWorkStore` JSON par une source durable unifiée.
-4. Brancher les handoffs worker/gateway sur cette source.
-5. Garder la compatibilité lecture avec les anciens fichiers JSON jusqu'à migration complète.
+2. Relire `PHASE2_OBSERVATION_BUS_REPORT.md`, `PHASE3_WORKER_RUNTIME_ENGINE_REPORT.md`, `PHASE4_SELF_REPAIR_V2_REPORT.md` et `PHASE5_MEMORY_HANDOFF_STORE_REPORT.md`.
+3. Créer les golden scenarios pour `chat|repo_task|resume|status|policy`.
+4. Ajouter un runner d'évaluation qui compare expected/actual JSON.
+5. Stocker les résultats dans la future table `evaluations`.
 
 ## À ne pas faire maintenant
 
 - Ne pas synchroniser/restart VPS sans validation humaine explicite, sauf reprise directe d'une phase déjà demandée en live.
 - Ne pas ajouter de watcher global : toute observation doit rester attachée à un `task_id`.
 - Ne pas étendre le self-repair v2 à des actions externes tant que la policy ne les autorise pas explicitement.
+- Ne pas supprimer l'ancien JSON Libre tant que la migration n'a pas été observée sur plusieurs reprises réelles.
 
 ## Commandes de vérification Phase 1
 

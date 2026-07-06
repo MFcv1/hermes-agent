@@ -10,6 +10,7 @@ import os
 import re
 import subprocess
 import time
+import urllib.parse
 from datetime import datetime, timezone
 from typing import Any, Dict
 
@@ -195,8 +196,48 @@ class TelegramConversationsMixin:
             "repo": str(active.get("repo") or ""),
             "mode": normalize_cockpit_mode(active.get("thread_mode") or active.get("project_mode") or "ask_review"),
             "task": str(active.get("last_task_title") or active.get("last_task_id") or active.get("thread_title") or ""),
+            "task_id": str(active.get("last_task_id") or ""),
+            "parent_task_id": str(active.get("parent_task_id") or ""),
             "thread_id": str(active.get("thread_id") or ""),
         }
+
+    async def _persist_libre_handoff_to_cockpit(self, handoff: dict, key: str) -> dict | None:
+        task_id = str(handoff.get("task_id") or "")
+        if not task_id:
+            return None
+        payload = {
+            "reason": str(handoff.get("reason") or "/libre"),
+            "summary": str(handoff.get("summary") or "Handoff Libre"),
+            "resume_hints": handoff.get("resume_hints") if isinstance(handoff.get("resume_hints"), dict) else {
+                "repo": handoff.get("repo", ""),
+                "mode": handoff.get("mode", ""),
+                "task": handoff.get("task", ""),
+                "task_id": task_id,
+                "thread_id": handoff.get("thread_id", ""),
+            },
+            "conversation_key": key,
+            "source": "telegram_libre",
+            "payload": {"local_handoff_id": handoff.get("id")},
+        }
+        data = await asyncio.to_thread(self._cockpit_api_sync, "POST", f"/api/internal/tasks/{task_id}/handoff", payload, 20)
+        if data and data.get("ok") and isinstance(data.get("handoff"), dict):
+            try:
+                self._libre_store().cache_handoff(key, {**handoff, **data["handoff"], "source": "repo_cockpit"})
+            except Exception:
+                logger.debug("[%s] Failed to cache Repo Cockpit handoff", self.name, exc_info=True)
+        return data
+
+    async def _fetch_libre_handoff_from_cockpit(self, key: str, task_id: str | None = None) -> dict | None:
+        if task_id:
+            path = f"/api/internal/tasks/{task_id}/handoff"
+        else:
+            path = "/api/internal/handoffs/latest?conversation_key=" + urllib.parse.quote(key, safe="")
+        data = await asyncio.to_thread(self._cockpit_api_sync, "GET", path, None, 20)
+        if data and data.get("ok") and isinstance(data.get("handoff"), dict):
+            handoff = data["handoff"]
+            self._libre_store().cache_handoff(key, handoff)
+            return handoff
+        return None
 
     async def _send_libre_command(self, msg: Message, args: str = "") -> None:
         raw = (args or "").strip().lower()
@@ -220,6 +261,9 @@ class TelegramConversationsMixin:
         if handoff_seed.get("repo") or handoff_seed.get("thread_id"):
             store.set_active(key, **handoff_seed)
         handoff = store.soft_close(key, reason="/libre")
+        cockpit_handoff = await self._persist_libre_handoff_to_cockpit(handoff, key)
+        if cockpit_handoff and cockpit_handoff.get("ok") and isinstance(cockpit_handoff.get("handoff"), dict):
+            handoff = {**handoff, **cockpit_handoff["handoff"]}
         self._libre_chat_states[user_id] = {
             "mode": "libre",
             "key": key,
@@ -230,6 +274,7 @@ class TelegramConversationsMixin:
 
         repo = handoff_seed.get("repo") or "aucun repo actif"
         thread_id = handoff_seed.get("thread_id") or "—"
+        task_id = handoff.get("task_id") or "—"
         previous_mode = self._mode_title(handoff_seed.get("mode") or "ask_review")
         lines = [
             "<b>✅ Mode libre activé</b>",
@@ -240,6 +285,7 @@ class TelegramConversationsMixin:
             f"Repo précédent : <code>{_html.escape(repo)}</code>",
             f"Mode précédent : <b>{_html.escape(previous_mode)}</b>",
             f"Thread : <code>{_html.escape(thread_id)}</code>",
+            f"Task : <code>{_html.escape(str(task_id))}</code>",
             "",
             "Orchestration auto : je peux rester en chat normal, ou router vers Ask review / Pilote / Autopilot si ton message parle clairement d'un repo.",
             "Observation runtime : pendant un travail autonome, je rattache les erreurs logs à la tâche en cours au lieu de faire des checkups hors contexte.",
@@ -284,6 +330,44 @@ class TelegramConversationsMixin:
             await self._send_new_command(msg, "pilote")
             return True
 
+        if decision.action == "resume":
+            key = state.get("key") or self._libre_context_key(msg, user_id)
+            store = self._libre_store()
+            local_handoff = store.latest_handoff(key)
+            task_id = str((local_handoff or {}).get("task_id") or "")
+            handoff = await self._fetch_libre_handoff_from_cockpit(key, task_id=task_id or None)
+            if not handoff:
+                handoff = local_handoff
+            if not handoff:
+                await self._send_cockpit_text(
+                    msg,
+                    "<b>Reprise</b>\n\nJe n'ai pas encore de handoff fiable pour ce chat. Ouvre un chantier avec <code>/new</code>, ou donne-moi le repo explicitement.",
+                    role="preview",
+                )
+                return True
+            resume_hints = handoff.get("resume_hints") if isinstance(handoff.get("resume_hints"), dict) else {}
+            parent_task_id = str(handoff.get("task_id") or resume_hints.get("task_id") or "")
+            store.set_active(
+                key,
+                repo=handoff.get("repo") or resume_hints.get("repo") or "",
+                mode=handoff.get("mode") or resume_hints.get("mode") or "pilote",
+                task=handoff.get("summary") or resume_hints.get("task") or "",
+                task_id=parent_task_id,
+                parent_task_id=parent_task_id,
+                thread_id=handoff.get("thread_id") or resume_hints.get("thread_id") or "",
+            )
+            self._libre_chat_states[user_id] = {**state, "mode": "libre", "key": key, "last_handoff": handoff, "resume_parent_task_id": parent_task_id}
+            await self._send_cockpit_text(
+                msg,
+                "<b>🔁 Reprise retrouvée</b>\n\n"
+                f"Task source : <code>{_html.escape(parent_task_id or '—')}</code>\n"
+                f"Repo : <code>{_html.escape(str(handoff.get('repo') or resume_hints.get('repo') or '—'))}</code>\n"
+                f"Résumé : {_html.escape(str(handoff.get('summary') or 'Handoff retrouvé'))}\n\n"
+                "Ton prochain message de travail repo sera rattaché à ce lineage.",
+                role="sticky",
+            )
+            return True
+
         if decision.action != "repo_task":
             return False
 
@@ -302,6 +386,7 @@ class TelegramConversationsMixin:
             clean,
             mode=decision.mode,
             intent=decision.intent,
+            parent_task_id=str(state.get("resume_parent_task_id") or (state.get("last_handoff") or {}).get("task_id") or ""),
             source="telegram_libre_router",
         )
         return True

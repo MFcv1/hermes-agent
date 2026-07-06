@@ -166,9 +166,30 @@ async def test_libre_command_soft_closes_pilot_state_without_hard_reset(monkeypa
         "repo": "MFcv1/hermes-agent",
         "thread_id": "thread_123",
         "thread_mode": "pilote",
+        "last_task_id": "op_123",
         "last_task_title": "Améliorer /new",
     }
     adapter._get_active_cockpit_thread = AsyncMock(return_value=("42", {"ok": True, "active": active}, active))
+    api_calls = []
+
+    def fake_api(method, path, payload=None, timeout=20):
+        api_calls.append((method, path, payload, timeout))
+        return {
+            "ok": True,
+            "handoff": {
+                "id": "handoff_remote",
+                "task_id": "op_123",
+                "summary": payload["summary"],
+                "resume_hints": payload["resume_hints"],
+                "conversation_key": payload["conversation_key"],
+            },
+        }
+
+    async def fake_to_thread(func, *args, **kwargs):
+        return func(*args, **kwargs)
+
+    monkeypatch.setattr(adapter, "_cockpit_api_sync", fake_api)
+    monkeypatch.setattr(telegram_mod.asyncio, "to_thread", fake_to_thread)
 
     class User:
         id = "42"
@@ -187,6 +208,8 @@ async def test_libre_command_soft_closes_pilot_state_without_hard_reset(monkeypa
     assert "MFcv1/hermes-agent" in sent
     assert "Mémoire durable conservée" in sent
     assert "Pilote" in sent and "Autopilot" in sent
+    assert api_calls[0][0:2] == ("POST", "/api/internal/tasks/op_123/handoff")
+    assert api_calls[0][2]["conversation_key"] == "telegram:100::42"
 
 
 @pytest.mark.asyncio
@@ -257,6 +280,74 @@ async def test_libre_text_routes_repo_work_to_cockpit_with_selected_mode(monkeyp
     assert api_calls[0][2]["mode"] == "pilote"
     assert api_calls[0][2]["intent"] == "debug_fix"
     assert api_calls[0][2]["source"] == "telegram_libre_router"
+    assert len(created) == 1
+
+
+@pytest.mark.asyncio
+async def test_libre_resume_then_repo_work_uses_parent_task_id(monkeypatch, tmp_path):
+    from gateway.libre_orchestrator import ActiveWorkStore
+
+    adapter = _make_adapter()
+    monkeypatch.setattr(adapter, "_libre_store", lambda: ActiveWorkStore(tmp_path / "libre_state.json"))
+    adapter._send_cockpit_text = AsyncMock()
+    key = "telegram:100::42"
+    store = adapter._libre_store()
+    store.cache_handoff(
+        key,
+        {
+            "id": "handoff_1",
+            "task_id": "op_parent",
+            "repo": "MFcv1/hermes-agent",
+            "mode": "pilote",
+            "task": "Finir Phase 5",
+            "thread_id": "thread_123",
+            "summary": "Soft-close MFcv1/hermes-agent (pilote) — reprise: Finir Phase 5",
+            "resume_hints": {"task_id": "op_parent", "repo": "MFcv1/hermes-agent", "thread_id": "thread_123"},
+            "created_at": 1,
+        },
+    )
+    adapter._libre_chat_states["42"] = {"mode": "libre", "key": key}
+    active = {"repo": "MFcv1/hermes-agent", "thread_id": "thread_123", "thread_mode": "pilote"}
+    adapter._get_active_cockpit_thread = AsyncMock(return_value=("42", {"ok": True, "active": active}, active))
+    api_calls = []
+
+    def fake_api(method, path, payload=None, timeout=20):
+        api_calls.append((method, path, payload, timeout))
+        if path.startswith("/api/internal/tasks/op_parent/handoff"):
+            return {"ok": True, "handoff": store.latest_handoff(key, include_consumed=True)}
+        if path == "/api/internal/tasks/from-thread":
+            return {"ok": True, "id": "op_child", "repo": "MFcv1/hermes-agent", "mode": payload.get("mode"), "status": "queued_plan"}
+        return {"ok": False}
+
+    async def fake_to_thread(func, *args, **kwargs):
+        return func(*args, **kwargs)
+
+    created = []
+
+    def fake_create_task(coro):
+        coro.close()
+        task = MagicMock()
+        created.append(task)
+        return task
+
+    monkeypatch.setattr(adapter, "_cockpit_api_sync", fake_api)
+    monkeypatch.setattr(telegram_mod.asyncio, "to_thread", fake_to_thread)
+    monkeypatch.setattr(telegram_mod.asyncio, "create_task", fake_create_task)
+
+    class User:
+        id = "42"
+
+    class Msg:
+        from_user = User()
+        chat_id = "100"
+
+    resumed = await adapter._maybe_handle_libre_text(Msg(), "reprends le chantier d'hier")
+    routed = await adapter._maybe_handle_libre_text(Msg(), "corrige le bug du menu /new sur le repo Hermes")
+
+    assert resumed is True
+    assert routed is True
+    create_payload = [call[2] for call in api_calls if call[1] == "/api/internal/tasks/from-thread"][0]
+    assert create_payload["parent_task_id"] == "op_parent"
     assert len(created) == 1
 
 
