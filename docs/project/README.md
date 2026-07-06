@@ -15,6 +15,7 @@ directement dans `docs/`).
 | `notes/` | Notes de travail diverses |
 | `PHASE0_RESTART_PROCEDURE.md` | Procédure préparée pour restart VPS Phase 0 (validation humaine requise). |
 | `PHASE0_COMPLETION_REPORT.md` | Rapport Phase 0 : push, restart VPS, health, risques, rollback. |
+| `PHASE1_FORMATTING_EXTRACTION_REPORT.md` | Rapport Phase 1 partielle : extraction formatting Telegram. |
 | `autonomie-v2-symbol-inventory.json` | Inventaire statique des symboles `gateway/run.py` et `gateway/platforms/telegram.py`. |
 
 ## Documents de référence (ailleurs)

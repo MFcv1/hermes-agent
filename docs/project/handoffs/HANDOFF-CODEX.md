@@ -405,3 +405,14 @@ python -m py_compile gateway/libre_orchestrator.py gateway/platforms/telegram.py
 - Rapport complet : `docs/project/PHASE0_COMPLETION_REPORT.md`.
 - Limite connue : le Gateway live Telegram ne publie pas `:8642/health` car `api_server` n’est pas activé ; le code health est prêt, mais la preuve live est via `gateway.status` + systemd env.
 - Prochain départ Phase 1 recommandé : extraction minimale du formatting/OutboundReport Telegram avec tests de caractérisation avant déplacement.
+
+## Mise à jour 2026-07-06 — Autonomie V2 Phase 1 extraction formatting Telegram
+
+- Première extraction Phase 1 effectuée sans changement UX : helpers MarkdownV2/table/formatting déplacés vers `gateway/platforms/telegram_formatting.py`.
+- `TelegramAdapter.format_message()` délègue à `format_telegram_markdown(content)`.
+- Tests ajoutés : `tests/gateway/test_telegram_formatting_module.py`.
+- Validation : `221 passed in 3.32s` sur formatting/rich/Pilote/Libre/model picker/conv UX ; `py_compile` OK.
+- Impact inventaire : `gateway/platforms/telegram.py` passe à 9767 lignes / 258 symboles ; nouveau module formatting = 241 lignes / 7 symboles.
+- Rapport : `docs/project/PHASE1_FORMATTING_EXTRACTION_REPORT.md`.
+- Pas de sync/restart VPS effectué pour cette extraction partielle.
+- Prochaine extraction recommandée : `gateway/repo_cockpit_client.py`, avec tests de caractérisation avant déplacement.
