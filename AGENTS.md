@@ -1263,6 +1263,7 @@ sous `docs/project/` et servent de source de reprise pour les agents :
 - `docs/project/PHASE6_EVAL_HARNESS_REPORT.md` — Phase 6.
 - `docs/project/PHASE7_AUTONOMY_STATUS_UX_REPORT.md` — Phase 7.
 - `docs/project/RUNBOOK_REGISTRY_REPORT.md` — Quick win 9.
+- `docs/project/TELEMETRY_STORE_REPORT.md` — Quick win 11.
 
 Avant de poursuivre une phase, relire le rapport dédié et les contrats
 normatifs dans `docs/brain/03-implementation-contracts.md`.

@@ -1,5 +1,6 @@
 """Tests for hermes_logging — centralized logging setup."""
 import io
+import json
 import logging
 import os
 import stat
@@ -629,6 +630,37 @@ class TestComponentPrefixes:
         prefixes = hermes_logging.COMPONENT_PREFIXES["gui"]
         assert "hermes_cli.web_server" in prefixes
         assert "tui_gateway" in prefixes
+
+
+def test_emit_structured_telemetry_writes_metadata_only(hermes_home):
+    hermes_logging.set_session_context("sess_telemetry")
+    try:
+        path = hermes_logging.emit_structured_telemetry(
+            "llm_call",
+            source="gateway",
+            task_id="op_123",
+            payload={
+                "purpose": "classify",
+                "input_tokens": 12,
+                "prompt": "do not persist this",
+                "user_message": "also do not persist this",
+                "nested": {"api_key": "sk-secret"},
+            },
+            hermes_home=hermes_home,
+        )
+    finally:
+        hermes_logging.clear_session_context()
+
+    raw = path.read_text(encoding="utf-8")
+    event = json.loads(raw.splitlines()[-1])
+    assert event["kind"] == "llm_call"
+    assert event["session_id"] == "sess_telemetry"
+    assert event["payload"]["purpose"] == "classify"
+    assert event["payload"]["prompt_omitted"] is True
+    assert event["payload"]["user_message_omitted"] is True
+    assert event["payload"]["nested"]["api_key_omitted"] is True
+    assert "sk-secret" not in raw
+    assert "also do not persist this" not in raw
 
 
 class TestSetupVerboseLogging:

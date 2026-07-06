@@ -1,6 +1,6 @@
 # Autonomie V2 — état de reprise
 
-Date : 2026-07-06
+Date : 2026-07-07
 Branche : `codex/ops-update-readiness`
 
 ## Références à lire dans cet ordre
@@ -82,20 +82,21 @@ La roadmap principale Autonomie V2 est terminée jusqu'à la Phase 7.
 Quick wins réalisés après la Phase 7 :
 
 - Quick win 9 — Skill / Runbook Registry : `RUNBOOK_REGISTRY_REPORT.md`.
+- Quick win 11 — Telemetry Store : `TELEMETRY_STORE_REPORT.md`.
 
 Prochaine cible possible :
 
 ```text
-Quick win 11 — Telemetry Store
+VPS Self-Ops heartbeat / intégration cost dashboard
 ```
 
 Ordre conseillé :
 
 1. Relire `docs/brain/03-implementation-contracts.md`.
-2. Relire `PHASE6_EVAL_HARNESS_REPORT.md`, `PHASE7_AUTONOMY_STATUS_UX_REPORT.md` et `RUNBOOK_REGISTRY_REPORT.md`.
-3. Créer `repo-cockpit/backend/telemetry.py` + table append-only `events`.
-4. Stocker des métadonnées et références uniquement ; jamais de secrets ni messages complets.
-5. Brancher les evals/dashboard sur cette source sans casser le cache prompt.
+2. Relire `PHASE7_AUTONOMY_STATUS_UX_REPORT.md`, `RUNBOOK_REGISTRY_REPORT.md` et `TELEMETRY_STORE_REPORT.md`.
+3. Relire `docs/brain/04-cost-engine.md` et `docs/brain/05-vps-selfops.md`.
+4. Brancher le dashboard sur `/api/internal/costs/daily` ou ajouter un heartbeat VPS explicite.
+5. Garder les événements metadata-only ; jamais de secrets ni messages complets.
 
 ## À ne pas faire maintenant
 
