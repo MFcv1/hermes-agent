@@ -17,6 +17,7 @@ directement dans `docs/`).
 | `PHASE0_COMPLETION_REPORT.md` | Rapport Phase 0 : push, restart VPS, health, risques, rollback. |
 | `PHASE1_FORMATTING_EXTRACTION_REPORT.md` | Rapport Phase 1 partielle : extraction formatting Telegram. |
 | `PHASE1_REPO_COCKPIT_CLIENT_REPORT.md` | Rapport Phase 1 partielle : extraction client HTTP Repo Cockpit gateway. |
+| `PHASE1_REPO_COCKPIT_FORMATTERS_REPORT.md` | Rapport Phase 1 partielle : extraction formatters panels/status/PR Repo Cockpit. |
 | `autonomie-v2-symbol-inventory.json` | Inventaire statique des symboles `gateway/run.py` et `gateway/platforms/telegram.py`. |
 
 ## Documents de référence (ailleurs)

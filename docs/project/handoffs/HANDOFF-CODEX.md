@@ -428,3 +428,15 @@ python -m py_compile gateway/libre_orchestrator.py gateway/platforms/telegram.py
 - Rapport : `docs/project/PHASE1_REPO_COCKPIT_CLIENT_REPORT.md`.
 - Pas de sync/restart VPS effectué pour cette extraction partielle.
 - Prochaine extraction recommandée : formatters de panels/status/PR summaries avant flows callbacks.
+
+## Mise à jour 2026-07-06 — Autonomie V2 Phase 1 extraction formatters Repo Cockpit
+
+- Commit client Repo Cockpit poussé sur `origin/codex/ops-update-readiness`.
+- Troisième extraction Phase 1 effectuée : formatters panels/status/PR sortis de `gateway/platforms/telegram.py` vers `gateway/repo_cockpit_formatting.py`.
+- `TelegramAdapter` garde les shims de méthodes privées pour limiter le diff ; ils délèguent au nouveau module.
+- Tests ajoutés : `tests/gateway/test_repo_cockpit_formatting.py`.
+- Validation : `228 passed in 3.57s` sur formatters/client/formatting/rich/Pilote/Libre/model picker/conv UX ; `py_compile` OK.
+- Impact : `gateway/platforms/telegram.py` descend à 9509 lignes / 257 symboles ; nouveau module formatters = fonctions pures panels/status/PR.
+- Rapport : `docs/project/PHASE1_REPO_COCKPIT_FORMATTERS_REPORT.md`.
+- Pas de sync/restart VPS effectué pour cette extraction partielle.
+- Prochaine extraction recommandée : builders de keyboards Repo Cockpit, sans toucher à `_handle_callback_query`.

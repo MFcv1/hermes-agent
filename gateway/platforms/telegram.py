@@ -107,6 +107,17 @@ from gateway.platforms.telegram_network import (
 )
 from gateway.human_heartbeat import progress_from_autonomy, render_progress_view
 from gateway.repo_cockpit_client import RepoCockpitClient, cockpit_webapp_url
+from gateway.repo_cockpit_formatting import (
+    format_autonomy_status,
+    format_pending_prs,
+    format_pr_summary,
+    format_runs_status,
+    latest_items,
+    pending_pr_label,
+    preview_is_blocked,
+    status_badge,
+    status_is_problem,
+)
 from utils import atomic_replace
 
 _TELEGRAM_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
@@ -6446,54 +6457,10 @@ class TelegramAdapter(TelegramModelsConfigMixin, BasePlatformAdapter):
         await self._send_cockpit_text(msg, "\n".join(lines))
 
     def _pending_pr_label(self, item: dict) -> str:
-        repo = str(item.get("repo") or "")
-        task_id = str(item.get("task_id") or "")
-        title = str(item.get("title") or "")
-        blob = f"{repo} {title}".lower()
-        if "tennis" in blob:
-            project = "tennis"
-        else:
-            project = repo.rsplit("/", 1)[-1] if repo else "projet"
-        project = re.sub(r"[^a-zA-Z0-9_-]+", "-", project).strip("-") or "projet"
-        if len(project) > 18:
-            project = project[:18].rstrip("-")
-        suffix = task_id[-6:] if task_id else ""
-        return f"{project} · {suffix}" if suffix else project
+        return pending_pr_label(item)
 
     def _format_pending_prs(self, data: dict) -> str:
-        prs = data.get("prs") or []
-        lines = ["<b>🔀 PRs en attente</b>", ""]
-        if not prs:
-            lines.append("Aucune PR en attente côté Repo Cockpit.")
-            return "\n".join(lines)
-        for idx, item in enumerate(prs[:10], 1):
-            task_id = str(item.get("task_id") or "")
-            repo = str(item.get("repo") or "")
-            status = str(item.get("status") or "")
-            title = str(item.get("title") or "Tâche Hermes")
-            branch = str(item.get("branch") or "")
-            updated = item.get("updated_at")
-            updated_txt = ""
-            try:
-                updated_txt = datetime.fromtimestamp(int(updated), tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-            except Exception:
-                updated_txt = str(updated or "")
-            lines.extend([
-                f"<b>{idx}. {_html.escape(repo)}</b>",
-                f"{_html.escape(title[:120])}",
-                f"Status : <code>{_html.escape(status)}</code>",
-                f"Task : <code>{_html.escape(task_id)}</code>",
-            ])
-            if branch:
-                lines.append(f"Branche : <code>{_html.escape(branch)}</code>")
-            smoke = item.get("smoke_status")
-            if smoke is not None:
-                lines.append(f"Smoke : <code>{_html.escape(str(smoke))}</code>")
-            if updated_txt:
-                lines.append(f"Maj : <code>{_html.escape(updated_txt)}</code>")
-            lines.append("")
-        lines.append("Détail : <code>/status op_xxx</code> ou <code>/runs op_xxx</code>")
-        return "\n".join(lines).strip()
+        return format_pending_prs(data)
 
     def _pending_prs_keyboard(self, data: dict) -> InlineKeyboardMarkup:
         rows: list[list[InlineKeyboardButton]] = []
@@ -6536,123 +6503,7 @@ class TelegramAdapter(TelegramModelsConfigMixin, BasePlatformAdapter):
         await self._send_cockpit_panel(msg, self._format_pending_prs(data), self._pending_prs_keyboard(data), role="preview")
 
     def _format_pr_summary(self, data: dict) -> str:
-        task = data.get("task") or {}
-        task_id = str(task.get("id") or data.get("task_id") or "")
-        result = task.get("result_json")
-        if isinstance(result, str):
-            try:
-                result = json.loads(result)
-            except Exception:
-                result = {}
-        result = result if isinstance(result, dict) else {}
-        pr = result.get("pr") if isinstance(result.get("pr"), dict) else {}
-        pr_url = pr.get("pr_url") or pr.get("url") or result.get("pr_url")
-        preview = task.get("preview_url") or task.get("deployment_url") or result.get("preview_url") or result.get("deployment_url")
-        branch = (
-            pr.get("branch")
-            or pr.get("head")
-            or result.get("branch")
-            or ((result.get("branch_result") or {}) if isinstance(result.get("branch_result"), dict) else {}).get("effective_branch")
-        )
-        lines = [
-            "<b>🧾 Résumé PR</b>",
-            "",
-            f"Task : <code>{_html.escape(task_id)}</code>",
-            f"Repo : <code>{_html.escape(str(task.get('repo') or ''))}</code>",
-            f"Statut : <b>{_html.escape(str(task.get('status') or ''))}</b>",
-            f"Mode : <code>{_html.escape(str(task.get('mode') or ''))}</code>",
-        ]
-        if branch:
-            lines.append(f"Branche : <code>{_html.escape(str(branch))}</code>")
-        if pr_url:
-            lines.append(f"PR : {_html.escape(str(pr_url))}")
-        if preview:
-            lines.append(f"Preview : {_html.escape(str(preview))}")
-        smokes = data.get("smoke_tests") or []
-        if smokes:
-            latest = smokes[0]
-            lines.append(f"Smoke : <code>{_html.escape(str(latest.get('status') or ''))}</code>")
-        checks = data.get("provider_checks") or []
-        if checks:
-            ok = sum(1 for item in checks if str(item.get("status") or "").lower() in {"passed", "ok", "ready"})
-            lines.append(f"Provider checks : <code>{ok}/{len(checks)} OK</code>")
-        runs = data.get("task_runs") or []
-        if runs:
-            lines.extend(["", "<b>Dernières étapes</b>"])
-            for item in runs[:5]:
-                phase = str(item.get("phase") or item.get("id") or "")
-                status = str(item.get("status") or "")
-                lines.append(f"{self._status_badge(status)} <code>{_html.escape(phase[:70])}</code> · {_html.escape(status)}")
-        lines.extend([
-            "",
-            "Pour continuer dans ce chat : écris une nouvelle demande. Hermes utilisera le projet/thread actif.",
-            "Pour changer de mode ou de projet : <code>/new</code> ou <code>/conv</code>.",
-        ])
-        return "\n".join(lines)
-
-    async def _send_task_command(self, msg: Message, args: str = "") -> None:
-        raw = (args or "").strip()
-        task_id = raw.split()[0] if raw else ""
-        if not task_id:
-            return await self._send_cockpit_text(
-                msg,
-                "Usage : <code>/task décris la tâche</code>\nDétail : <code>/task op_xxx</code>",
-                role="preview",
-            )
-        if not task_id.startswith("op_"):
-            user_id = str(getattr(getattr(msg, "from_user", None), "id", "") or getattr(msg, "chat_id", ""))
-            pending = await asyncio.to_thread(
-                self._cockpit_api_sync,
-                "GET",
-                f"/api/internal/tasks/pilot-pending/{user_id}",
-                None,
-                20,
-            )
-            if pending.get("ok") and pending.get("pending") and (pending.get("task") or {}).get("id"):
-                pilot_task_id = str((pending.get("task") or {}).get("id"))
-                resumed = await asyncio.to_thread(
-                    self._cockpit_api_sync,
-                    "POST",
-                    f"/api/internal/tasks/{pilot_task_id}/pilot-answer",
-                    {
-                        "telegram_user_id": user_id,
-                        "chat_id": str(getattr(msg, "chat_id", "")),
-                        "answer": raw,
-                    },
-                    30,
-                )
-                if resumed.get("ok"):
-                    await self._send_cockpit_text(
-                        msg,
-                        "<b>🧭 Réponse Pilote reçue</b>\n\n"
-                        f"Tâche : <code>{_html.escape(pilot_task_id)}</code>\n"
-                        "Statut : <code>queued_plan</code>\n\n"
-                        "Je relance le worker avec ce contexte.",
-                        role="sticky",
-                    )
-                    asyncio.create_task(self._run_autopilot_worker_after_task_create(msg, pilot_task_id))
-                    return
-                return await self._send_cockpit_text(
-                    msg,
-                    "<b>Réponse Pilote non appliquée</b>\n\n<code>"
-                    + _html.escape(str(resumed.get("description") or resumed))[:1000]
-                    + "</code>",
-                    role="preview",
-                )
-            return await self._create_task_from_thread_command(msg, raw)
-        data = await asyncio.to_thread(self._cockpit_api_sync, "GET", f"/api/tasks/{task_id}", None, 20)
-        if data.get("ok") is False or data.get("detail"):
-            return await self._send_cockpit_text(msg, f"❌ Tâche introuvable : <code>{_html.escape(task_id)}</code>")
-        result = data.get("result") or {}
-        pr = ((result.get("pr") or {}).get("pr_url")) if isinstance(result, dict) else None
-        lines = [f"<b>📌 Tâche { _html.escape(data.get('id','')) }</b>", "", f"Repo : <code>{_html.escape(data.get('repo',''))}</code>", f"Statut : <b>{_html.escape(data.get('status',''))}</b>", f"Phase : <code>{_html.escape(str(data.get('current_phase') or ''))}</code>", f"Approval : <code>{_html.escape(str(data.get('approval_status') or ''))}</code>", f"Mode : {_html.escape(data.get('mode',''))}", f"Complexité : {_html.escape(data.get('complexity',''))}"]
-        if data.get("plan_md"):
-            lines.append("\n<b>Plan</b>\n<pre><code>" + _html.escape(str(data.get("plan_md"))[:1200]) + "</code></pre>")
-        if pr: lines.append(f"PR : { _html.escape(pr) }")
-        if data.get("preview_url"): lines.append(f"Preview : {_html.escape(data.get('preview_url'))}")
-        if data.get("deployment_url"): lines.append(f"Deploy : {_html.escape(data.get('deployment_url'))}")
-        lines.append(f"Resume : <code>{_html.escape(data.get('resume_md_path',''))}</code>")
-        await self._send_cockpit_text(msg, "\n".join(lines))
+        return format_pr_summary(data)
 
     def _audit_task_text(self, active: dict, args: str = "") -> str:
         repo = str(active.get("repo") or "repo actif").strip() or "repo actif"
@@ -6789,94 +6640,16 @@ class TelegramAdapter(TelegramModelsConfigMixin, BasePlatformAdapter):
         return None, "La conversation active n'a pas encore de task. Crée une tâche avec <code>/task ...</code> ou utilise <code>/conv</code>."
 
     def _status_badge(self, status: str | None) -> str:
-        value = str(status or "unknown")
-        if value in {"passed", "ready", "done", "completed"} or value.startswith("running"):
-            return "✅"
-        if value.startswith("blocked") or value in {"failed", "error"}:
-            return "🚨"
-        if value in {"queued", "pending"} or value.startswith("queued"):
-            return "⏳"
-        return "•"
+        return status_badge(status)
 
     def _latest_items(self, data: dict, key: str, limit: int = 3) -> list[dict]:
-        items = data.get(key) or []
-        if not isinstance(items, list):
-            return []
-        return items[:limit]
+        return latest_items(data, key, limit)
 
     def _format_autonomy_status(self, data: dict) -> str:
-        task = data.get("task") or {}
-        status = str(task.get("status") or "")
-        error_events = data.get("error_events") or []
-        latest_error = {}
-        if self._status_is_problem(status):
-            latest_error = (data.get("latest_error") or (error_events[0] if isinstance(error_events, list) and error_events else {}))
-        lines = [
-            "<b>🛰️ Status autonomie</b>",
-            "",
-            f"Task : <code>{_html.escape(str(task.get('id') or data.get('task_id') or ''))}</code>",
-            f"Repo : <code>{_html.escape(str(task.get('repo') or ''))}</code>",
-            f"Statut : <b>{_html.escape(status)}</b>",
-            f"Phase : <code>{_html.escape(str(task.get('current_phase') or ''))}</code>",
-        ]
-        preview = task.get("preview_url") or task.get("deployment_url")
-        if preview:
-            label = "Preview non validée" if self._preview_is_blocked(status) else "Preview"
-            lines.append(f"{label} : {_html.escape(str(preview))}")
-        if latest_error:
-            lines.extend([
-                "",
-                "<b>Dernière erreur classée</b>",
-                f"Catégorie : <code>{_html.escape(str(latest_error.get('category') or ''))}</code>",
-                f"Runbook : <code>{_html.escape(str(latest_error.get('runbook') or ''))}</code>",
-                f"Humain requis : <code>{_html.escape(str(latest_error.get('human_action_required') or False))}</code>",
-            ])
-        provider_checks = self._latest_items(data, "provider_checks")
-        if provider_checks:
-            lines.extend(["", "<b>Provider checks</b>"])
-            for item in provider_checks:
-                lines.append(
-                    f"{self._status_badge(item.get('status'))} {_html.escape(str(item.get('provider') or ''))}/"
-                    f"{_html.escape(str(item.get('check_name') or ''))} : <code>{_html.escape(str(item.get('status') or ''))}</code>"
-                )
-        smokes = self._latest_items(data, "smoke_tests")
-        if smokes:
-            lines.extend(["", "<b>Smoke tests</b>"])
-            for item in smokes:
-                lines.append(f"{self._status_badge(item.get('status'))} <code>{_html.escape(str(item.get('status') or ''))}</code> · {_html.escape(str(item.get('url') or ''))[:120]}")
-        runbooks = self._latest_items(data, "runbooks_applied")
-        if runbooks:
-            lines.extend(["", "<b>Runbooks</b>"])
-            for item in runbooks:
-                lines.append(f"{self._status_badge(item.get('status'))} <code>{_html.escape(str(item.get('runbook') or ''))}</code> · {_html.escape(str(item.get('status') or ''))}")
-        lines.append("\nDétail : <code>/runs " + _html.escape(str(task.get("id") or data.get("task_id") or "")) + "</code>")
-        return "\n".join(lines)
+        return format_autonomy_status(data)
 
     def _format_runs_status(self, data: dict) -> str:
-        task = data.get("task") or {}
-        task_id = str(task.get("id") or data.get("task_id") or "")
-        lines = [
-            "<b>🧪 Runs / gates</b>",
-            "",
-            f"Task : <code>{_html.escape(task_id)}</code>",
-            f"Statut : <b>{_html.escape(str(task.get('status') or ''))}</b>",
-        ]
-        for section, title, name_key in [
-            ("task_runs", "Runs worker", "phase"),
-            ("repair_attempts", "Réparations", "runbook"),
-            ("smoke_tests", "Smoke tests", "url"),
-            ("runbooks_applied", "Runbooks appliqués", "runbook"),
-            ("deployments", "Deployments", "provider"),
-        ]:
-            items = self._latest_items(data, section, 6)
-            if not items:
-                continue
-            lines.extend(["", f"<b>{_html.escape(title)}</b>"])
-            for item in items:
-                label = str(item.get(name_key) or item.get("check_name") or item.get("id") or "")
-                status = str(item.get("status") or "")
-                lines.append(f"{self._status_badge(status)} <code>{_html.escape(label)[:80]}</code> · <b>{_html.escape(status)}</b>")
-        return "\n".join(lines)
+        return format_runs_status(data)
 
     def _format_autopilot_live_card(self, data: dict, *, elapsed_seconds: int) -> str:
         progress = progress_from_autonomy(data, elapsed_seconds=elapsed_seconds)
@@ -6953,18 +6726,10 @@ class TelegramAdapter(TelegramModelsConfigMixin, BasePlatformAdapter):
         return "\n".join(lines)
 
     def _preview_is_blocked(self, status: str) -> bool:
-        return status in {
-            "blocked_deploy",
-            "blocked_smoke",
-            "blocked_release_gate",
-            "blocked_pr_required",
-            "blocked_review_required",
-            "blocked_tests",
-        }
+        return preview_is_blocked(status)
 
     def _status_is_problem(self, status: str) -> bool:
-        value = str(status or "")
-        return value.startswith("blocked") or value in {"failed", "error"}
+        return status_is_problem(status)
 
     def _autonomy_keyboard(self, data: dict, view: str = "status") -> InlineKeyboardMarkup:
         task = data.get("task") or {}
