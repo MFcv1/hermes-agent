@@ -7179,6 +7179,21 @@ class TelegramAdapter(TelegramModelsConfigMixin, BasePlatformAdapter):
                 parts.append(f"{suite} {passed}/{total}")
         return ", ".join(parts[:3])
 
+    def _cost_summary_line(self, data: dict) -> str:
+        summary = data.get("cost_summary") or {}
+        if not isinstance(summary, dict):
+            return ""
+        task = summary.get("task") if isinstance(summary.get("task"), dict) else {}
+        daily = summary.get("daily") if isinstance(summary.get("daily"), dict) else {}
+        task_cost = float(task.get("total_cost_usd") or 0.0)
+        daily_cost = float(daily.get("total_cost_usd") or 0.0)
+        calls = int(task.get("calls") or 0)
+        if not task_cost and not daily_cost and not calls:
+            return ""
+        def fmt(value: float) -> str:
+            return f"${value:.4f}" if 0 < value < 0.01 else f"${value:.2f}"
+        return f"Aujourd'hui {fmt(daily_cost)} · task {fmt(task_cost)} · appels {calls}"
+
     def _short_observation_label(self, item: dict) -> str:
         signature = str(item.get("signature") or "")
         source = str(item.get("source") or "")
@@ -7224,6 +7239,9 @@ class TelegramAdapter(TelegramModelsConfigMixin, BasePlatformAdapter):
         eval_line = self._evaluation_summary_line(data)
         if eval_line:
             lines.append(f"Evals : <code>{_html.escape(eval_line)}</code>")
+        cost_line = self._cost_summary_line(data)
+        if cost_line:
+            lines.append(f"Coût : <code>{_html.escape(cost_line)}</code>")
         if latest_error:
             lines.extend([
                 "",
