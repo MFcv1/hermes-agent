@@ -7210,6 +7210,29 @@ class TelegramAdapter(TelegramModelsConfigMixin, BasePlatformAdapter):
             f"RAM {metrics.get('ram_used_pct', '?')}% · load {metrics.get('load15_per_cpu', '?')}"
         )
 
+    def _cost_guard_line(self, data: dict) -> str:
+        guard = data.get("cost_guard") or {}
+        if not isinstance(guard, dict):
+            return ""
+        status = str(guard.get("status") or "ok")
+        if status == "ok":
+            return ""
+        reasons = ", ".join(str(item) for item in (guard.get("reasons") or [])) or status
+        task = guard.get("task") if isinstance(guard.get("task"), dict) else {}
+        daily = guard.get("daily") if isinstance(guard.get("daily"), dict) else {}
+        task_cost = float(task.get("total_cost_usd") or 0.0)
+        daily_cost = float(daily.get("total_cost_usd") or 0.0)
+        return f"{status} · {reasons} · jour ${daily_cost:.2f} · task ${task_cost:.2f}"
+
+    def _telemetry_summary_line(self, data: dict) -> str:
+        summary = data.get("telemetry_summary") or {}
+        if not isinstance(summary, dict) or not summary.get("events"):
+            return ""
+        return (
+            f"{summary.get('events', 0)} events · repairs {summary.get('repairs', 0)} · "
+            f"échecs {summary.get('failures', 0)} · escalades {summary.get('escalations', 0)}"
+        )
+
     def _short_observation_label(self, item: dict) -> str:
         signature = str(item.get("signature") or "")
         source = str(item.get("source") or "")
@@ -7258,6 +7281,12 @@ class TelegramAdapter(TelegramModelsConfigMixin, BasePlatformAdapter):
         cost_line = self._cost_summary_line(data)
         if cost_line:
             lines.append(f"Coût : <code>{_html.escape(cost_line)}</code>")
+        cost_guard_line = self._cost_guard_line(data)
+        if cost_guard_line:
+            lines.append(f"Budget : <code>{_html.escape(cost_guard_line)}</code>")
+        telemetry_summary_line = self._telemetry_summary_line(data)
+        if telemetry_summary_line:
+            lines.append(f"Historique : <code>{_html.escape(telemetry_summary_line)}</code>")
         selfops_line = self._selfops_summary_line(data)
         if selfops_line:
             lines.append(f"VPS : <code>{_html.escape(selfops_line)}</code>")
