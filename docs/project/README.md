@@ -31,6 +31,7 @@ directement dans `docs/`).
 | `TELEMETRY_STORE_REPORT.md` | Rapport quick win 11 VPS : store `events`, coûts journaliers, sink telemetry gateway. |
 | `COST_DASHBOARD_REPORT.md` | Rapport quick win 12 VPS : dashboard coût jour/task/modèle depuis telemetry. |
 | `SELFOPS_TELEMETRY_AUTONOMY_REPORT.md` | Rapport quick win 13 VPS : heartbeat self-ops, timeline telemetry, eval events, cost guard. |
+| `SELFOPS_ACTIONS_TELEMETRY_REPORT.md` | Rapport quick win 14 VPS : actions self-ops sûres, analytics task, eval report, cost guard enforce. |
 | `AUTONOMIE_V2_IMPLEMENTATION_STATUS.md` | Point de reprise consolidé : phases, preuves, prochaine cible. |
 | `autonomie-v2-symbol-inventory.json` | Inventaire statique des symboles `gateway/run.py` et `gateway/platforms/telegram.py`. |
 

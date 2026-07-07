@@ -7,14 +7,14 @@ Source : `docs/project/TELEMETRY_STORE_REPORT.md`
 - [x] Brancher le dashboard Repo Cockpit sur les coûts journaliers.
 - [x] Afficher le coût du jour, les appels LLM et le modèle principal.
 - [x] Exposer le coût par task dans le payload `/autonomy`.
-- Ajouter une vue task qui liste les événements telemetry récents :
+- [x] Ajouter une vue task qui liste les événements telemetry récents :
   - décisions policy ;
   - actions worker ;
   - appels LLM ;
   - durées ;
   - refs de run/artifacts.
-- Afficher le détail coût par modèle/task dans une vue analytique plus complète.
-- Garder le dashboard metadata-only : aucune fuite de prompt, message complet,
+- [x] Afficher le détail coût par modèle/task dans une vue analytique plus complète.
+- [x] Garder le dashboard metadata-only : aucune fuite de prompt, message complet,
   token, body brut ou secret.
 
 ## Priorité 2 — Evals alimentées par traces propres
@@ -27,26 +27,33 @@ Source : `docs/project/TELEMETRY_STORE_REPORT.md`
   - résultat ;
   - coût estimé ;
   - refs vers artifacts/logs nettoyés.
-- Ajouter une commande ou endpoint qui reconstruit un rapport eval depuis la
+- [x] Ajouter une commande ou endpoint qui reconstruit un rapport eval depuis la
   telemetry au lieu de relire les logs bruts.
-- Utiliser les traces pour repérer les régressions de routing, repair et policy.
+- [x] Utiliser les traces pour repérer les régressions de routing, repair et policy.
 
 ## Priorité 3 — Autonomie basée sur l'historique
 
 - [x] Poser le heartbeat Self-Ops périodique VPS dans `events(kind=selfops_sample)`.
 - [x] Exposer les événements telemetry récents par task.
-- Construire une synthèse périodique des événements par task :
+- [x] Construire une synthèse périodique des événements par task :
   - ce qui a marché ;
   - ce qui a échoué ;
   - combien de réparations ont été tentées ;
   - quand Hermes a escaladé à l'humain ;
   - quel runbook ou quelle policy a aidé.
-- Ajouter une boucle d'analyse qui produit des recommandations d'amélioration
+- [x] Ajouter une boucle d'analyse qui produit des recommandations d'amélioration
   sans modifier automatiquement le système.
-- Alimenter les futurs choix de policy/runbook avec cet historique, en gardant
+- [x] Alimenter les futurs choix de policy/runbook avec cet historique, en gardant
   une validation humaine pour tout changement risqué.
-- Préparer le lien avec le prochain chantier : VPS Self-Ops heartbeat et cost
+- [x] Préparer le lien avec le prochain chantier : VPS Self-Ops heartbeat et cost
   dashboard.
+
+## Priorité 4 — Suites post Quick Win 14
+
+- Ajouter une UI des recommandations Self-Ops ouvertes.
+- Ajouter un flow approval pour les actions humaines (`scale_infra`, cleanup critique étendu, dépenses).
+- Ajouter un graphe coût / modèle / task sur 7 jours.
+- Ajouter un rapport Telegram hebdomadaire automatique.
 
 ## Contraintes à garder
 

@@ -85,19 +85,20 @@ Quick wins réalisés après la Phase 7 :
 - Quick win 11 — Telemetry Store : `TELEMETRY_STORE_REPORT.md`.
 - Quick win 12 — Cost Dashboard : `COST_DASHBOARD_REPORT.md`.
 - Quick win 13 — Self-Ops / Telemetry timeline / Eval events / Cost guard : `SELFOPS_TELEMETRY_AUTONOMY_REPORT.md`.
+- Quick win 14 — Self-Ops actions / Task analytics / Eval report / Cost guard enforce : `SELFOPS_ACTIONS_TELEMETRY_REPORT.md`.
 
 Prochaine cible possible :
 
 ```text
-Runbook actions self-ops sûres / vue analytique task telemetry
+Recommandations Self-Ops + approvals humaines + reporting hebdo
 ```
 
 Ordre conseillé :
 
 1. Relire `docs/brain/03-implementation-contracts.md`.
-2. Relire `PHASE7_AUTONOMY_STATUS_UX_REPORT.md`, `RUNBOOK_REGISTRY_REPORT.md`, `TELEMETRY_STORE_REPORT.md`, `COST_DASHBOARD_REPORT.md` et `SELFOPS_TELEMETRY_AUTONOMY_REPORT.md`.
+2. Relire `PHASE7_AUTONOMY_STATUS_UX_REPORT.md`, `RUNBOOK_REGISTRY_REPORT.md`, `TELEMETRY_STORE_REPORT.md`, `COST_DASHBOARD_REPORT.md`, `SELFOPS_TELEMETRY_AUTONOMY_REPORT.md` et `SELFOPS_ACTIONS_TELEMETRY_REPORT.md`.
 3. Relire `docs/brain/04-cost-engine.md` et `docs/brain/05-vps-selfops.md`.
-4. Ajouter les actions self-ops autorisées par policy : cleanup disk warning, restart unique service inactive, SQLite archive/VACUUM.
+4. Ajouter une UI/approval pour les recommandations Self-Ops qui restent humaines : resize infra, cleanup critique étendu, dépenses.
 5. Garder les événements metadata-only ; jamais de secrets ni messages complets.
 
 ## À ne pas faire maintenant
