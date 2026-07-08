@@ -36,6 +36,8 @@ directement dans `docs/`).
 | `TELEGRAM_CUA_PORTFOLIO_V2_SMOKE_REPORT.md` | Rapport test supervisé Telegram/CUA : `/new`, `/libre`, repo Portfolio V2, plan Pilote, limites worker/observer. |
 | `AUTONOMIE_V2_IMPLEMENTATION_STATUS.md` | Point de reprise consolidé : phases, preuves, prochaine cible. |
 | `CURRENT_AUTONOMY_DEPLOYMENT_AUDIT_2026-07-09.md` | État situationnel courant : synchro Mac/GitHub, commits live VPS, providers prêts, profils deploy autonomes, risques restants. |
+| `CODEX_SUPERVISOR_MODE_PLAN.md` | Plan d'implémentation du mode où Codex pilote Hermes via Telegram/CUA et vérifie Cockpit, GitHub et les providers. |
+| `supervisor-runs/` | Rapports générés par `scripts/codex_supervisor_mode.py` pour chaque supervision Codex -> Hermes. |
 | `autonomie-v2-symbol-inventory.json` | Inventaire statique des symboles `gateway/run.py` et `gateway/platforms/telegram.py`. |
 
 ## Documents de référence (ailleurs)

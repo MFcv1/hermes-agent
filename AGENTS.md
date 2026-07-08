@@ -1269,6 +1269,7 @@ sous `docs/project/` et servent de source de reprise pour les agents :
 - `docs/project/SELFOPS_ACTIONS_TELEMETRY_REPORT.md` — Quick win 14.
 - `docs/project/PRODUCT_OPS_CONTROL_REPORT.md` — product ops control : recommandations, approvals, coût 7j, rapport hebdo, sync Phase 1 VPS.
 - `docs/project/CURRENT_AUTONOMY_DEPLOYMENT_AUDIT_2026-07-09.md` — état situationnel courant : synchro Mac/GitHub, commits VPS, providers prêts, profils deploy autonomes, risques restants.
+- `docs/project/CODEX_SUPERVISOR_MODE_PLAN.md` — plan du mode superviseur Codex -> Telegram/CUA -> Hermes, avec vérification Cockpit, GitHub et hosting.
 
 Avant de poursuivre une phase, relire le rapport dédié et les contrats
 normatifs dans `docs/brain/03-implementation-contracts.md`.

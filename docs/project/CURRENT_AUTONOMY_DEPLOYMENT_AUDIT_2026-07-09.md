@@ -9,24 +9,25 @@ Repo Cockpit work.
 ## Local Mac Repository
 
 - Path: `/Users/matthis/.hermes/hermes-agent`
-- Current branch: `codex/ops-update-readiness`
+- Current branch: `main`
 - Remote:
   - `origin`: `https://github.com/MFcv1/hermes-agent.git`
   - `upstream`: `https://github.com/NousResearch/hermes-agent.git`
 - Branch sync:
-  - `HEAD` is synchronized with `origin/codex/ops-update-readiness`.
-  - No pull request exists for `codex/ops-update-readiness` at the time of this audit.
-  - The branch is a long-running product/autonomy branch and is far from both
-    `origin/main` and `upstream/main`; do not treat it as a simple fast-forward
-    candidate.
+  - `HEAD` is synchronized with `origin/main`.
+  - The previous `origin/main` was preserved on
+    `backup/main-before-ops-update-readiness-20260709`.
+  - `main` intentionally contains the current product/autonomy work and is far
+    from `upstream/main`; do not click GitHub "Sync fork" unless the goal is to
+    reconcile with the official Hermes upstream.
 - GitHub auth on the Mac:
   - Logged in as `MFcv1`.
   - Token scopes include `repo` and `workflow`.
 
 ## GitHub Source Of Truth
 
-For the core `hermes-agent` repository, GitHub is available and the current
-work branch can be pushed normally.
+For the core `hermes-agent` repository, GitHub is available and `main` is the
+source-of-truth branch for Matthis' current autonomy work.
 
 For the live VPS Repo Cockpit repository, `/home/hermes/repo-cockpit` currently
 has no configured Git remote. Its live commits are clean locally on the VPS,
@@ -132,7 +133,7 @@ Actions that must remain approval-gated:
 
 ## Recommended Next Step
 
-Run a supervised real deployment smoke:
+Run a supervised real deployment smoke through Codex Supervisor Mode:
 
 1. Create a private repo such as `MFcv1/hermes-deploy-smoke-cloudflare`.
 2. Scaffold a minimal Next.js/OpenNext or Astro app.
@@ -142,3 +143,8 @@ Run a supervised real deployment smoke:
 
 After that, repeat once for Vercel + Supabase if the product path needs a
 database-backed app.
+
+The first read-only shell for this is `scripts/codex_supervisor_mode.py`. It
+can already send/capture Telegram via CUA, query Cockpit locally or over SSH,
+check GitHub state, smoke an optional deploy URL, and write Markdown/JSON
+reports under `docs/project/supervisor-runs/`.
