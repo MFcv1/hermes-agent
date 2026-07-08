@@ -33,6 +33,7 @@ directement dans `docs/`).
 | `SELFOPS_TELEMETRY_AUTONOMY_REPORT.md` | Rapport quick win 13 VPS : heartbeat self-ops, timeline telemetry, eval events, cost guard. |
 | `SELFOPS_ACTIONS_TELEMETRY_REPORT.md` | Rapport quick win 14 VPS : actions self-ops sûres, analytics task, eval report, cost guard enforce. |
 | `PRODUCT_OPS_CONTROL_REPORT.md` | Rapport product ops VPS : recommandations Self-Ops, approvals humaines, coût 7j, rapport Telegram hebdo, sync Phase 1 gateway. |
+| `TELEGRAM_CUA_PORTFOLIO_V2_SMOKE_REPORT.md` | Rapport test supervisé Telegram/CUA : `/new`, `/libre`, repo Portfolio V2, plan Pilote, limites worker/observer. |
 | `AUTONOMIE_V2_IMPLEMENTATION_STATUS.md` | Point de reprise consolidé : phases, preuves, prochaine cible. |
 | `autonomie-v2-symbol-inventory.json` | Inventaire statique des symboles `gateway/run.py` et `gateway/platforms/telegram.py`. |
 
