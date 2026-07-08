@@ -1,6 +1,6 @@
 # Autonomie V2 — état de reprise
 
-Date : 2026-07-07
+Date : 2026-07-08
 Branche : `codex/ops-update-readiness`
 
 ## Références à lire dans cet ordre
@@ -17,7 +17,7 @@ Ces documents sont la source à suivre pour les prochaines sessions. En cas de c
 | Phase | Statut | Preuves |
 |---|---|---|
 | Phase 0 — stabilisation/inventaire | Terminé côté code local + déploiement VPS documenté | `PHASE0_COMPLETION_REPORT.md`, `gateway/deployment_info.py`, `scripts/inventory_symbols.py`, `docs/project/autonomie-v2-symbol-inventory.json` |
-| Phase 1 — extraction modules gateway | Terminé côté code local, sync VPS non fait | `PHASE1_COMPLETION_REPORT.md` |
+| Phase 1 — extraction modules gateway | Terminé côté code local + synchronisé VPS | `PHASE1_COMPLETION_REPORT.md`, `PRODUCT_OPS_CONTROL_REPORT.md` |
 | Phase 2 — observation bus + contrats | Terminé côté gateway + backend VPS | `PHASE2_OBSERVATION_BUS_REPORT.md` |
 | Phase 3 — worker runtime engine | Terminé côté backend/worker VPS | `PHASE3_WORKER_RUNTIME_ENGINE_REPORT.md` |
 | Phase 4 — self-repair v2 | Terminé côté backend/worker VPS | `PHASE4_SELF_REPAIR_V2_REPORT.md` |
@@ -34,6 +34,8 @@ Ces documents sont la source à suivre pour les prochaines sessions. En cas de c
 - Textes purs `/new` / Pilote / sélection repo / `/tasks` / audit dry-run extraits dans `gateway/repo_cockpit_text.py`.
 - Mixins extraits : `gateway/telegram_transport_mixin.py`, `gateway/telegram_inbound_filter_mixin.py`, `gateway/telegram_model_picker_mixin.py`, `gateway/telegram_conversations_mixin.py`, `gateway/repo_cockpit_telegram_mixin.py`.
 - `gateway/platforms/telegram.py` fait maintenant 1745 lignes.
+- Sync VPS effectuée le 2026-07-08 : commit live `5d1589848 refactor(telegram): finish modular gateway phase1 sync`.
+- Vérifications live : `py_compile`, import `TelegramAdapter`, restart `hermes-gateway.service`, Bot API `getMe`, smoke Telegram `message_id=765`.
 
 Le pattern actuel est volontairement conservateur :
 
@@ -86,24 +88,23 @@ Quick wins réalisés après la Phase 7 :
 - Quick win 12 — Cost Dashboard : `COST_DASHBOARD_REPORT.md`.
 - Quick win 13 — Self-Ops / Telemetry timeline / Eval events / Cost guard : `SELFOPS_TELEMETRY_AUTONOMY_REPORT.md`.
 - Quick win 14 — Self-Ops actions / Task analytics / Eval report / Cost guard enforce : `SELFOPS_ACTIONS_TELEMETRY_REPORT.md`.
+- Product Ops Control — recommandations Self-Ops, approvals humaines, coût 7j, rapport Telegram hebdo, sync Phase 1 VPS : `PRODUCT_OPS_CONTROL_REPORT.md`.
 
-Prochaine cible possible :
+État courant :
 
 ```text
-Recommandations Self-Ops + approvals humaines + reporting hebdo
+Le gros projet Autonomie V2 + les quick wins telemetry/selfops/cost/product-ops sont debout en live.
 ```
 
-Ordre conseillé :
+Prochaines cibles possibles :
 
 1. Relire `docs/brain/03-implementation-contracts.md`.
-2. Relire `PHASE7_AUTONOMY_STATUS_UX_REPORT.md`, `RUNBOOK_REGISTRY_REPORT.md`, `TELEMETRY_STORE_REPORT.md`, `COST_DASHBOARD_REPORT.md`, `SELFOPS_TELEMETRY_AUTONOMY_REPORT.md` et `SELFOPS_ACTIONS_TELEMETRY_REPORT.md`.
-3. Relire `docs/brain/04-cost-engine.md` et `docs/brain/05-vps-selfops.md`.
-4. Ajouter une UI/approval pour les recommandations Self-Ops qui restent humaines : resize infra, cleanup critique étendu, dépenses.
-5. Garder les événements metadata-only ; jamais de secrets ni messages complets.
+2. Relire `PRODUCT_OPS_CONTROL_REPORT.md` et les rapports quick wins précédents.
+3. Choisir une suite produit : exécution contrôlée des approvals déjà validées, amélioration graphique Cockpit, ou reporting enrichi par task/projet.
+4. Garder les événements metadata-only ; jamais de secrets ni messages complets.
 
 ## À ne pas faire maintenant
 
-- Ne pas synchroniser/restart VPS sans validation humaine explicite, sauf reprise directe d'une phase déjà demandée en live.
 - Ne pas ajouter de watcher global : toute observation doit rester attachée à un `task_id`.
 - Ne pas étendre le self-repair v2 à des actions externes tant que la policy ne les autorise pas explicitement.
 - Ne pas supprimer l'ancien JSON Libre tant que la migration n'a pas été observée sur plusieurs reprises réelles.

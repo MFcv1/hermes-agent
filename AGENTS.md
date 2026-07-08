@@ -1267,6 +1267,7 @@ sous `docs/project/` et servent de source de reprise pour les agents :
 - `docs/project/COST_DASHBOARD_REPORT.md` — Quick win 12.
 - `docs/project/SELFOPS_TELEMETRY_AUTONOMY_REPORT.md` — Quick win 13.
 - `docs/project/SELFOPS_ACTIONS_TELEMETRY_REPORT.md` — Quick win 14.
+- `docs/project/PRODUCT_OPS_CONTROL_REPORT.md` — product ops control : recommandations, approvals, coût 7j, rapport hebdo, sync Phase 1 VPS.
 
 Avant de poursuivre une phase, relire le rapport dédié et les contrats
 normatifs dans `docs/brain/03-implementation-contracts.md`.

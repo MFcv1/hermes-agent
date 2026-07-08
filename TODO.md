@@ -48,12 +48,15 @@ Source : `docs/project/TELEMETRY_STORE_REPORT.md`
 - [x] Préparer le lien avec le prochain chantier : VPS Self-Ops heartbeat et cost
   dashboard.
 
-## Priorité 4 — Suites post Quick Win 14
+## Priorité 4 — Product Ops Control
 
-- Ajouter une UI des recommandations Self-Ops ouvertes.
-- Ajouter un flow approval pour les actions humaines (`scale_infra`, cleanup critique étendu, dépenses).
-- Ajouter un graphe coût / modèle / task sur 7 jours.
-- Ajouter un rapport Telegram hebdomadaire automatique.
+- [x] Ajouter une UI des recommandations Self-Ops ouvertes.
+- [x] Ajouter un flow approval pour les actions humaines (`scale_infra`, cleanup critique étendu, dépenses).
+- [x] Ajouter un graphe coût / modèle / task sur 7 jours.
+- [x] Ajouter un rapport Telegram hebdomadaire automatique.
+- [x] Synchroniser la décomposition Phase 1 du gateway Telegram sur le VPS live.
+
+Rapport : `docs/project/PRODUCT_OPS_CONTROL_REPORT.md`.
 
 ## Contraintes à garder
 
