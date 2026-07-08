@@ -35,6 +35,7 @@ directement dans `docs/`).
 | `PRODUCT_OPS_CONTROL_REPORT.md` | Rapport product ops VPS : recommandations Self-Ops, approvals humaines, coût 7j, rapport Telegram hebdo, sync Phase 1 gateway. |
 | `TELEGRAM_CUA_PORTFOLIO_V2_SMOKE_REPORT.md` | Rapport test supervisé Telegram/CUA : `/new`, `/libre`, repo Portfolio V2, plan Pilote, limites worker/observer. |
 | `AUTONOMIE_V2_IMPLEMENTATION_STATUS.md` | Point de reprise consolidé : phases, preuves, prochaine cible. |
+| `CURRENT_AUTONOMY_DEPLOYMENT_AUDIT_2026-07-09.md` | État situationnel courant : synchro Mac/GitHub, commits live VPS, providers prêts, profils deploy autonomes, risques restants. |
 | `autonomie-v2-symbol-inventory.json` | Inventaire statique des symboles `gateway/run.py` et `gateway/platforms/telegram.py`. |
 
 ## Documents de référence (ailleurs)
