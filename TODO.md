@@ -58,6 +58,59 @@ Source : `docs/project/TELEMETRY_STORE_REPORT.md`
 
 Rapport : `docs/project/PRODUCT_OPS_CONTROL_REPORT.md`.
 
+## Demain — Codex Supervisor Mode
+
+Objectif : rendre `@supervisormode` aussi structuré qu'un clavardage Codex,
+au lieu de dépendre du fil Telegram unique.
+
+### 1. Sessions Supervisor structurées
+
+- [ ] Créer un store de sessions Supervisor côté Codex/Hermes :
+  - `supervisor_session_id` ;
+  - titre lisible ;
+  - statut ;
+  - repo cible ;
+  - provider cible ;
+  - `task_id` Cockpit courant ;
+  - branche GitHub ;
+  - PR éventuelle ;
+  - URL preview/live ;
+  - chemins des rapports et screenshots CUA.
+- [ ] Ajouter une règle : nouvelle mission = nouvelle session Supervisor, sauf
+  reprise explicite d'un `task_id`.
+- [ ] Ajouter des commandes/actions de reprise :
+  - lister les sessions Supervisor récentes ;
+  - reprendre une session ;
+  - clore une session ;
+  - rattacher une session à un `task_id` Cockpit trouvé après coup.
+- [ ] Stocker chaque brief envoyé à Hermes comme artefact propre, sans dépendre
+  de l'ancien historique Telegram.
+- [ ] Produire un rapport final par session, avec liens GitHub/Cockpit/hosting.
+
+### 2. Automatisation des limites actuelles du superviseur
+
+- [ ] Extraire automatiquement un nouveau `task_id` depuis les réponses Telegram,
+  les endpoints Cockpit ou le dernier thread actif.
+- [ ] Ajouter une boucle de relance intelligente supervisée :
+  - Hermes pose une question ;
+  - Hermes bloque sur approval ;
+  - Hermes travaille sur le mauvais repo ;
+  - Hermes produit des docs mais ne pousse rien sur GitHub ;
+  - smoke deploy échoue ;
+  - task stagne/timed out.
+- [ ] Transformer chaque relance en message Telegram traçable et l'ajouter au
+  rapport Markdown/JSON.
+- [ ] Ajouter un flow "repo + deploy + URL" piloté par le superviseur :
+  - création repo si autorisée ;
+  - branche dédiée ;
+  - tâche Hermes ;
+  - vérification GitHub ;
+  - deploy preview Cloudflare/Vercel/Supabase selon provider ;
+  - smoke URL ;
+  - rapport final.
+- [ ] Garder les approvals humaines pour production, DNS, coûts, secrets,
+  actions irréversibles et merge vers `main`.
+
 ## Contraintes à garder
 
 - Pas de contenu utilisateur complet dans `events`.
