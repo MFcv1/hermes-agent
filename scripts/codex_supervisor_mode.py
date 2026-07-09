@@ -31,6 +31,24 @@ DEFAULT_COCKPIT_ENDPOINTS = [
     "/api/internal/ops/weekly-report?formatted=1",
 ]
 
+TASK_TERMINAL_STATUSES = {
+    "blocked",
+    "blocked_auth",
+    "blocked_policy",
+    "blocked_runtime_repair",
+    "cancelled",
+    "completed",
+    "deployed_preview",
+    "done",
+    "failed",
+    "needs_approval",
+    "needs_merge_approval",
+    "needs_review",
+    "pilot_questions_required",
+}
+
+TASK_TERMINAL_PREFIXES = ("blocked_",)
+
 
 def _repo_root() -> Path:
     here = Path(__file__).resolve()
@@ -151,9 +169,7 @@ def _collect_cockpit_local(args: argparse.Namespace) -> dict[str, Any]:
     if args.task_id:
         endpoints.extend(
             [
-                f"/api/internal/tasks/{args.task_id}",
-                f"/api/internal/tasks/{args.task_id}/status",
-                f"/api/internal/tasks/{args.task_id}/events",
+                f"/api/internal/tasks/{args.task_id}/autonomy",
             ]
         )
     results = {}
@@ -172,9 +188,7 @@ def _collect_cockpit_ssh(args: argparse.Namespace) -> dict[str, Any]:
     if args.task_id:
         endpoints.extend(
             [
-                f"/api/internal/tasks/{args.task_id}",
-                f"/api/internal/tasks/{args.task_id}/status",
-                f"/api/internal/tasks/{args.task_id}/events",
+                f"/api/internal/tasks/{args.task_id}/autonomy",
             ]
         )
     payload = json.dumps({"endpoints": endpoints, "base_url": args.cockpit_base_url.rstrip("/")})
@@ -237,6 +251,125 @@ def collect_cockpit(args: argparse.Namespace) -> dict[str, Any]:
     if args.vps_ssh:
         return _collect_cockpit_ssh(args)
     return _collect_cockpit_local(args)
+
+
+def _task_endpoint(task_id: str) -> str:
+    return f"/api/internal/tasks/{task_id}/autonomy"
+
+
+def _task_payload_from_cockpit(cockpit: dict[str, Any], task_id: str) -> dict[str, Any]:
+    endpoint = _task_endpoint(task_id)
+    data = (cockpit.get("endpoints") or {}).get(endpoint) or {}
+    body = data.get("body") if isinstance(data, dict) else None
+    return body if isinstance(body, dict) else {}
+
+
+def _status_is_terminal(status: str) -> bool:
+    clean = status.strip().lower()
+    return clean in TASK_TERMINAL_STATUSES or clean.startswith(TASK_TERMINAL_PREFIXES)
+
+
+def _extract_task_snapshot(payload: dict[str, Any], task_id: str) -> dict[str, Any]:
+    task = payload.get("task") if isinstance(payload.get("task"), dict) else {}
+    runs = payload.get("runs") if isinstance(payload.get("runs"), list) else []
+    approvals = payload.get("approvals") if isinstance(payload.get("approvals"), list) else []
+    observations = payload.get("runtime_observations")
+    if not isinstance(observations, list):
+        observations = payload.get("observations") if isinstance(payload.get("observations"), list) else []
+    latest_run = runs[0] if runs and isinstance(runs[0], dict) else {}
+    status = str(task.get("status") or payload.get("status") or "unknown")
+    phase = str(task.get("current_phase") or latest_run.get("phase") or "")
+    deployment_url = task.get("deployment_url") or task.get("preview_url") or payload.get("deployment_url") or payload.get("preview_url")
+    return {
+        "task_id": str(task.get("id") or payload.get("task_id") or task_id),
+        "ok": bool(payload.get("ok", True)),
+        "status": status,
+        "terminal": _status_is_terminal(status),
+        "phase": phase,
+        "repo": task.get("repo"),
+        "mode": task.get("mode"),
+        "project_id": task.get("project_id"),
+        "thread_id": task.get("thread_id"),
+        "updated_at": task.get("updated_at"),
+        "blocked_reason": task.get("blocked_reason"),
+        "deployment_url": deployment_url,
+        "runs_count": len(runs),
+        "approvals_count": len(approvals),
+        "pending_approvals_count": sum(1 for item in approvals if str((item or {}).get("status") or "") == "pending"),
+        "observations_count": len(observations),
+        "latest_run": latest_run,
+    }
+
+
+def _collect_task_snapshot(args: argparse.Namespace) -> dict[str, Any]:
+    cockpit = collect_cockpit(args)
+    if cockpit.get("skipped"):
+        return {
+            "task_id": args.task_id,
+            "ok": False,
+            "status": "cockpit_skipped",
+            "terminal": True,
+            "error": "Cockpit collection is skipped",
+        }
+    payload = _task_payload_from_cockpit(cockpit, args.task_id)
+    if not payload:
+        return {
+            "task_id": args.task_id,
+            "ok": False,
+            "status": "task_payload_missing",
+            "terminal": False,
+            "cockpit": cockpit,
+        }
+    snapshot = _extract_task_snapshot(payload, args.task_id)
+    snapshot["endpoint"] = _task_endpoint(args.task_id)
+    snapshot["cockpit_ok"] = _cockpit_ok(cockpit)
+    return snapshot
+
+
+def watch_task(args: argparse.Namespace) -> dict[str, Any]:
+    if not args.watch_task:
+        return {"skipped": True}
+    if not args.task_id:
+        return {
+            "ok": False,
+            "status": "missing_task_id",
+            "terminal": True,
+            "samples": [],
+            "error": "--watch-task requires --task-id",
+        }
+
+    deadline = time.monotonic() + max(0, args.watch_timeout)
+    samples: list[dict[str, Any]] = []
+    poll_interval = max(0.5, args.poll_interval)
+    final: dict[str, Any] = {}
+    while True:
+        sample = _collect_task_snapshot(args)
+        sample["sampled_at"] = datetime.now(timezone.utc).isoformat()
+        samples.append(sample)
+        final = sample
+        if sample.get("terminal"):
+            break
+        if time.monotonic() >= deadline:
+            final = {
+                **sample,
+                "terminal": True,
+                "timeout": True,
+                "status": "watch_timeout",
+                "last_task_status": sample.get("status"),
+            }
+            samples[-1] = final
+            break
+        time.sleep(poll_interval)
+
+    return {
+        "ok": bool(final.get("ok")) and not bool(final.get("timeout")),
+        "task_id": args.task_id,
+        "status": final.get("status"),
+        "terminal": bool(final.get("terminal")),
+        "timeout": bool(final.get("timeout")),
+        "samples": samples,
+        "final": final,
+    }
 
 
 def collect_github(args: argparse.Namespace) -> dict[str, Any]:
@@ -348,12 +481,19 @@ def _telegram_ok(telegram: dict[str, Any]) -> bool:
     return str(telegram.get("status")) in {"screenshot_review_required", "sent_review_required"}
 
 
+def _task_watch_ok(task_watch: dict[str, Any]) -> bool:
+    if task_watch.get("skipped"):
+        return True
+    return bool(task_watch.get("terminal")) and not bool(task_watch.get("timeout")) and bool(task_watch.get("ok", True))
+
+
 def summarize_status(report: dict[str, Any]) -> str:
     checks = {
         "telegram": _telegram_ok(report.get("telegram") or {}),
         "cockpit": _cockpit_ok(report.get("cockpit") or {}),
         "github": _github_ok(report.get("github") or {}),
         "deploy": _deploy_ok(report.get("deploy") or {}),
+        "task_watch": _task_watch_ok(report.get("task_watch") or {"skipped": True}),
     }
     report["checks"] = checks
     if all(checks.values()):
@@ -406,6 +546,23 @@ def format_markdown(report: dict[str, Any]) -> str:
             status = data.get("status_code", data.get("error", "?"))
             marker = "OK" if data.get("ok") else "ATTENTION"
             lines.append(f"- {marker} `{endpoint}` -> `{status}`")
+
+    task_watch = report.get("task_watch") or {}
+    lines.extend(["", "## Task Watch", ""])
+    if task_watch.get("skipped"):
+        lines.append("- Skipped.")
+    else:
+        final = task_watch.get("final") or {}
+        lines.append(f"- Task: `{task_watch.get('task_id')}`")
+        lines.append(f"- Status: `{task_watch.get('status')}`")
+        lines.append(f"- Samples: `{len(task_watch.get('samples') or [])}`")
+        lines.append(f"- Timeout: `{bool(task_watch.get('timeout'))}`")
+        if final.get("phase"):
+            lines.append(f"- Phase: `{final.get('phase')}`")
+        if final.get("repo"):
+            lines.append(f"- Repo: `{final.get('repo')}`")
+        if final.get("deployment_url"):
+            lines.append(f"- Deployment URL: `{final.get('deployment_url')}`")
 
     github = report.get("github") or {}
     lines.extend(["", "## GitHub", ""])
@@ -460,6 +617,7 @@ def run_supervisor(args: argparse.Namespace) -> dict[str, Any]:
     report["telegram"] = run_telegram(args)
     if args.wait_after_send > 0:
         time.sleep(args.wait_after_send)
+    report["task_watch"] = watch_task(args)
     report["cockpit"] = collect_cockpit(args)
     report["github"] = collect_github(args)
     report["deploy"] = smoke_deploy_url(args)
@@ -501,6 +659,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--vps-ssh", default="", help="Example: root@134.122.73.242. If set, query Cockpit from the VPS.")
     parser.add_argument("--vps-env-file", default="/home/hermes/.hermes/.env")
     parser.add_argument("--task-id", default="")
+    parser.add_argument("--watch-task", action="store_true", help="Poll Cockpit until the task reaches a terminal status.")
+    parser.add_argument("--watch-timeout", type=float, default=900)
+    parser.add_argument("--poll-interval", type=float, default=15)
 
     parser.add_argument("--github-repo", default="", help="Example: MFcv1/portfolio-v2-hermes-test.")
     parser.add_argument("--github-branch", default="")

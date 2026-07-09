@@ -57,6 +57,8 @@ This phase does not create repos, deploy, merge, or approve anything by itself.
 
 ## Phase 2 — task-aware supervision loop
 
+Status: basic implementation done in `scripts/codex_supervisor_mode.py`.
+
 Add a loop that can watch a `task_id` until it reaches one of:
 
 - `completed`;
@@ -72,6 +74,17 @@ For each poll, record:
 - costs/telemetry if exposed;
 - approvals pending;
 - related GitHub branch/commit if available.
+
+Current implementation:
+
+- `--watch-task --task-id op_xxx` polls Cockpit through
+  `/api/internal/tasks/{task_id}/autonomy`.
+- It stops on terminal statuses such as `completed`,
+  `pilot_questions_required`, `needs_approval`, `needs_merge_approval`,
+  `needs_review`, `deployed_preview`, `failed`, `cancelled`, and `blocked_*`.
+- It records every sampled status in the final JSON/Markdown report.
+- It does not yet send automatic repair/nudge messages; that belongs to
+  Phase 3.
 
 ## Phase 3 — repair/nudge policy
 
