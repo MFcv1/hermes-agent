@@ -301,6 +301,7 @@ from hermes_cli.subcommands.pairing import build_pairing_parser
 from hermes_cli.subcommands.plugins import build_plugins_parser
 from hermes_cli.subcommands.mcp import build_mcp_parser
 from hermes_cli.subcommands.claw import build_claw_parser
+from hermes_cli.subcommands.deploy import build_deploy_parser
 
 
 def _require_tty(command_name: str) -> None:
@@ -11460,7 +11461,7 @@ _BUILTIN_SUBCOMMANDS = frozenset(
     {
         "acp", "auth", "backup", "bundles", "checkpoints", "claw", "completion",
         "computer-use",
-        "config", "cron", "curator", "dashboard", "debug", "doctor",
+        "config", "cron", "curator", "dashboard", "debug", "deploy", "doctor",
         "dump", "fallback", "gateway", "hooks", "import", "insights",
         "gui", "desktop", "kanban", "login", "logout", "logs", "lsp", "mcp", "memory", "migrate",
         "model", "pairing", "plugins", "portal", "postinstall", "profile", "proxy",
@@ -11935,6 +11936,12 @@ def cmd_claw(args):
     claw_command(args)
 
 
+def cmd_deploy(args):
+    from hermes_cli.cloudflare_deploy import cloudflare_deploy_command
+
+    raise SystemExit(cloudflare_deploy_command(args))
+
+
 def main():
     """Main entry point for hermes CLI."""
     # Cosmetic: make the process show up as 'hermes' instead of 'python3.11'
@@ -11986,6 +11993,9 @@ def main():
     # model command  (parser built in hermes_cli/subcommands/model.py)
     # =========================================================================
     build_model_parser(subparsers, cmd_model=cmd_model)
+
+    # Atomic provider deployment workflows (CLI + skill, no model tool).
+    build_deploy_parser(subparsers, cmd_deploy=cmd_deploy)
 
     # =========================================================================
     # fallback command — manage the fallback provider chain
