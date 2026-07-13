@@ -55,6 +55,59 @@ venv/bin/python -m pytest tests/scripts/test_vps_write_roots_audit.py -q
 python3 scripts/vps_smoke_matrix.py --json
 ```
 
+## Durable run lineage and completion
+
+Every supervised mission must keep one immutable `run_id` from the first
+Supervisor invocation through the final report. Pass known task/session/model,
+GitHub and deployment identifiers explicitly; the supervisor writes a
+hash-chained append-only ledger:
+
+```bash
+python3 scripts/codex_supervisor_mode.py \
+  --message "<brief>" \
+  --skip-telegram \
+  --task-id "<task-id>" --watch-task \
+  --session-id "<gateway-session>" \
+  --github-repo "<owner/repo>" --github-branch "<branch>" \
+  --provider "<observed-provider>" --model "<observed-model>" \
+  --budget-calls "<limit>" --used-calls "<observed>" \
+  --ledger-path "$HOME/.hermes/supervisor-runs/ledger.jsonl"
+```
+
+Do not accept `completed`, `done` or `deployed_preview` without a validated
+`PROJECT_STATUS.md`. Start from
+`docs/project/supervision/PROJECT_STATUS_TEMPLATE.md`; it must contain the full
+source SHA, gates, URLs, resources/limits, rollback and next action. Use
+`--project-root` when the project is locally visible. If Cockpit is remote, its
+task payload must expose equivalent `project_status` evidence.
+
+## Self-Ops effectiveness and retention
+
+An exit code zero proves that a cleanup command executed, not that it achieved
+its objective. Measure filesystem bytes before and after and record removed
+paths with `scripts/selfops_effectiveness_guard.py`. Two consecutive successful
+commands below the configured delta become `ineffective`, trigger one
+escalation with top consumers and suspend that action for 24 hours.
+
+Inventory Kanban retention candidates before deletion:
+
+```bash
+hermes kanban gc --event-retention-days 30 --log-retention-days 30 --dry-run
+```
+
+Follow `docs/project/supervision/HERMES_RETENTION_POLICY.md`. Never count a
+zero-delta run as remediation and never automatically remove active-task,
+Supervisor-ledger or N/N-1 rollback evidence.
+
+## VPS changes remain plans until approval
+
+`python3 scripts/vps_maintenance_plan.py --json` generates locally validated
+systemd hardening, a durable loopback-only dashboard unit, release-from-SHA,
+offsite Restic backup and restore-drill plans. Generation is read-only. Do not
+install units, reload/restart services, resize the VPS, create snapshots, alter
+GitHub rulesets, or modify Tailscale ACL/device state without explicit approval
+for that exact operation.
+
 ## Repo Cockpit Telegram Flows
 
 ### `/conv`

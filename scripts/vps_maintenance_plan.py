@@ -23,6 +23,21 @@ DEFAULT_SAFE_ROOTS = (
     "/home/hermes/.hermes",
     "/home/hermes/repo-cockpit",
 )
+REQUIRED_HARDENING_DIRECTIVES = (
+    "NoNewPrivileges=true",
+    "PrivateTmp=true",
+    "ProtectSystem=strict",
+    "ProtectHome=read-only",
+    "RestrictSUIDSGID=true",
+    "LockPersonality=true",
+    "ProtectKernelTunables=true",
+    "ProtectKernelModules=true",
+    "ProtectControlGroups=true",
+    "MemoryMax=",
+    "TasksMax=",
+    "KillMode=control-group",
+    "UMask=0077",
+)
 
 
 def _run(argv: list[str], *, timeout: float = 5) -> dict[str, Any]:
@@ -71,6 +86,85 @@ def _override_content(safe_roots: tuple[str, ...]) -> str:
     )
 
 
+def _hardening_override_content(
+    safe_roots: tuple[str, ...], *, memory_max: str = "2G"
+) -> str:
+    roots = " ".join(safe_roots)
+    return (
+        "[Service]\n"
+        "NoNewPrivileges=true\n"
+        "PrivateTmp=true\n"
+        "ProtectSystem=strict\n"
+        "ProtectHome=read-only\n"
+        f"ReadWritePaths={roots}\n"
+        "RestrictSUIDSGID=true\n"
+        "LockPersonality=true\n"
+        "ProtectKernelTunables=true\n"
+        "ProtectKernelModules=true\n"
+        "ProtectControlGroups=true\n"
+        f"MemoryMax={memory_max}\n"
+        "TasksMax=256\n"
+        "KillMode=control-group\n"
+        "UMask=0077\n"
+    )
+
+
+def _dashboard_unit_content(user: str) -> str:
+    return (
+        "[Unit]\n"
+        "Description=Hermes dashboard\n"
+        "After=network-online.target\n"
+        "Wants=network-online.target\n\n"
+        "[Service]\n"
+        "Type=simple\n"
+        f"User={user}\n"
+        f"WorkingDirectory=/home/{user}/.hermes/hermes-agent\n"
+        f"ExecStart=/home/{user}/.hermes/hermes-agent/venv/bin/python "
+        "-m hermes_cli.main dashboard --no-open --skip-build "
+        "--host 127.0.0.1 --port 9119\n"
+        "Restart=on-failure\n"
+        "RestartSec=5s\n"
+        "NoNewPrivileges=true\n"
+        "PrivateTmp=true\n"
+        "ProtectSystem=strict\n"
+        "ProtectHome=read-only\n"
+        f"ReadWritePaths=/home/{user}/.hermes\n"
+        "MemoryMax=768M\n"
+        "TasksMax=128\n"
+        "KillMode=control-group\n"
+        "UMask=0077\n\n"
+        "[Install]\n"
+        "WantedBy=multi-user.target\n"
+    )
+
+
+def validate_generated_plan(
+    *, hardening_content: str, dashboard_content: str
+) -> dict[str, Any]:
+    missing_hardening = [
+        directive
+        for directive in REQUIRED_HARDENING_DIRECTIVES
+        if directive not in hardening_content
+    ]
+    dashboard_requirements = (
+        "ExecStart=",
+        "--host 127.0.0.1",
+        "Restart=on-failure",
+        "NoNewPrivileges=true",
+        "MemoryMax=",
+        "KillMode=control-group",
+    )
+    missing_dashboard = [
+        directive for directive in dashboard_requirements if directive not in dashboard_content
+    ]
+    return {
+        "ok": not missing_hardening and not missing_dashboard,
+        "missing_hardening": missing_hardening,
+        "missing_dashboard": missing_dashboard,
+        "note": "static local validation; run systemd-analyze security on the Linux target before apply",
+    }
+
+
 def _current_override(path: Path) -> dict[str, Any]:
     out: dict[str, Any] = {"path": str(path), "exists": path.exists()}
     if path.exists():
@@ -95,6 +189,8 @@ def collect_plan(
     uid = _uid_for_user(user)
     xdg = f"XDG_RUNTIME_DIR=/run/user/{uid}"
     roots_value = ":".join(safe_roots)
+    hardening_content = _hardening_override_content(safe_roots)
+    dashboard_content = _dashboard_unit_content(user)
 
     apply_commands = [
         "sudo -u hermes /home/hermes/.hermes/scripts/vps_ops_preflight.py",
@@ -129,9 +225,62 @@ def collect_plan(
         "safe_roots": list(safe_roots),
         "override": current,
         "expected_override_content": expected_content,
+        "hardening_override_content": hardening_content,
+        "dashboard_unit_content": dashboard_content,
+        "local_validation": validate_generated_plan(
+            hardening_content=hardening_content,
+            dashboard_content=dashboard_content,
+        ),
         "apply_commands": apply_commands,
         "postcheck_commands": postcheck_commands,
         "rollback_commands": rollback_commands,
+        "sha_release_plan": [
+            "test -n \"$RELEASE_SHA\" && git -C /home/hermes/.hermes/hermes-agent fetch --prune origin",
+            "git -C /home/hermes/.hermes/hermes-agent worktree add --detach /home/hermes/releases/$RELEASE_SHA $RELEASE_SHA",
+            "test \"$(git -C /home/hermes/releases/$RELEASE_SHA rev-parse HEAD)\" = \"$RELEASE_SHA\"",
+            "ln -sfn /home/hermes/releases/$RELEASE_SHA /home/hermes/releases/current.next",
+            "mv -Tf /home/hermes/releases/current.next /home/hermes/releases/current",
+        ],
+        "offsite_backup_plan": [
+            "test -n \"$RESTIC_REPOSITORY\" && test -n \"$RESTIC_PASSWORD_FILE\"",
+            "restic snapshots --json",
+            "restic backup /home/hermes/repo-cockpit /home/hermes/.hermes --exclude-caches --tag hermes-vps",
+            "restic check --read-data-subset=5%",
+        ],
+        "restore_drill_plan": [
+            "RESTORE_DIR=$(mktemp -d)",
+            "restic restore latest --target \"$RESTORE_DIR\" --tag hermes-vps",
+            "test -d \"$RESTORE_DIR/home/hermes/repo-cockpit\"",
+            "rm -rf \"$RESTORE_DIR\"",
+        ],
+        "capacity_recommendation": {
+            "minimum_ram_bytes": 2 * 1024 * 1024 * 1024,
+            "recommended_ram_bytes": 4 * 1024 * 1024 * 1024,
+            "minimum_available_ram_percent": 20,
+            "maximum_disk_used_percent": 70,
+            "note": "measurement only; resizing is a paid provider action",
+        },
+        "github_governance_audit": [
+            "test -n \"$GITHUB_REPO\"",
+            "gh api repos/$GITHUB_REPO/rulesets",
+            "gh api repos/$GITHUB_REPO/contents/CODEOWNERS",
+            "gh api repos/$GITHUB_REPO/environments/preview",
+        ],
+        "tailscale_readonly_audit": [
+            "tailscale status --json",
+            "tailscale debug prefs",
+            "export ACL, grants, tags and device inventory from the admin console for human review",
+        ],
+        "approval_required": [
+            "production",
+            "DNS",
+            "paid resize or storage",
+            "reboot",
+            "provider snapshot",
+            "GitHub App or ruleset mutation",
+            "Tailscale ACL or device revocation",
+            "systemd install/reload/restart",
+        ],
         "warnings": [
             "read-only plan only; do not run apply commands without an approved maintenance window",
             "gateway restart is required before the running bot sees HERMES_WRITE_SAFE_ROOTS",
@@ -158,6 +307,18 @@ def format_plan(plan: dict[str, Any]) -> str:
     lines.append("")
     lines.append("Rollback commands:")
     lines.extend(f"{idx}. {cmd}" for idx, cmd in enumerate(plan.get("rollback_commands") or [], start=1))
+    lines.append("")
+    lines.append("Local generated-unit validation:")
+    lines.append(json.dumps(plan.get("local_validation") or {}, sort_keys=True))
+    lines.append("")
+    lines.append("SHA release plan (requires approval before service switch):")
+    lines.extend(f"{idx}. {cmd}" for idx, cmd in enumerate(plan.get("sha_release_plan") or [], start=1))
+    lines.append("")
+    lines.append("Offsite backup plan (requires configured remote repository):")
+    lines.extend(f"{idx}. {cmd}" for idx, cmd in enumerate(plan.get("offsite_backup_plan") or [], start=1))
+    lines.append("")
+    lines.append("Restore drill plan:")
+    lines.extend(f"{idx}. {cmd}" for idx, cmd in enumerate(plan.get("restore_drill_plan") or [], start=1))
     warnings = plan.get("warnings") or []
     if warnings:
         lines.append("")

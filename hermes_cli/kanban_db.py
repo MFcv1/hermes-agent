@@ -8047,24 +8047,32 @@ def rewind_notify_cursor(
 
 def gc_events(
     conn: sqlite3.Connection, *, older_than_seconds: int = 30 * 24 * 3600,
+    dry_run: bool = False,
 ) -> int:
     """Delete task_events rows older than ``older_than_seconds`` for tasks
     in a terminal state (``done`` or ``archived``). Returns the number of
     rows deleted. Running / ready / blocked tasks keep their full event
     history."""
     cutoff = int(time.time()) - int(older_than_seconds)
-    with write_txn(conn):
-        cur = conn.execute(
-            "DELETE FROM task_events WHERE created_at < ? AND task_id IN "
-            "(SELECT id FROM tasks WHERE status IN ('done', 'archived'))",
+    predicate = (
+        "created_at < ? AND task_id IN "
+        "(SELECT id FROM tasks WHERE status IN ('done', 'archived'))"
+    )
+    if dry_run:
+        row = conn.execute(
+            f"SELECT COUNT(*) AS count FROM task_events WHERE {predicate}",
             (cutoff,),
-        )
+        ).fetchone()
+        return int(row["count"] if row else 0)
+    with write_txn(conn):
+        cur = conn.execute(f"DELETE FROM task_events WHERE {predicate}", (cutoff,))
     return int(cur.rowcount or 0)
 
 
 def gc_worker_logs(
     *, older_than_seconds: int = 30 * 24 * 3600,
     board: Optional[str] = None,
+    dry_run: bool = False,
 ) -> int:
     """Delete worker log files older than ``older_than_seconds``. Returns
     the number of files removed. Kept separate from ``gc_events`` because
@@ -8079,7 +8087,8 @@ def gc_worker_logs(
     for p in log_dir.iterdir():
         try:
             if p.is_file() and p.stat().st_mtime < cutoff:
-                p.unlink()
+                if not dry_run:
+                    p.unlink()
                 removed += 1
         except OSError:
             continue

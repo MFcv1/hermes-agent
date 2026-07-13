@@ -44,6 +44,19 @@ def _args(tmp_path, **overrides):
         "deploy_url": "",
         "timeout": 1,
         "report_dir": str(tmp_path / "reports"),
+        "ledger_path": str(tmp_path / "reports" / "ledger.jsonl"),
+        "run_id": "",
+        "session_id": "",
+        "project_root": "",
+        "model": "",
+        "provider": "",
+        "effort": "",
+        "budget_calls": None,
+        "used_calls": None,
+        "input_tokens": None,
+        "output_tokens": None,
+        "artifact_digest": "",
+        "deployment_id": "",
         "json": False,
     }
     data.update(overrides)
@@ -100,10 +113,24 @@ def test_supervisor_writes_report_with_all_checks_ok(tmp_path, monkeypatch):
             "required": False,
             "reason": "Task watch was skipped",
         },
+        "handoff": {
+            "outcome": "skipped",
+            "required": False,
+            "reason": "Project handoff was not required",
+        },
     }
     assert Path(report["reports"]["json"]).is_file()
     assert Path(report["reports"]["markdown"]).is_file()
     assert report["legacy_checks"]["github"] is False
+    assert report["run_id"].startswith("sup_")
+    ledger = Path(report["ledger"]["path"])
+    assert ledger.is_file()
+    records = [json.loads(line) for line in ledger.read_text().splitlines()]
+    assert records[0]["event_type"] == "supervisor_run_started"
+    record = records[-1]
+    assert record["run_id"] == report["run_id"]
+    assert record["lineage"]["status"] == "ready_for_human_review"
+    assert record["previous_hash"] == records[0]["record_hash"]
 
 
 def test_supervisor_marks_attention_when_cockpit_health_fails(tmp_path, monkeypatch):
@@ -157,6 +184,7 @@ def test_write_reports_contains_guardrail(tmp_path):
         "telegram": {"skipped": True},
         "cockpit": {"skipped": True},
         "task_watch": {"skipped": True},
+        "handoff": {"skipped": True},
         "github": {"skipped": True},
         "deploy": {"skipped": True},
     }
@@ -257,7 +285,14 @@ def test_supervisor_includes_task_watch_check(tmp_path, monkeypatch):
             "terminal": True,
             "timeout": False,
             "samples": [],
-            "final": {"status": "completed"},
+            "final": {
+                "status": "completed",
+                "project_status": {
+                    "ok": True,
+                    "path": "PROJECT_STATUS.md",
+                    "source_commit": "a" * 40,
+                },
+            },
         },
     )
     monkeypatch.setattr(
@@ -335,6 +370,12 @@ def _check_evidence(name, outcome):
             "skipped": {"skipped": True},
             "unknown": {},
         },
+        "handoff": {
+            "pass": {"ok": True, "path": "PROJECT_STATUS.md", "source_commit": "a" * 40},
+            "fail": {"ok": False, "errors": ["missing Source SHA"]},
+            "skipped": {"skipped": True},
+            "unknown": {},
+        },
     }
     return evidence[name][outcome]
 
@@ -348,11 +389,13 @@ def _summary_report(name, outcome, *, required):
         "github_repo": "MFcv1/example" if name == "github" and required else None,
         "github_branch": None,
         "deploy_url": "https://example.test" if name == "deploy" and required else None,
+        "project_root": "/tmp/project" if name == "handoff" and required else None,
     }
     for check_name in supervisor.CHECK_NAMES:
         report[check_name] = {"skipped": True}
     if name == "task_watch" and required:
         report["cockpit"] = _check_evidence("cockpit", "pass")
+        report["handoff"] = _check_evidence("handoff", "pass")
     report[name] = _check_evidence(name, outcome)
     return report
 
@@ -437,3 +480,90 @@ def test_report_is_redacted_and_bounded(tmp_path):
     assert "sk-proj-abcdefghijklmnopqrstuvwxyz" not in serialized
     assert "TRUNCATED" in serialized
     assert len(sanitized["cockpit"]["items"]) == supervisor.MAX_REPORT_LIST_ITEMS + 1
+
+
+def test_completed_task_without_project_status_is_incomplete(tmp_path, monkeypatch):
+    monkeypatch.setattr(supervisor, "run_telegram", lambda args: {"skipped": True})
+    monkeypatch.setattr(
+        supervisor,
+        "watch_task",
+        lambda args: {
+            "ok": True,
+            "task_id": "op_1",
+            "status": "completed",
+            "terminal": True,
+            "timeout": False,
+            "samples": [],
+            "final": {"status": "completed"},
+        },
+    )
+    monkeypatch.setattr(
+        supervisor,
+        "collect_cockpit",
+        lambda args: {
+            "endpoints": {
+                "/health": {"ok": True},
+                "/api/hosting/capabilities": {"ok": True},
+            }
+        },
+    )
+    monkeypatch.setattr(supervisor, "collect_github", lambda args: {"skipped": True})
+    monkeypatch.setattr(supervisor, "smoke_deploy_url", lambda args: {"skipped": True})
+
+    report = supervisor.run_supervisor(
+        _args(tmp_path, skip_telegram=True, task_id="op_1", watch_task=True)
+    )
+
+    assert report["status"] == "incomplete_evidence"
+    assert report["checks"]["handoff"]["required"] is True
+    assert report["checks"]["handoff"]["outcome"] == "unknown"
+
+
+def test_project_status_contract_and_ledger_hash_chain(tmp_path):
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "PROJECT_STATUS.md").write_text(
+        """# Project Status
+
+## Status
+Ready for review.
+## Source
+Commit: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+Branch: feat/example
+## Gates
+Tests pass.
+## URLs
+No deployment.
+## Resources and limits
+No paid resources.
+## Rollback
+Revert the commit.
+## Next action
+Human review.
+""",
+        encoding="utf-8",
+    )
+
+    handoff = supervisor.collect_handoff(
+        _args(tmp_path, project_root=str(project)),
+        {"skipped": True},
+        {"skipped": True},
+    )
+    assert handoff["ok"] is True
+    assert handoff["source_commit"] == "a" * 40
+
+    ledger = tmp_path / "ledger.jsonl"
+    first = supervisor.append_ledger_event(
+        ledger, {"run_id": "run_1", "status": "started"}
+    )
+    second = supervisor.append_ledger_event(
+        ledger, {"run_id": "run_1", "status": "completed"}
+    )
+    lines = [json.loads(line) for line in ledger.read_text().splitlines()]
+    assert first["sequence"] == 1
+    assert second["sequence"] == 2
+    assert lines[1]["previous_hash"] == lines[0]["record_hash"]
+    assert supervisor.verify_ledger(ledger)["ok"] is True
+    lines[0]["status"] = "tampered"
+    ledger.write_text("\n".join(json.dumps(line) for line in lines) + "\n")
+    assert supervisor.verify_ledger(ledger)["ok"] is False

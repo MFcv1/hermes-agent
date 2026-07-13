@@ -11,15 +11,18 @@ from __future__ import annotations
 
 import argparse
 import enum
+import hashlib
 import importlib.util
 import json
 import os
+import re
 import shlex
 import subprocess
 import sys
 import time
 import urllib.error
 import urllib.request
+import uuid
 from datetime import datetime, timezone
 from functools import lru_cache
 from pathlib import Path
@@ -52,7 +55,7 @@ TASK_TERMINAL_STATUSES = {
 TASK_TERMINAL_PREFIXES = ("blocked_",)
 TASK_SUCCESS_STATUSES = {"completed", "deployed_preview", "done"}
 
-CHECK_NAMES = ("telegram", "cockpit", "github", "deploy", "task_watch")
+CHECK_NAMES = ("telegram", "cockpit", "github", "deploy", "task_watch", "handoff")
 MAX_REPORT_STRING_CHARS = 4000
 MAX_REPORT_LIST_ITEMS = 50
 MAX_REPORT_DEPTH = 10
@@ -103,6 +106,78 @@ def _safe_slug(value: str) -> str:
 
 def _utc_stamp() -> str:
     return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+
+
+def _new_run_id() -> str:
+    return f"sup_{_utc_stamp().lower()}_{uuid.uuid4().hex[:12]}"
+
+
+def _canonical_hash(value: dict[str, Any]) -> str:
+    payload = json.dumps(
+        value, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def append_ledger_event(path: Path, event: dict[str, Any]) -> dict[str, Any]:
+    """Append one hash-chained event without rewriting earlier evidence."""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a+", encoding="utf-8") as handle:
+        try:
+            import fcntl
+
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        except (ImportError, OSError):
+            pass
+        handle.seek(0)
+        lines = [line for line in handle.read().splitlines() if line.strip()]
+        previous: dict[str, Any] = {}
+        if lines:
+            try:
+                previous = json.loads(lines[-1])
+            except json.JSONDecodeError as exc:
+                raise RuntimeError(f"ledger tail is invalid JSON: {path}") from exc
+        record = {
+            "schema": 1,
+            "sequence": int(previous.get("sequence") or 0) + 1,
+            "event_id": f"evt_{uuid.uuid4().hex}",
+            "recorded_at": datetime.now(timezone.utc).isoformat(),
+            "previous_hash": str(previous.get("record_hash") or ""),
+            **sanitize_report(event),
+        }
+        record["record_hash"] = _canonical_hash(record)
+        handle.seek(0, os.SEEK_END)
+        handle.write(json.dumps(record, sort_keys=True, ensure_ascii=False) + "\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+        return record
+
+
+def verify_ledger(path: Path) -> dict[str, Any]:
+    previous_hash = ""
+    count = 0
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError as exc:
+        return {"ok": False, "records": 0, "error": str(exc)}
+    for expected_sequence, line in enumerate(lines, start=1):
+        if not line.strip():
+            continue
+        count += 1
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            return {"ok": False, "records": count - 1, "error": "invalid_json"}
+        claimed_hash = str(record.pop("record_hash", ""))
+        if record.get("sequence") != expected_sequence:
+            return {"ok": False, "records": count - 1, "error": "sequence_mismatch"}
+        if record.get("previous_hash") != previous_hash:
+            return {"ok": False, "records": count - 1, "error": "chain_mismatch"}
+        if _canonical_hash(record) != claimed_hash:
+            return {"ok": False, "records": count - 1, "error": "hash_mismatch"}
+        previous_hash = claimed_hash
+    return {"ok": True, "records": count, "head_hash": previous_hash}
 
 
 def _load_script_module(name: str):
@@ -327,6 +402,11 @@ def _extract_task_snapshot(payload: dict[str, Any], task_id: str) -> dict[str, A
     status = str(task.get("status") or payload.get("status") or "unknown")
     phase = str(task.get("current_phase") or latest_run.get("phase") or "")
     deployment_url = task.get("deployment_url") or task.get("preview_url") or payload.get("deployment_url") or payload.get("preview_url")
+    project_status = (
+        task.get("project_status")
+        or latest_run.get("project_status")
+        or payload.get("project_status")
+    )
     return {
         "task_id": str(task.get("id") or payload.get("task_id") or task_id),
         "ok": bool(payload.get("ok", True)),
@@ -345,7 +425,75 @@ def _extract_task_snapshot(payload: dict[str, Any], task_id: str) -> dict[str, A
         "pending_approvals_count": sum(1 for item in approvals if str((item or {}).get("status") or "") == "pending"),
         "observations_count": len(observations),
         "latest_run": latest_run,
+        "project_status": project_status,
     }
+
+
+PROJECT_STATUS_HEADINGS = {
+    "status": ("status",),
+    "source": ("source",),
+    "gates": ("gates", "checks"),
+    "urls": ("urls", "url", "deployments"),
+    "resources": ("resources", "resources and limits", "limits"),
+    "rollback": ("rollback",),
+    "next_action": ("next action", "next steps", "prochaine action"),
+}
+FULL_SHA_RE = re.compile(r"(?<![0-9a-f])[0-9a-f]{40,64}(?![0-9a-f])", re.I)
+
+
+def validate_project_status(path: Path) -> dict[str, Any]:
+    if not path.is_file():
+        return {"ok": False, "path": str(path), "errors": ["PROJECT_STATUS.md missing"]}
+    text = path.read_text(encoding="utf-8", errors="replace")
+    headings = {
+        match.group(1).strip().lower()
+        for match in re.finditer(r"^#{2,6}\s+(.+?)\s*$", text, re.MULTILINE)
+    }
+    errors = []
+    for field, aliases in PROJECT_STATUS_HEADINGS.items():
+        if not any(alias in headings for alias in aliases):
+            errors.append(f"missing {field} section")
+    sha_match = FULL_SHA_RE.search(text)
+    if not sha_match:
+        errors.append("missing full source commit SHA")
+    return {
+        "ok": not errors,
+        "path": str(path),
+        "source_commit": sha_match.group(0).lower() if sha_match else None,
+        "errors": errors,
+    }
+
+
+def collect_handoff(
+    args: argparse.Namespace,
+    task_watch: dict[str, Any],
+    github: dict[str, Any],
+) -> dict[str, Any]:
+    if getattr(args, "project_root", ""):
+        root = Path(args.project_root).expanduser().resolve()
+        result = validate_project_status(root / "PROJECT_STATUS.md")
+        branch = github.get("branch") if isinstance(github, dict) else {}
+        info = branch.get("info") if isinstance(branch, dict) else {}
+        github_sha = str((info or {}).get("sha") or "").lower()
+        if result.get("ok") and github_sha and result.get("source_commit") != github_sha:
+            result["ok"] = False
+            result.setdefault("errors", []).append(
+                "PROJECT_STATUS source SHA differs from GitHub branch SHA"
+            )
+        return result
+
+    final = task_watch.get("final") if isinstance(task_watch, dict) else {}
+    status = str((final or {}).get("status") or task_watch.get("status") or "").lower()
+    evidence = (final or {}).get("project_status")
+    if isinstance(evidence, dict):
+        source_commit = str(evidence.get("source_commit") or "")
+        ok = bool(evidence.get("ok")) and bool(evidence.get("path")) and bool(
+            FULL_SHA_RE.fullmatch(source_commit)
+        )
+        return {**evidence, "ok": ok}
+    if status in TASK_SUCCESS_STATUSES:
+        return {}
+    return {"skipped": True}
 
 
 def _collect_task_snapshot(args: argparse.Namespace) -> dict[str, Any]:
@@ -567,12 +715,23 @@ def _task_watch_outcome(task_watch: dict[str, Any]) -> tuple[CheckOutcome, str]:
     return CheckOutcome.UNKNOWN, "Task terminal outcome is not recognized"
 
 
+def _handoff_outcome(handoff: dict[str, Any]) -> tuple[CheckOutcome, str]:
+    if handoff.get("skipped"):
+        return CheckOutcome.SKIPPED, "Project handoff was not required"
+    if "ok" not in handoff:
+        return CheckOutcome.UNKNOWN, "PROJECT_STATUS.md evidence is missing"
+    if handoff.get("ok") is True:
+        return CheckOutcome.PASS, "PROJECT_STATUS.md contract passed"
+    return CheckOutcome.FAIL, "PROJECT_STATUS.md contract failed"
+
+
 CHECK_EVALUATORS = {
     "telegram": _telegram_outcome,
     "cockpit": _cockpit_outcome,
     "github": _github_outcome,
     "deploy": _deploy_outcome,
     "task_watch": _task_watch_outcome,
+    "handoff": _handoff_outcome,
 }
 
 
@@ -580,12 +739,14 @@ def _required_checks(report: dict[str, Any]) -> dict[str, bool]:
     """Derive evidence obligations from the requested run, not its result."""
 
     task_requested = bool(report.get("task_id") or report.get("watch_task"))
+    task_status = str((report.get("task_watch") or {}).get("status") or "").lower()
     return {
         "telegram": not bool(report.get("skip_telegram")),
         "cockpit": not bool(report.get("skip_cockpit")) or task_requested,
         "github": bool(report.get("github_repo") or report.get("github_branch")),
         "deploy": bool(report.get("deploy_url")),
         "task_watch": task_requested,
+        "handoff": bool(report.get("project_root")) or task_status in TASK_SUCCESS_STATUSES,
     }
 
 
@@ -669,6 +830,7 @@ def format_markdown(report: dict[str, Any]) -> str:
         f"- Started: `{report.get('started_at')}`",
         f"- Status: `{report.get('status')}`",
         f"- Intent: `{report.get('intent')}`",
+        f"- Run ID: `{report.get('run_id')}`",
         "",
         "## Checks",
         "",
@@ -739,6 +901,19 @@ def format_markdown(report: dict[str, Any]) -> str:
         if deploy.get("status_code"):
             lines.append(f"- HTTP: `{deploy.get('status_code')}`")
 
+    handoff = report.get("handoff") or {}
+    lines.extend(["", "## Project handoff", ""])
+    if handoff.get("skipped"):
+        lines.append("- Not required for this run.")
+    else:
+        lines.append(f"- Contract OK: `{handoff.get('ok')}`")
+        if handoff.get("path"):
+            lines.append(f"- Path: `{handoff.get('path')}`")
+        if handoff.get("source_commit"):
+            lines.append(f"- Source commit: `{handoff.get('source_commit')}`")
+        for error in handoff.get("errors") or []:
+            lines.append(f"- Error: {error}")
+
     lines.extend(
         [
             "",
@@ -759,6 +934,7 @@ def run_supervisor(args: argparse.Namespace) -> dict[str, Any]:
 
     report: dict[str, Any] = {
         "schema": 2,
+        "run_id": args.run_id or _new_run_id(),
         "started_at": datetime.now(timezone.utc).isoformat(),
         "intent": intent,
         "send": bool(args.send),
@@ -766,10 +942,37 @@ def run_supervisor(args: argparse.Namespace) -> dict[str, Any]:
         "github_repo": args.github_repo or None,
         "github_branch": args.github_branch or None,
         "deploy_url": args.deploy_url or None,
+        "session_id": args.session_id or None,
+        "project_root": args.project_root or None,
+        "model": args.model or None,
+        "provider": args.provider or None,
+        "effort": args.effort or None,
+        "budget_calls": args.budget_calls,
+        "used_calls": args.used_calls,
+        "input_tokens": args.input_tokens,
+        "output_tokens": args.output_tokens,
+        "artifact_digest": args.artifact_digest or None,
+        "deployment_id": args.deployment_id or None,
         "skip_telegram": bool(args.skip_telegram),
         "skip_cockpit": bool(args.skip_cockpit),
         "watch_task": bool(args.watch_task),
     }
+    ledger_path = Path(args.ledger_path).expanduser()
+    append_ledger_event(
+        ledger_path,
+        {
+            "run_id": report["run_id"],
+            "event_type": "supervisor_run_started",
+            "lineage": {
+                "task_id": report.get("task_id"),
+                "session_id": report.get("session_id"),
+                "repo": report.get("github_repo"),
+                "branch": report.get("github_branch"),
+                "intent": report.get("intent"),
+                "status": "running",
+            },
+        },
+    )
 
     report["telegram"] = run_telegram(args)
     if args.wait_after_send > 0:
@@ -778,8 +981,52 @@ def run_supervisor(args: argparse.Namespace) -> dict[str, Any]:
     report["cockpit"] = collect_cockpit(args)
     report["github"] = collect_github(args)
     report["deploy"] = smoke_deploy_url(args)
+    report["handoff"] = collect_handoff(args, report["task_watch"], report["github"])
     report["status"] = summarize_status(report)
     report = sanitize_report(report)
+    final_task = (report.get("task_watch") or {}).get("final") or {}
+    if not isinstance(final_task, dict):
+        final_task = {}
+    latest_task_run = final_task.get("latest_run") or {}
+    if not isinstance(latest_task_run, dict):
+        latest_task_run = {}
+    github_branch = (report.get("github") or {}).get("branch") or {}
+    github_info = github_branch.get("info") or {}
+    if not isinstance(github_info, dict):
+        github_info = {}
+    ledger_event = append_ledger_event(
+        ledger_path,
+        {
+            "run_id": report["run_id"],
+            "event_type": "supervisor_run_evaluated",
+            "lineage": {
+                "task_id": report.get("task_id"),
+                "session_id": report.get("session_id"),
+                "model": report.get("model"),
+                "provider": report.get("provider"),
+                "effort": report.get("effort"),
+                "budget_calls": report.get("budget_calls"),
+                "used_calls": report.get("used_calls")
+                or latest_task_run.get("api_call_count"),
+                "input_tokens": report.get("input_tokens"),
+                "output_tokens": report.get("output_tokens"),
+                "repo": report.get("github_repo"),
+                "branch": report.get("github_branch"),
+                "source_commit": github_info.get("sha")
+                or (report.get("handoff") or {}).get("source_commit"),
+                "gates": report.get("checks"),
+                "artifact_digest": report.get("artifact_digest"),
+                "deployment_id": report.get("deployment_id"),
+                "deployment_url": report.get("deploy_url"),
+                "status": report.get("status"),
+            },
+        },
+    )
+    report["ledger"] = {
+        "path": str(ledger_path),
+        "sequence": ledger_event["sequence"],
+        "record_hash": ledger_event["record_hash"],
+    }
     report["reports"] = write_reports(report, Path(args.report_dir).expanduser())
     return report
 
@@ -826,8 +1073,25 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--github-repo", default="", help="Example: MFcv1/portfolio-v2-hermes-test.")
     parser.add_argument("--github-branch", default="")
     parser.add_argument("--deploy-url", default="")
+    parser.add_argument("--run-id", default="", help="Resume a known immutable supervisor run ID.")
+    parser.add_argument("--session-id", default="", help="Gateway session lineage, when known.")
+    parser.add_argument("--project-root", default="", help="Local project root containing PROJECT_STATUS.md.")
+    parser.add_argument("--model", default="", help="Observed model recorded in the run ledger.")
+    parser.add_argument("--provider", default="", help="Observed provider recorded in the run ledger.")
+    parser.add_argument("--effort", default="", help="Observed reasoning effort recorded in the run ledger.")
+    parser.add_argument("--budget-calls", type=int, default=None)
+    parser.add_argument("--used-calls", type=int, default=None)
+    parser.add_argument("--input-tokens", type=int, default=None)
+    parser.add_argument("--output-tokens", type=int, default=None)
+    parser.add_argument("--artifact-digest", default="")
+    parser.add_argument("--deployment-id", default="")
     parser.add_argument("--timeout", type=float, default=25)
     parser.add_argument("--report-dir", default=str(_default_report_dir()))
+    parser.add_argument(
+        "--ledger-path",
+        default=str(_default_report_dir() / "ledger.jsonl"),
+        help="Append-only supervisor lineage ledger.",
+    )
     parser.add_argument("--json", action="store_true")
     return parser
 

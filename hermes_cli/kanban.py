@@ -843,6 +843,10 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                       help="Delete task_events older than N days for terminal tasks (default: 30)")
     p_gc.add_argument("--log-retention-days", type=int, default=30,
                       help="Delete worker log files older than N days (default: 30)")
+    p_gc.add_argument(
+        "--dry-run", action="store_true",
+        help="Report eligible workspaces, events, and logs without deleting them",
+    )
 
     kanban_parser.set_defaults(_kanban_parser=kanban_parser)
     return kanban_parser
@@ -2673,6 +2677,7 @@ def _cmd_gc(args: argparse.Namespace) -> int:
     delete old worker logs."""
     import shutil
     scratch_root = kb.workspaces_root()
+    dry_run = bool(getattr(args, "dry_run", False))
     removed_ws = 0
     with kb.connect_closing() as conn:
         rows = conn.execute(
@@ -2692,7 +2697,8 @@ def _cmd_gc(args: argparse.Namespace) -> int:
             # Safety: never delete outside the scratch root.
             continue
         if path.exists() and path.is_dir():
-            shutil.rmtree(path, ignore_errors=True)
+            if not dry_run:
+                shutil.rmtree(path, ignore_errors=True)
             removed_ws += 1
 
     event_days = getattr(args, "event_retention_days", 30)
@@ -2700,12 +2706,16 @@ def _cmd_gc(args: argparse.Namespace) -> int:
     with kb.connect_closing() as conn:
         removed_events = kb.gc_events(
             conn, older_than_seconds=event_days * 24 * 3600,
+            dry_run=dry_run,
         )
     removed_logs = kb.gc_worker_logs(
         older_than_seconds=log_days * 24 * 3600,
+        dry_run=dry_run,
     )
-    print(f"GC complete: {removed_ws} workspace(s), "
-          f"{removed_events} event row(s), {removed_logs} log file(s) removed")
+    label = "GC dry-run" if dry_run else "GC complete"
+    suffix = "eligible" if dry_run else "removed"
+    print(f"{label}: {removed_ws} workspace(s), "
+          f"{removed_events} event row(s), {removed_logs} log file(s) {suffix}")
     return 0
 
 

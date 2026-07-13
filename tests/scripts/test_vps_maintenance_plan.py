@@ -66,3 +66,47 @@ def test_format_plan_includes_apply_postcheck_and_rollback_sections(tmp_path, mo
     assert "Apply commands:" in text
     assert "Post-check commands:" in text
     assert "Rollback commands:" in text
+
+
+def test_plan_contains_locally_validated_hardening_dashboard_and_offsite_backup(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(vps_maintenance_plan, "_home_for_user", lambda _user: tmp_path)
+    monkeypatch.setattr(vps_maintenance_plan, "_uid_for_user", lambda _user: "1001")
+
+    plan = vps_maintenance_plan.collect_plan()
+
+    assert plan["local_validation"]["ok"] is True
+    hardening = plan["hardening_override_content"]
+    for directive in (
+        "NoNewPrivileges=true",
+        "PrivateTmp=true",
+        "ProtectSystem=strict",
+        "MemoryMax=",
+        "TasksMax=",
+        "KillMode=control-group",
+    ):
+        assert directive in hardening
+    assert "ExecStart=" in plan["dashboard_unit_content"]
+    assert "--host 127.0.0.1" in plan["dashboard_unit_content"]
+    assert any("restic check" in command for command in plan["offsite_backup_plan"])
+    assert any("restic restore" in command for command in plan["restore_drill_plan"])
+    assert any("worktree add --detach" in command for command in plan["sha_release_plan"])
+    assert plan["capacity_recommendation"]["minimum_ram_bytes"] == 2 * 1024**3
+    assert any("rulesets" in command for command in plan["github_governance_audit"])
+    assert plan["tailscale_readonly_audit"][0] == "tailscale status --json"
+    assert "production" in plan["approval_required"]
+
+
+def test_hardening_validator_fails_when_required_directive_is_removed():
+    content = vps_maintenance_plan._hardening_override_content(
+        ("/home/hermes/.hermes",), memory_max="2G"
+    ).replace("NoNewPrivileges=true\n", "")
+
+    result = vps_maintenance_plan.validate_generated_plan(
+        hardening_content=content,
+        dashboard_content="[Service]\nExecStart=/bin/true --host 127.0.0.1\n",
+    )
+
+    assert result["ok"] is False
+    assert "NoNewPrivileges=true" in result["missing_hardening"]

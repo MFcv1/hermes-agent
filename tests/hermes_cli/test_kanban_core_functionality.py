@@ -886,6 +886,35 @@ def test_cli_gc_reports_counts(kanban_home):
     assert "GC complete" in out
 
 
+def test_cli_gc_dry_run_reports_candidates_without_deleting(kanban_home):
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="old scratch")
+        kb.archive_task(conn, tid)
+        conn.execute("UPDATE task_events SET created_at = 0 WHERE task_id = ?", (tid,))
+        conn.commit()
+    finally:
+        conn.close()
+    workspace = kb.workspaces_root() / tid
+    workspace.mkdir(parents=True)
+    (workspace / "artifact.txt").write_text("keep", encoding="utf-8")
+    log = kb.worker_log_path(tid)
+    log.parent.mkdir(parents=True, exist_ok=True)
+    log.write_text("keep", encoding="utf-8")
+    os.utime(log, (0, 0))
+
+    out = run_slash("gc --event-retention-days 1 --log-retention-days 1 --dry-run")
+
+    assert "GC dry-run" in out
+    assert workspace.is_dir()
+    assert log.is_file()
+    with kb.connect_closing() as conn:
+        count = conn.execute(
+            "SELECT COUNT(*) FROM task_events WHERE task_id = ?", (tid,)
+        ).fetchone()[0]
+    assert count > 0
+
+
 # ---------------------------------------------------------------------------
 # run_slash parity — every verb returns a sensible, non-crashy string
 # ---------------------------------------------------------------------------
