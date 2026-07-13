@@ -50,8 +50,15 @@ def test_run_conversation_persists_tokens_for_telegram_sessions():
     result = agent.run_conversation("hello")
 
     assert result["final_response"] == "done"
-    session_db.update_token_counts.assert_called_once()
-    assert session_db.update_token_counts.call_args.args[0] == "telegram-session"
+    assert session_db.update_token_counts.call_count == 2
+    assert all(
+        call.args[0] == "telegram-session"
+        for call in session_db.update_token_counts.call_args_list
+    )
+    assert sum(
+        call.kwargs.get("api_call_count", 0)
+        for call in session_db.update_token_counts.call_args_list
+    ) == 1
 
 
 def test_run_conversation_persists_tokens_for_cron_sessions():
@@ -61,8 +68,15 @@ def test_run_conversation_persists_tokens_for_cron_sessions():
     result = agent.run_conversation("hello")
 
     assert result["final_response"] == "done"
-    session_db.update_token_counts.assert_called_once()
-    assert session_db.update_token_counts.call_args.args[0] == "cron-session"
+    assert session_db.update_token_counts.call_count == 2
+    assert all(
+        call.args[0] == "cron-session"
+        for call in session_db.update_token_counts.call_args_list
+    )
+    assert sum(
+        call.kwargs.get("api_call_count", 0)
+        for call in session_db.update_token_counts.call_args_list
+    ) == 1
 
 
 def test_session_search_lazily_opens_db_when_entrypoint_did_not_pass_one(monkeypatch):

@@ -1526,6 +1526,11 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
                 final_response = "I reached the iteration limit and couldn't generate a summary."
         else:
             # Retry summary generation
+            if agent.run_envelope.budget.snapshot()["remaining"] <= 0:
+                return (
+                    "I reached the iteration limit and the reserved final call "
+                    "did not produce a text summary."
+                )
             if agent.api_mode == "codex_responses":
                 codex_kwargs = agent._build_api_kwargs(api_messages)
                 codex_kwargs.pop("tools", None)

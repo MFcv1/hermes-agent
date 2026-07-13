@@ -9116,9 +9116,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         context = build_session_context(source, self.config, session_entry)
         
         # Set session context variables for tools (task-local, concurrency-safe)
-        _session_env_tokens = self._set_session_env(
+        _session_env_tokens = self._set_session_env_for_generation(
             context,
-            session_generation=self._current_session_generation(session_key),
+            self._current_session_generation(session_key),
         )
         
         # Read privacy.redact_pii from config (re-read per message)
@@ -12924,6 +12924,31 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             async_delivery=_async_delivery,
         )
 
+    def _set_session_env_for_generation(
+        self,
+        context: SessionContext,
+        session_generation: int,
+    ) -> list:
+        """Set session vars while preserving compatibility with narrow overrides.
+
+        A few adapters and test harnesses replace the private setter with a
+        one-argument callable.  Generation propagation is mandatory for the
+        built-in implementation, while legacy overrides should keep working.
+        """
+        setter = self._set_session_env
+        try:
+            parameters = inspect.signature(setter).parameters.values()
+            accepts_generation = any(
+                parameter.name == "session_generation"
+                or parameter.kind is inspect.Parameter.VAR_KEYWORD
+                for parameter in parameters
+            )
+        except (TypeError, ValueError):
+            accepts_generation = True
+        if accepts_generation:
+            return setter(context, session_generation=session_generation)
+        return setter(context)
+
     def _clear_session_env(self, tokens: list) -> None:
         """Restore session context variables to their pre-handler values."""
         from gateway.session_context import clear_session_vars
@@ -14085,7 +14110,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if running_agent and running_agent is not _AGENT_PENDING_SENTINEL:
             running_agent.interrupt(interrupt_reason)
         if adapter and hasattr(adapter, "interrupt_session_activity"):
-            await adapter.interrupt_session_activity(session_key, source.chat_id)
+            interrupt_result = adapter.interrupt_session_activity(session_key, source.chat_id)
+            if inspect.isawaitable(interrupt_result):
+                await interrupt_result
         if release_running_state:
             self._release_running_agent_state(session_key)
 

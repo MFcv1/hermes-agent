@@ -648,6 +648,7 @@ async def test_send_restart_notification_logs_info_on_sendresult_success(
 @pytest.mark.asyncio
 async def test_shutdown_notifications_use_cached_live_thread_source_when_origin_missing():
     runner, adapter = make_restart_runner()
+    runner._restart_requested = True
     source = make_restart_source(chat_id="parent-42", chat_type="group", thread_id="topic-7")
     session_key = build_session_key(source)
 
@@ -658,11 +659,11 @@ async def test_shutdown_notifications_use_cached_live_thread_source_when_origin_
 
     await runner._notify_active_sessions_of_shutdown()
 
-    adapter.send.assert_awaited_once_with(
-        "parent-42",
-        "⚠️ Gateway shutting down — Your current task will be interrupted.",
-        metadata={"thread_id": "topic-7"},
-    )
+    adapter.send.assert_awaited_once()
+    send_args = adapter.send.await_args
+    assert send_args.args[0] == "parent-42"
+    assert "restarting" in send_args.args[1]
+    assert send_args.kwargs["metadata"] == {"thread_id": "topic-7"}
 
 
 @pytest.mark.asyncio

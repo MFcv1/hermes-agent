@@ -211,10 +211,14 @@ def build_turn_context(
         agent.run_envelope = RunEnvelope.create(
             session_id=agent.session_id,
             task_id=effective_task_id,
-            session_generation=getattr(agent.run_envelope, "session_generation", 0),
+            session_generation=getattr(
+                getattr(agent, "run_envelope", None),
+                "session_generation",
+                0,
+            ),
             model=agent.model,
             provider=agent.provider,
-            effort=reasoning_effort(agent.reasoning_config),
+            effort=reasoning_effort(getattr(agent, "reasoning_config", None)),
             budget_limit=agent.max_iterations,
         )
     else:

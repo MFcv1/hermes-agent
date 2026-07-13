@@ -1089,7 +1089,21 @@ _SLACK_PRIORITY_ALIASES = ("btw", "bg")
 #   - credits: the billing/top-up surface; reached via /hermes credits on Slack.
 #   - billing: the terminal-billing surface (buy/auto-reload/limit); /hermes billing.
 #   - debug: the log/report upload surface; reached via /hermes debug on Slack.
-_SLACK_VIA_HERMES_ONLY = frozenset({"credits", "billing", "debug"})
+_SLACK_VIA_HERMES_ONLY = frozenset(
+    {
+        "billing",
+        "credits",
+        "debug",
+        "insights",
+        "platform",
+        "restart",
+        "update",
+        "updatecheck",
+        "usage",
+        "version",
+        "vps",
+    }
+)
 
 
 def _sanitize_slack_name(raw: str) -> str:

@@ -1105,7 +1105,9 @@ def test_run_conversation_codex_tool_round_trip(monkeypatch):
     responses = [_codex_tool_call_response(), _codex_message_response("done")]
     monkeypatch.setattr(agent, "_interruptible_api_call", lambda api_kwargs: responses.pop(0))
 
-    def _fake_execute_tool_calls(assistant_message, messages, effective_task_id):
+    def _fake_execute_tool_calls(
+        assistant_message, messages, effective_task_id, api_call_count
+    ):
         for call in assistant_message.tool_calls:
             messages.append(
                 {
@@ -1296,7 +1298,9 @@ def test_run_conversation_codex_replay_payload_keeps_call_id(monkeypatch):
 
     monkeypatch.setattr(agent, "_interruptible_api_call", _fake_api_call)
 
-    def _fake_execute_tool_calls(assistant_message, messages, effective_task_id):
+    def _fake_execute_tool_calls(
+        assistant_message, messages, effective_task_id, api_call_count
+    ):
         for call in assistant_message.tool_calls:
             messages.append(
                 {
@@ -1331,7 +1335,9 @@ def test_run_conversation_codex_continues_after_incomplete_interim_message(monke
     ]
     monkeypatch.setattr(agent, "_interruptible_api_call", lambda api_kwargs: responses.pop(0))
 
-    def _fake_execute_tool_calls(assistant_message, messages, effective_task_id):
+    def _fake_execute_tool_calls(
+        assistant_message, messages, effective_task_id, api_call_count
+    ):
         for call in assistant_message.tool_calls:
             messages.append(
                 {
@@ -1769,7 +1775,9 @@ def test_run_conversation_codex_continues_after_commentary_phase_message(monkeyp
     ]
     monkeypatch.setattr(agent, "_interruptible_api_call", lambda api_kwargs: responses.pop(0))
 
-    def _fake_execute_tool_calls(assistant_message, messages, effective_task_id):
+    def _fake_execute_tool_calls(
+        assistant_message, messages, effective_task_id, api_call_count
+    ):
         for call in assistant_message.tool_calls:
             messages.append(
                 {
@@ -1805,7 +1813,9 @@ def test_run_conversation_codex_continues_after_ack_stop_message(monkeypatch):
     ]
     monkeypatch.setattr(agent, "_interruptible_api_call", lambda api_kwargs: responses.pop(0))
 
-    def _fake_execute_tool_calls(assistant_message, messages, effective_task_id):
+    def _fake_execute_tool_calls(
+        assistant_message, messages, effective_task_id, api_call_count
+    ):
         for call in assistant_message.tool_calls:
             messages.append(
                 {
@@ -1846,7 +1856,9 @@ def test_run_conversation_codex_continues_after_ack_for_directory_listing_prompt
     ]
     monkeypatch.setattr(agent, "_interruptible_api_call", lambda api_kwargs: responses.pop(0))
 
-    def _fake_execute_tool_calls(assistant_message, messages, effective_task_id):
+    def _fake_execute_tool_calls(
+        assistant_message, messages, effective_task_id, api_call_count
+    ):
         for call in assistant_message.tool_calls:
             messages.append(
                 {

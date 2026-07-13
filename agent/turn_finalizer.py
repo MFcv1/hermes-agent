@@ -126,7 +126,7 @@ def finalize_turn(
     completed = (
         final_response is not None
         and api_call_count < agent.max_iterations
-        and not (_run_envelope is not None and _run_envelope.budget.work_remaining <= 0)
+        and _turn_exit_reason.startswith("text_response(")
         and not failed
     )
 
