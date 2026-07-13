@@ -13,6 +13,7 @@ import fnmatch
 import logging
 import os
 import re
+import secrets
 import sys
 import threading
 import time
@@ -727,7 +728,8 @@ def unregister_gateway_notify(session_key: str) -> None:
 
 
 def resolve_gateway_approval(session_key: str, choice: str,
-                             resolve_all: bool = False) -> int:
+                             resolve_all: bool = False,
+                             approval_id: str | None = None) -> int:
     """Called by the gateway's /approve or /deny handler to unblock
     waiting agent thread(s).
 
@@ -741,7 +743,19 @@ def resolve_gateway_approval(session_key: str, choice: str,
         queue = _gateway_queues.get(session_key)
         if not queue:
             return 0
-        if resolve_all:
+        if approval_id:
+            target = next(
+                (
+                    entry for entry in queue
+                    if str(entry.data.get("approval_id") or "") == approval_id
+                ),
+                None,
+            )
+            if target is None:
+                return 0
+            queue.remove(target)
+            targets = [target]
+        elif resolve_all:
             targets = list(queue)
             queue.clear()
         else:
@@ -759,6 +773,21 @@ def has_blocking_approval(session_key: str) -> bool:
     """Check if a session has one or more blocking gateway approvals waiting."""
     with _lock:
         return bool(_gateway_queues.get(session_key))
+
+
+def list_gateway_approvals(session_key: str) -> list[dict]:
+    """Return bounded metadata for unresolved approvals in FIFO order."""
+    with _lock:
+        entries = list(_gateway_queues.get(session_key) or [])
+    return [
+        {
+            "approval_id": str(entry.data.get("approval_id") or ""),
+            "run_id": str(entry.data.get("run_id") or ""),
+            "command": str(entry.data.get("command") or "")[:200],
+            "description": str(entry.data.get("description") or "")[:200],
+        }
+        for entry in entries
+    ]
 
 
 def submit_pending(session_key: str, approval: dict):
@@ -1364,6 +1393,19 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
     notify callback raised.  Persistence of an approved choice and building
     the final tool-facing result dict remain the caller's responsibility.
     """
+    approval_data = dict(approval_data)
+    try:
+        from gateway.session_context import get_session_env
+
+        run_id = get_session_env("HERMES_RUN_ID", "") or ""
+    except Exception:
+        run_id = ""
+    approval_data.setdefault("run_id", run_id or _approval_turn_id.get() or session_key)
+    approval_data.setdefault(
+        "approval_id",
+        _approval_tool_call_id.get() or f"op_{secrets.token_hex(6)}",
+    )
+
     command = approval_data.get("command", "")
     description = approval_data.get("description", "")
     primary_key = approval_data.get("pattern_key", "")

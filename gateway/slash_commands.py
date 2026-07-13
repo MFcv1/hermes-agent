@@ -3897,6 +3897,7 @@ class GatewaySlashCommandsMixin:
 
         from tools.approval import (
             resolve_gateway_approval, has_blocking_approval,
+            list_gateway_approvals,
         )
 
         if not has_blocking_approval(session_key):
@@ -3908,7 +3909,21 @@ class GatewaySlashCommandsMixin:
         # Parse args: support "all", "all session", "all always", "session", "always"
         args = event.get_command_args().strip().lower().split()
         resolve_all = "all" in args
+        scope_words = {"always", "permanent", "permanently", "session", "ses"}
         remaining = [a for a in args if a != "all"]
+        approval_ids = [a for a in remaining if a not in scope_words]
+
+        pending = list_gateway_approvals(session_key)
+        if not resolve_all and not approval_ids and len(pending) != 1:
+            refs = "\n".join(
+                f"- `{item['approval_id']}`: `{item['command'][:80]}`"
+                for item in pending[:5]
+            )
+            return (
+                "Multiple commands are awaiting approval. Choose one explicitly:\n"
+                f"{refs}\nUse `/approve <operation-id>` or `/deny <operation-id>`."
+            )
+        approval_id = approval_ids[0] if approval_ids else None
 
         if any(a in {"always", "permanent", "permanently"} for a in remaining):
             choice = "always"
@@ -3917,7 +3932,12 @@ class GatewaySlashCommandsMixin:
         else:
             choice = "once"
 
-        count = resolve_gateway_approval(session_key, choice, resolve_all=resolve_all)
+        count = resolve_gateway_approval(
+            session_key,
+            choice,
+            resolve_all=resolve_all,
+            approval_id=approval_id,
+        )
         if not count:
             return t("gateway.approve.no_pending")
 
@@ -3943,6 +3963,7 @@ class GatewaySlashCommandsMixin:
 
         from tools.approval import (
             resolve_gateway_approval, has_blocking_approval,
+            list_gateway_approvals,
         )
 
         if not has_blocking_approval(session_key):
@@ -3951,10 +3972,27 @@ class GatewaySlashCommandsMixin:
                 return t("gateway.deny.stale")
             return t("gateway.deny.no_pending")
 
-        args = event.get_command_args().strip().lower()
+        args = event.get_command_args().strip().lower().split()
         resolve_all = "all" in args
+        approval_ids = [arg for arg in args if arg != "all"]
+        pending = list_gateway_approvals(session_key)
+        if not resolve_all and not approval_ids and len(pending) != 1:
+            refs = "\n".join(
+                f"- `{item['approval_id']}`: `{item['command'][:80]}`"
+                for item in pending[:5]
+            )
+            return (
+                "Multiple commands are awaiting a decision. Choose one explicitly:\n"
+                f"{refs}\nUse `/deny <operation-id>` or `/approve <operation-id>`."
+            )
+        approval_id = approval_ids[0] if approval_ids else None
 
-        count = resolve_gateway_approval(session_key, "deny", resolve_all=resolve_all)
+        count = resolve_gateway_approval(
+            session_key,
+            "deny",
+            resolve_all=resolve_all,
+            approval_id=approval_id,
+        )
         if not count:
             return t("gateway.deny.no_pending")
 

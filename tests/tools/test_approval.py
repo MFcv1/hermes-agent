@@ -1630,6 +1630,8 @@ class TestApprovalTimeoutIsNotConsent:
         assert result.get("outcome") == "timeout"
         # The notify_cb DID fire — we did try to ask the user.
         assert len(notified) == 1
+        assert notified[0]["approval_id"].startswith("op_")
+        assert notified[0]["run_id"] == self.SESSION_KEY
 
     def test_timeout_message_is_emphatic_against_retry_and_rephrase(self, monkeypatch):
         """The BLOCKED message must explicitly tell the agent not to rephrase.

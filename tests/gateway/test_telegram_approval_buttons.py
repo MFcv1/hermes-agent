@@ -124,6 +124,34 @@ class TestTelegramExecApproval:
         assert adapter._approval_state[approval_id] == "my-session-key"
 
     @pytest.mark.asyncio
+    async def test_binds_button_and_fallback_to_operation(self):
+        adapter = _make_adapter()
+        adapter._bot.send_message = AsyncMock(
+            return_value=SimpleNamespace(message_id=42)
+        )
+
+        await adapter.send_exec_approval(
+            chat_id="12345",
+            command="echo test",
+            session_key="session-a",
+            metadata={"approval_id": "op_exact", "approval_run_id": "run-a"},
+        )
+
+        token = next(iter(adapter._approval_state))
+        assert adapter._approval_bindings[token] == {
+            "approval_id": "op_exact",
+            "run_id": "run-a",
+        }
+        kwargs = adapter._bot.send_message.call_args.kwargs
+        assert "/approve op_exact" in kwargs["text"]
+        callbacks = [
+            button.callback_data
+            for row in kwargs["reply_markup"].inline_keyboard
+            for button in row
+        ]
+        assert all(value.endswith(token) for value in callbacks)
+
+    @pytest.mark.asyncio
     async def test_sends_in_thread(self):
         adapter = _make_adapter()
         mock_msg = MagicMock()
@@ -269,6 +297,33 @@ class TestTelegramApprovalCallback:
 
         # State should be cleaned up
         assert 1 not in adapter._approval_state
+
+    @pytest.mark.asyncio
+    async def test_callback_resolves_exact_bound_operation(self):
+        adapter = _make_adapter()
+        adapter._approval_state["opaque"] = "session-a"
+        adapter._approval_bindings["opaque"] = {
+            "approval_id": "op_exact",
+            "run_id": "run-a",
+        }
+        query = AsyncMock()
+        query.data = "ea:once:opaque"
+        query.message = MagicMock()
+        query.message.chat_id = 12345
+        query.from_user = MagicMock(id="12345", first_name="Norbert")
+        query.answer = AsyncMock()
+        query.edit_message_text = AsyncMock()
+        update = MagicMock(callback_query=query)
+
+        with patch.dict(os.environ, {"TELEGRAM_ALLOWED_USERS": "*"}, clear=False):
+            with patch(
+                "tools.approval.resolve_gateway_approval", return_value=1
+            ) as resolve:
+                await adapter._handle_callback_query(update, MagicMock())
+
+        resolve.assert_called_once_with(
+            "session-a", "once", approval_id="op_exact"
+        )
 
     @pytest.mark.asyncio
     async def test_resume_typing_after_inline_approval(self):

@@ -278,6 +278,45 @@ class TestApproveCommand:
         assert e2.result == "session"
 
     @pytest.mark.asyncio
+    async def test_bare_approve_refuses_ambiguous_queue(self):
+        """A bare command must never silently pick an operation."""
+        from tools.approval import _ApprovalEntry, _gateway_queues
+
+        runner = _make_runner()
+        source = _make_source()
+        session_key = runner._session_key_for_source(source)
+        first = _ApprovalEntry({"approval_id": "op_first", "command": "cmd1"})
+        second = _ApprovalEntry({"approval_id": "op_second", "command": "cmd2"})
+        _gateway_queues[session_key] = [first, second]
+
+        result = await runner._handle_approve_command(_make_event("/approve"))
+
+        assert "Multiple commands" in result
+        assert "op_first" in result and "op_second" in result
+        assert not first.event.is_set()
+        assert not second.event.is_set()
+
+    @pytest.mark.asyncio
+    async def test_approve_operation_id_resolves_only_matching_entry(self):
+        from tools.approval import _ApprovalEntry, _gateway_queues
+
+        runner = _make_runner()
+        source = _make_source()
+        session_key = runner._session_key_for_source(source)
+        first = _ApprovalEntry({"approval_id": "op_first", "command": "cmd1"})
+        second = _ApprovalEntry({"approval_id": "op_second", "command": "cmd2"})
+        _gateway_queues[session_key] = [first, second]
+
+        result = await runner._handle_approve_command(
+            _make_event("/approve op_second")
+        )
+
+        assert "approved" in result.lower()
+        assert not first.event.is_set()
+        assert second.event.is_set()
+        assert _gateway_queues[session_key] == [first]
+
+    @pytest.mark.asyncio
     async def test_approve_no_pending(self):
         """/approve with no pending approval returns helpful message."""
         runner = _make_runner()
@@ -340,6 +379,23 @@ class TestDenyCommand:
         result = await runner._handle_deny_command(_make_event("/deny all"))
         assert "2 commands" in result
         assert all(e.result == "deny" for e in [e1, e2])
+
+    @pytest.mark.asyncio
+    async def test_deny_operation_id_resolves_only_matching_entry(self):
+        from tools.approval import _ApprovalEntry, _gateway_queues
+
+        runner = _make_runner()
+        source = _make_source()
+        session_key = runner._session_key_for_source(source)
+        first = _ApprovalEntry({"approval_id": "op_first", "command": "cmd1"})
+        second = _ApprovalEntry({"approval_id": "op_second", "command": "cmd2"})
+        _gateway_queues[session_key] = [first, second]
+
+        result = await runner._handle_deny_command(_make_event("/deny op_first"))
+
+        assert "denied" in result.lower()
+        assert first.event.is_set()
+        assert not second.event.is_set()
 
     @pytest.mark.asyncio
     async def test_deny_no_pending(self):
