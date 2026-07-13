@@ -126,7 +126,10 @@ def finalize_turn(
     completed = (
         final_response is not None
         and api_call_count < agent.max_iterations
-        and _turn_exit_reason.startswith("text_response(")
+        and (
+            _turn_exit_reason.startswith("text_response(")
+            or _turn_exit_reason == "guardrail_halt"
+        )
         and not failed
     )
 
