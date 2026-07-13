@@ -10,6 +10,7 @@ merges, or deletes anything by itself.
 from __future__ import annotations
 
 import argparse
+import enum
 import importlib.util
 import json
 import os
@@ -20,6 +21,7 @@ import time
 import urllib.error
 import urllib.request
 from datetime import datetime, timezone
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -48,6 +50,38 @@ TASK_TERMINAL_STATUSES = {
 }
 
 TASK_TERMINAL_PREFIXES = ("blocked_",)
+TASK_SUCCESS_STATUSES = {"completed", "deployed_preview", "done"}
+
+CHECK_NAMES = ("telegram", "cockpit", "github", "deploy", "task_watch")
+MAX_REPORT_STRING_CHARS = 4000
+MAX_REPORT_LIST_ITEMS = 50
+MAX_REPORT_DEPTH = 10
+SENSITIVE_REPORT_KEYS = {
+    "access_token",
+    "apikey",
+    "api_key",
+    "auth",
+    "authorization",
+    "client_secret",
+    "cookie",
+    "id_token",
+    "jwt",
+    "password",
+    "private_key",
+    "refresh_token",
+    "secret",
+    "set_cookie",
+    "token",
+}
+
+
+class CheckOutcome(str, enum.Enum):
+    """Machine-readable outcome for one independent evidence check."""
+
+    PASS = "pass"
+    FAIL = "fail"
+    SKIPPED = "skipped"
+    UNKNOWN = "unknown"
 
 
 def _repo_root() -> Path:
@@ -79,6 +113,19 @@ def _load_script_module(name: str):
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+@lru_cache(maxsize=1)
+def _load_redactor():
+    """Load the repo redactor when this file is executed as a script."""
+
+    module_path = _repo_root() / "agent" / "redact.py"
+    spec = importlib.util.spec_from_file_location("codex_supervisor_redact", module_path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"cannot load {module_path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.redact_sensitive_text
 
 
 class CommandResult:
@@ -322,7 +369,8 @@ def _collect_task_snapshot(args: argparse.Namespace) -> dict[str, Any]:
         }
     snapshot = _extract_task_snapshot(payload, args.task_id)
     snapshot["endpoint"] = _task_endpoint(args.task_id)
-    snapshot["cockpit_ok"] = _cockpit_ok(cockpit)
+    cockpit_outcome, _ = _cockpit_outcome(cockpit)
+    snapshot["cockpit_ok"] = cockpit_outcome is CheckOutcome.PASS
     return snapshot
 
 
@@ -454,54 +502,121 @@ def run_telegram(args: argparse.Namespace) -> dict[str, Any]:
     return telegram_smoke.run_smoke(smoke_args)
 
 
-def _cockpit_ok(cockpit: dict[str, Any]) -> bool:
+def _cockpit_outcome(cockpit: dict[str, Any]) -> tuple[CheckOutcome, str]:
     if cockpit.get("skipped"):
-        return True
+        return CheckOutcome.SKIPPED, "Cockpit collection was skipped"
     endpoints = cockpit.get("endpoints") or {}
     required = ["/health", "/api/hosting/capabilities"]
-    return all((endpoints.get(endpoint) or {}).get("ok") for endpoint in required)
+    if not endpoints or any(endpoint not in endpoints for endpoint in required):
+        return CheckOutcome.UNKNOWN, "Required Cockpit endpoint evidence is missing"
+    if all((endpoints.get(endpoint) or {}).get("ok") is True for endpoint in required):
+        return CheckOutcome.PASS, "Required Cockpit endpoints passed"
+    return CheckOutcome.FAIL, "At least one required Cockpit endpoint failed"
 
 
-def _github_ok(github: dict[str, Any]) -> bool:
+def _github_outcome(github: dict[str, Any]) -> tuple[CheckOutcome, str]:
     if github.get("skipped"):
-        return True
-    if not github.get("view_ok"):
-        return False
+        return CheckOutcome.SKIPPED, "GitHub collection was skipped"
+    if "view_ok" not in github:
+        return CheckOutcome.UNKNOWN, "GitHub repository evidence is missing"
+    if github.get("view_ok") is not True:
+        return CheckOutcome.FAIL, "GitHub repository lookup failed"
     branch = github.get("branch") or {}
-    return bool(branch.get("ok", True))
+    if branch and "ok" not in branch:
+        return CheckOutcome.UNKNOWN, "GitHub branch evidence is incomplete"
+    if branch.get("ok", True) is not True:
+        return CheckOutcome.FAIL, "GitHub branch lookup failed"
+    return CheckOutcome.PASS, "Requested GitHub evidence passed"
 
 
-def _deploy_ok(deploy: dict[str, Any]) -> bool:
-    return bool(deploy.get("skipped") or deploy.get("ok"))
+def _deploy_outcome(deploy: dict[str, Any]) -> tuple[CheckOutcome, str]:
+    if deploy.get("skipped"):
+        return CheckOutcome.SKIPPED, "Deploy smoke was skipped"
+    if "ok" not in deploy:
+        return CheckOutcome.UNKNOWN, "Deploy smoke evidence is missing"
+    if deploy.get("ok") is True:
+        return CheckOutcome.PASS, "Deploy smoke passed"
+    return CheckOutcome.FAIL, "Deploy smoke failed"
 
 
-def _telegram_ok(telegram: dict[str, Any]) -> bool:
+def _telegram_outcome(telegram: dict[str, Any]) -> tuple[CheckOutcome, str]:
     if telegram.get("skipped"):
-        return True
-    return str(telegram.get("status")) in {"screenshot_review_required", "sent_review_required"}
+        return CheckOutcome.SKIPPED, "Telegram/CUA check was skipped"
+    status = str(telegram.get("status") or "")
+    if not status:
+        return CheckOutcome.UNKNOWN, "Telegram/CUA status is missing"
+    if status in {"screenshot_review_required", "sent_review_required"}:
+        return CheckOutcome.PASS, f"Telegram/CUA reached {status}"
+    return CheckOutcome.FAIL, f"Telegram/CUA ended with {status}"
 
 
-def _task_watch_ok(task_watch: dict[str, Any]) -> bool:
+def _task_watch_outcome(task_watch: dict[str, Any]) -> tuple[CheckOutcome, str]:
     if task_watch.get("skipped"):
-        return True
-    return bool(task_watch.get("terminal")) and not bool(task_watch.get("timeout")) and bool(task_watch.get("ok", True))
+        return CheckOutcome.SKIPPED, "Task watch was skipped"
+    if task_watch.get("status") in {"missing_task_id", "cockpit_skipped", "task_payload_missing"}:
+        return CheckOutcome.UNKNOWN, f"Task evidence unavailable: {task_watch.get('status')}"
+    if not {"terminal", "timeout"}.issubset(task_watch):
+        return CheckOutcome.UNKNOWN, "Task watch evidence is incomplete"
+    if task_watch.get("timeout") or task_watch.get("ok") is False:
+        return CheckOutcome.FAIL, "Task watch failed or timed out"
+    status = str(task_watch.get("status") or "").strip().lower()
+    if task_watch.get("terminal") and status in TASK_SUCCESS_STATUSES:
+        return CheckOutcome.PASS, f"Task completed with {status}"
+    if task_watch.get("terminal") and _status_is_terminal(status):
+        return CheckOutcome.FAIL, f"Task requires attention with terminal status {status}"
+    return CheckOutcome.UNKNOWN, "Task terminal outcome is not recognized"
+
+
+CHECK_EVALUATORS = {
+    "telegram": _telegram_outcome,
+    "cockpit": _cockpit_outcome,
+    "github": _github_outcome,
+    "deploy": _deploy_outcome,
+    "task_watch": _task_watch_outcome,
+}
+
+
+def _required_checks(report: dict[str, Any]) -> dict[str, bool]:
+    """Derive evidence obligations from the requested run, not its result."""
+
+    task_requested = bool(report.get("task_id") or report.get("watch_task"))
+    return {
+        "telegram": not bool(report.get("skip_telegram")),
+        "cockpit": not bool(report.get("skip_cockpit")) or task_requested,
+        "github": bool(report.get("github_repo") or report.get("github_branch")),
+        "deploy": bool(report.get("deploy_url")),
+        "task_watch": task_requested,
+    }
 
 
 def summarize_status(report: dict[str, Any]) -> str:
-    checks = {
-        "telegram": _telegram_ok(report.get("telegram") or {}),
-        "cockpit": _cockpit_ok(report.get("cockpit") or {}),
-        "github": _github_ok(report.get("github") or {}),
-        "deploy": _deploy_ok(report.get("deploy") or {}),
-        "task_watch": _task_watch_ok(report.get("task_watch") or {"skipped": True}),
-    }
+    requirements = _required_checks(report)
+    checks: dict[str, dict[str, Any]] = {}
+    for name in CHECK_NAMES:
+        outcome, reason = CHECK_EVALUATORS[name](report.get(name) or {})
+        checks[name] = {
+            "outcome": outcome.value,
+            "required": requirements[name],
+            "reason": reason,
+        }
     report["checks"] = checks
-    if all(checks.values()):
-        return "ready_for_human_review"
-    return "attention_required"
+    # Temporary, lossy schema-v1 bridge. It remains boolean for simple
+    # consumers but is fail-closed: only an explicit pass maps to true.
+    report["legacy_checks"] = {
+        name: check["outcome"] == CheckOutcome.PASS.value for name, check in checks.items()
+    }
+    if any(check["outcome"] == CheckOutcome.FAIL.value for check in checks.values()):
+        return "attention_required"
+    if any(
+        check["required"] and check["outcome"] in {CheckOutcome.SKIPPED.value, CheckOutcome.UNKNOWN.value}
+        for check in checks.values()
+    ):
+        return "incomplete_evidence"
+    return "ready_for_human_review"
 
 
 def write_reports(report: dict[str, Any], report_dir: Path) -> dict[str, str]:
+    report = sanitize_report(report)
     report_dir.mkdir(parents=True, exist_ok=True)
     stem = f"{report['started_at'].replace(':', '').replace('-', '')}-{_safe_slug(report['intent'])}"
     json_path = report_dir / f"{stem}.json"
@@ -509,6 +624,42 @@ def write_reports(report: dict[str, Any], report_dir: Path) -> dict[str, str]:
     json_path.write_text(json.dumps(report, indent=2, sort_keys=True), encoding="utf-8")
     md_path.write_text(format_markdown(report), encoding="utf-8")
     return {"json": str(json_path), "markdown": str(md_path)}
+
+
+def _sanitize_report_value(value: Any, *, key: str = "", depth: int = 0) -> Any:
+    """Redact secrets and bound untrusted evidence before any report/output."""
+
+    if depth >= MAX_REPORT_DEPTH:
+        return "[TRUNCATED: maximum report depth reached]"
+    sensitive_key = key.lower().replace("-", "_")
+    if sensitive_key in SENSITIVE_REPORT_KEYS:
+        return "[REDACTED]"
+    if isinstance(value, dict):
+        items = list(value.items())
+        result = {
+            str(item_key): _sanitize_report_value(item_value, key=str(item_key), depth=depth + 1)
+            for item_key, item_value in items[:MAX_REPORT_LIST_ITEMS]
+        }
+        if len(items) > MAX_REPORT_LIST_ITEMS:
+            result["_truncated_keys"] = len(items) - MAX_REPORT_LIST_ITEMS
+        return result
+    if isinstance(value, (list, tuple)):
+        result = [_sanitize_report_value(item, depth=depth + 1) for item in value[:MAX_REPORT_LIST_ITEMS]]
+        if len(value) > MAX_REPORT_LIST_ITEMS:
+            result.append(f"[TRUNCATED: {len(value) - MAX_REPORT_LIST_ITEMS} additional items]")
+        return result
+    if isinstance(value, str):
+        redacted = _load_redactor()(value, force=True)
+        if len(redacted) > MAX_REPORT_STRING_CHARS:
+            omitted = len(redacted) - MAX_REPORT_STRING_CHARS
+            return f"{redacted[:MAX_REPORT_STRING_CHARS]}\n[TRUNCATED: {omitted} characters omitted]"
+        return redacted
+    return value
+
+
+def sanitize_report(report: dict[str, Any]) -> dict[str, Any]:
+    sanitized = _sanitize_report_value(report)
+    return sanitized if isinstance(sanitized, dict) else {}
 
 
 def format_markdown(report: dict[str, Any]) -> str:
@@ -522,8 +673,11 @@ def format_markdown(report: dict[str, Any]) -> str:
         "## Checks",
         "",
     ]
-    for name, ok in sorted((report.get("checks") or {}).items()):
-        lines.append(f"- `{name}`: {'OK' if ok else 'ATTENTION'}")
+    for name, check in sorted((report.get("checks") or {}).items()):
+        lines.append(
+            f"- `{name}`: `{check.get('outcome', 'unknown')}` "
+            f"(required: `{bool(check.get('required'))}`) — {check.get('reason', '')}"
+        )
 
     telegram = report.get("telegram") or {}
     lines.extend(["", "## Telegram/CUA", ""])
@@ -604,7 +758,7 @@ def run_supervisor(args: argparse.Namespace) -> dict[str, Any]:
         raise ValueError("use only one of --message or --command")
 
     report: dict[str, Any] = {
-        "schema": 1,
+        "schema": 2,
         "started_at": datetime.now(timezone.utc).isoformat(),
         "intent": intent,
         "send": bool(args.send),
@@ -612,6 +766,9 @@ def run_supervisor(args: argparse.Namespace) -> dict[str, Any]:
         "github_repo": args.github_repo or None,
         "github_branch": args.github_branch or None,
         "deploy_url": args.deploy_url or None,
+        "skip_telegram": bool(args.skip_telegram),
+        "skip_cockpit": bool(args.skip_cockpit),
+        "watch_task": bool(args.watch_task),
     }
 
     report["telegram"] = run_telegram(args)
@@ -622,14 +779,17 @@ def run_supervisor(args: argparse.Namespace) -> dict[str, Any]:
     report["github"] = collect_github(args)
     report["deploy"] = smoke_deploy_url(args)
     report["status"] = summarize_status(report)
+    report = sanitize_report(report)
     report["reports"] = write_reports(report, Path(args.report_dir).expanduser())
     return report
 
 
 def format_console(report: dict[str, Any]) -> str:
     lines = [f"Codex supervisor: {str(report.get('status')).upper()}"]
-    for name, ok in sorted((report.get("checks") or {}).items()):
-        lines.append(f"- {'OK' if ok else 'ATTENTION'} {name}")
+    for name, check in sorted((report.get("checks") or {}).items()):
+        outcome = str(check.get("outcome", CheckOutcome.UNKNOWN.value)).upper()
+        required = " required" if check.get("required") else " optional"
+        lines.append(f"- {outcome} {name} ({required.strip()})")
     reports = report.get("reports") or {}
     if reports:
         lines.append("Reports:")

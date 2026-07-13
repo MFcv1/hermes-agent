@@ -7,6 +7,8 @@ import importlib.util
 import json
 from pathlib import Path
 
+import pytest
+
 
 SCRIPT = Path(__file__).resolve().parents[2] / "scripts" / "codex_supervisor_mode.py"
 spec = importlib.util.spec_from_file_location("codex_supervisor_mode", SCRIPT)
@@ -73,14 +75,35 @@ def test_supervisor_writes_report_with_all_checks_ok(tmp_path, monkeypatch):
 
     assert report["status"] == "ready_for_human_review"
     assert report["checks"] == {
-        "telegram": True,
-        "cockpit": True,
-        "github": True,
-        "deploy": True,
-        "task_watch": True,
+        "telegram": {
+            "outcome": "pass",
+            "required": True,
+            "reason": "Telegram/CUA reached screenshot_review_required",
+        },
+        "cockpit": {
+            "outcome": "pass",
+            "required": True,
+            "reason": "Required Cockpit endpoints passed",
+        },
+        "github": {
+            "outcome": "skipped",
+            "required": False,
+            "reason": "GitHub collection was skipped",
+        },
+        "deploy": {
+            "outcome": "skipped",
+            "required": False,
+            "reason": "Deploy smoke was skipped",
+        },
+        "task_watch": {
+            "outcome": "skipped",
+            "required": False,
+            "reason": "Task watch was skipped",
+        },
     }
     assert Path(report["reports"]["json"]).is_file()
     assert Path(report["reports"]["markdown"]).is_file()
+    assert report["legacy_checks"]["github"] is False
 
 
 def test_supervisor_marks_attention_when_cockpit_health_fails(tmp_path, monkeypatch):
@@ -103,7 +126,7 @@ def test_supervisor_marks_attention_when_cockpit_health_fails(tmp_path, monkeypa
     report = supervisor.run_supervisor(_args(tmp_path, skip_telegram=True))
 
     assert report["status"] == "attention_required"
-    assert report["checks"]["cockpit"] is False
+    assert report["checks"]["cockpit"]["outcome"] == "fail"
 
 
 def test_github_branch_failure_is_not_ready(monkeypatch):
@@ -119,7 +142,7 @@ def test_github_branch_failure_is_not_ready(monkeypatch):
     }
 
     assert supervisor.summarize_status(report) == "attention_required"
-    assert report["checks"]["github"] is False
+    assert report["checks"]["github"]["outcome"] == "fail"
 
 
 def test_write_reports_contains_guardrail(tmp_path):
@@ -127,7 +150,10 @@ def test_write_reports_contains_guardrail(tmp_path):
         "started_at": "2026-07-09T00:00:00+00:00",
         "intent": "deploy smoke",
         "status": "ready_for_human_review",
-        "checks": {"telegram": True, "cockpit": True, "github": True, "deploy": True},
+        "checks": {
+            name: {"outcome": "skipped", "required": False, "reason": "not requested"}
+            for name in supervisor.CHECK_NAMES
+        },
         "telegram": {"skipped": True},
         "cockpit": {"skipped": True},
         "task_watch": {"skipped": True},
@@ -252,4 +278,162 @@ def test_supervisor_includes_task_watch_check(tmp_path, monkeypatch):
     report = supervisor.run_supervisor(_args(tmp_path, skip_telegram=True, task_id="op_1", watch_task=True))
 
     assert report["status"] == "ready_for_human_review"
-    assert report["checks"]["task_watch"] is True
+    assert report["checks"]["task_watch"]["outcome"] == "pass"
+
+
+@pytest.mark.parametrize(
+    "task_status",
+    ("failed", "blocked", "cancelled", "needs_approval", "pilot_questions_required"),
+)
+def test_terminal_task_requiring_attention_is_not_a_pass(task_status):
+    report = _summary_report("task_watch", "pass", required=True)
+    report["task_watch"]["status"] = task_status
+
+    assert supervisor.summarize_status(report) == "attention_required"
+    assert report["checks"]["task_watch"]["outcome"] == "fail"
+
+
+def _check_evidence(name, outcome):
+    evidence = {
+        "telegram": {
+            "pass": {"status": "screenshot_review_required"},
+            "fail": {"status": "failed"},
+            "skipped": {"skipped": True},
+            "unknown": {},
+        },
+        "cockpit": {
+            "pass": {
+                "endpoints": {
+                    "/health": {"ok": True},
+                    "/api/hosting/capabilities": {"ok": True},
+                }
+            },
+            "fail": {
+                "endpoints": {
+                    "/health": {"ok": False},
+                    "/api/hosting/capabilities": {"ok": True},
+                }
+            },
+            "skipped": {"skipped": True},
+            "unknown": {},
+        },
+        "github": {
+            "pass": {"view_ok": True},
+            "fail": {"view_ok": False},
+            "skipped": {"skipped": True},
+            "unknown": {},
+        },
+        "deploy": {
+            "pass": {"ok": True},
+            "fail": {"ok": False},
+            "skipped": {"skipped": True},
+            "unknown": {},
+        },
+        "task_watch": {
+            "pass": {"ok": True, "terminal": True, "timeout": False, "status": "completed"},
+            "fail": {"ok": False, "terminal": True, "timeout": True, "status": "watch_timeout"},
+            "skipped": {"skipped": True},
+            "unknown": {},
+        },
+    }
+    return evidence[name][outcome]
+
+
+def _summary_report(name, outcome, *, required):
+    report = {
+        "skip_telegram": name != "telegram" or not required,
+        "skip_cockpit": name != "cockpit" or not required,
+        "task_id": "op_1" if name == "task_watch" and required else None,
+        "watch_task": name == "task_watch" and required,
+        "github_repo": "MFcv1/example" if name == "github" and required else None,
+        "github_branch": None,
+        "deploy_url": "https://example.test" if name == "deploy" and required else None,
+    }
+    for check_name in supervisor.CHECK_NAMES:
+        report[check_name] = {"skipped": True}
+    if name == "task_watch" and required:
+        report["cockpit"] = _check_evidence("cockpit", "pass")
+    report[name] = _check_evidence(name, outcome)
+    return report
+
+
+@pytest.mark.parametrize("name", supervisor.CHECK_NAMES)
+@pytest.mark.parametrize("outcome", ("pass", "fail", "unknown"))
+def test_check_outcome_matrix(name, outcome):
+    report = _summary_report(name, outcome, required=True)
+
+    status = supervisor.summarize_status(report)
+
+    assert report["checks"][name]["outcome"] == outcome
+    expected = {
+        "pass": "ready_for_human_review",
+        "fail": "attention_required",
+        "unknown": "incomplete_evidence",
+    }
+    assert status == expected[outcome]
+
+
+@pytest.mark.parametrize("name", supervisor.CHECK_NAMES)
+def test_required_skipped_is_incomplete_evidence(name):
+    report = _summary_report(name, "skipped", required=True)
+
+    assert supervisor.summarize_status(report) == "incomplete_evidence"
+    assert report["checks"][name] == {
+        "outcome": "skipped",
+        "required": True,
+        "reason": report["checks"][name]["reason"],
+    }
+
+
+@pytest.mark.parametrize("name", supervisor.CHECK_NAMES)
+def test_optional_skipped_is_neutral(name):
+    report = _summary_report(name, "skipped", required=False)
+
+    assert supervisor.summarize_status(report) == "ready_for_human_review"
+    assert report["checks"][name]["outcome"] == "skipped"
+    assert report["checks"][name]["required"] is False
+
+
+def test_requested_task_without_watch_cannot_be_ready(tmp_path, monkeypatch):
+    monkeypatch.setattr(supervisor, "run_telegram", lambda args: {"skipped": True})
+    monkeypatch.setattr(supervisor, "watch_task", lambda args: {"skipped": True})
+    monkeypatch.setattr(supervisor, "collect_cockpit", lambda args: {"skipped": True})
+    monkeypatch.setattr(supervisor, "collect_github", lambda args: {"skipped": True})
+    monkeypatch.setattr(supervisor, "smoke_deploy_url", lambda args: {"skipped": True})
+
+    report = supervisor.run_supervisor(
+        _args(tmp_path, skip_telegram=True, skip_cockpit=True, task_id="op_1", watch_task=False)
+    )
+
+    assert report["status"] == "incomplete_evidence"
+    assert report["checks"]["task_watch"]["required"] is True
+
+
+@pytest.mark.parametrize("status", ("attention_required", "incomplete_evidence"))
+def test_main_returns_nonzero_for_non_ready_status(status, monkeypatch):
+    monkeypatch.setattr(supervisor, "run_supervisor", lambda args: {"status": status, "checks": {}})
+
+    assert supervisor.main(["--message", "check", "--json"]) == 2
+
+
+def test_report_is_redacted_and_bounded(tmp_path):
+    report = {
+        "started_at": "2026-07-13T00:00:00+00:00",
+        "intent": "inspect",
+        "status": "attention_required",
+        "checks": {},
+        "cockpit": {
+            "access_token": "short-secret-value",
+            "body": "sk-proj-abcdefghijklmnopqrstuvwxyz" + ("x" * 5000),
+            "items": list(range(100)),
+        },
+    }
+
+    sanitized = supervisor.sanitize_report(report)
+    paths = supervisor.write_reports(report, tmp_path)
+    serialized = Path(paths["json"]).read_text(encoding="utf-8")
+
+    assert "short-secret-value" not in serialized
+    assert "sk-proj-abcdefghijklmnopqrstuvwxyz" not in serialized
+    assert "TRUNCATED" in serialized
+    assert len(sanitized["cockpit"]["items"]) == supervisor.MAX_REPORT_LIST_ITEMS + 1
