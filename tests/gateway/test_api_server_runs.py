@@ -123,6 +123,9 @@ class TestStartRun:
                 assert status["run_id"] == data["run_id"]
                 assert status["status"] in {"queued", "running", "completed"}
                 assert status["object"] == "hermes.run"
+                create_kwargs = mock_create.call_args.kwargs
+                assert create_kwargs["run_id"] == data["run_id"]
+                assert create_kwargs["event_callback"] is create_kwargs["tool_progress_callback"]
 
     @pytest.mark.asyncio
     async def test_start_invalid_json_returns_400(self, adapter):
@@ -276,6 +279,32 @@ class TestRunStatus:
 
 
 class TestRunEvents:
+    @pytest.mark.asyncio
+    async def test_model_call_event_reaches_run_stream(self, adapter):
+        run_id = "run_model_call"
+        loop = asyncio.get_running_loop()
+        queue = asyncio.Queue()
+        adapter._run_streams[run_id] = queue
+        adapter._run_statuses[run_id] = {"run_id": run_id, "status": "running"}
+        callback = adapter._make_run_event_callback(run_id, loop)
+
+        callback(
+            "llm:call",
+            {
+                "used": 1,
+                "limit": 8,
+                "reserved": 1,
+                "model": "test-model",
+            },
+        )
+        event = await asyncio.wait_for(queue.get(), timeout=1)
+
+        assert event["event"] == "llm.call.started"
+        assert event["used"] == 1
+        assert event["limit"] == 8
+        assert event["reserved"] == 1
+        assert adapter._run_statuses[run_id]["last_event"] == "llm.call.started"
+
     @pytest.mark.asyncio
     async def test_events_stream_returns_completed(self, adapter):
         """Events stream should receive run.completed when agent finishes."""

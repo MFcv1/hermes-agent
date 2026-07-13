@@ -109,24 +109,8 @@ def _record_codex_app_server_usage(agent, turn) -> dict[str, Any]:
     Even when Codex omits usage for a turn, Hermes should still count that turn
     as one API call for session/status accounting.
     """
-    agent.session_api_calls += 1
-
     usage = getattr(turn, "token_usage_last", None)
     if not isinstance(usage, dict) or not usage:
-        if agent._session_db and agent.session_id:
-            try:
-                if not agent._session_db_created:
-                    agent._ensure_db_session()
-                agent._session_db.update_token_counts(
-                    agent.session_id,
-                    model=agent.model,
-                    api_call_count=1,
-                )
-            except Exception as exc:
-                logger.debug(
-                    "Codex app-server api-call persistence failed (session=%s): %s",
-                    agent.session_id, exc,
-                )
         return {}
 
     from agent.usage_pricing import CanonicalUsage, estimate_usage_cost
@@ -210,7 +194,7 @@ def _record_codex_app_server_usage(agent, turn) -> dict[str, Any]:
                 billing_mode="subscription_included"
                 if cost_result.status == "included" else None,
                 model=agent.model,
-                api_call_count=1,
+                api_call_count=0,
             )
         except Exception as exc:
             logger.debug(
@@ -288,6 +272,13 @@ def run_codex_app_server_turn(
     # standard run_conversation() flow (line ~11823) before the early
     # return reaches us. Do NOT append again — that would duplicate.
 
+    from agent.run_envelope import begin_model_call
+
+    begin_model_call(
+        agent,
+        phase=agent.run_envelope.phase,
+        api_request_id=f"{getattr(agent, '_current_turn_id', '')}:codex-app-server",
+    )
     try:
         turn = agent._codex_session.run_turn(user_input=user_message)
     except Exception as exc:
@@ -305,10 +296,11 @@ def run_codex_app_server_turn(
                 f"Fall back to default runtime with `/codex-runtime auto`."
             ),
             "messages": messages,
-            "api_calls": 0,
+            "api_calls": 1,
             "completed": False,
             "partial": True,
             "error": str(exc),
+            "run": agent.run_envelope.receipt(),
         }
 
     # If the turn signalled the underlying client is wedged (deadline
@@ -396,6 +388,7 @@ def run_codex_app_server_turn(
         "error": turn.error,
         "codex_thread_id": turn.thread_id,
         "codex_turn_id": turn.turn_id,
+        "run": agent.run_envelope.receipt(),
         **usage_result,
     }
 

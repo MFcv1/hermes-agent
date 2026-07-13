@@ -418,6 +418,7 @@ class AIAgent:
         session_db=None,
         parent_session_id: str = None,
         iteration_budget: "IterationBudget" = None,
+        run_envelope=None,
         fallback_model: Dict[str, Any] = None,
         credential_pool=None,
         checkpoints_enabled: bool = False,
@@ -493,6 +494,7 @@ class AIAgent:
             session_db=session_db,
             parent_session_id=parent_session_id,
             iteration_budget=iteration_budget,
+            run_envelope=run_envelope,
             fallback_model=fallback_model,
             credential_pool=credential_pool,
             checkpoints_enabled=checkpoints_enabled,
@@ -3012,6 +3014,7 @@ class AIAgent:
         when it was killed, and by the periodic "still working" notifications.
         """
         elapsed = time.time() - self._last_activity_ts
+        call_budget = self.run_envelope.budget.snapshot()
         return {
             "last_activity_ts": self._last_activity_ts,
             "last_activity_desc": self._last_activity_desc,
@@ -3021,6 +3024,10 @@ class AIAgent:
             "max_iterations": self.max_iterations,
             "budget_used": self.iteration_budget.used,
             "budget_max": self.iteration_budget.max_total,
+            "run_id": self.run_envelope.run_id,
+            "model_calls_used": call_budget["used"],
+            "model_calls_limit": call_budget["limit"],
+            "model_calls_reserved": call_budget["reserved"],
         }
 
     def shutdown_memory_provider(self, messages: list = None) -> None:

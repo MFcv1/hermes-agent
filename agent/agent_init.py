@@ -216,6 +216,7 @@ def init_agent(
     session_db=None,
     parent_session_id: str = None,
     iteration_budget: "IterationBudget" = None,
+    run_envelope=None,
     fallback_model: Dict[str, Any] = None,
     credential_pool=None,
     checkpoints_enabled: bool = False,
@@ -1041,6 +1042,18 @@ def init_agent(
         timestamp_str = agent.session_start.strftime("%Y%m%d_%H%M%S")
         short_uuid = uuid.uuid4().hex[:6]
         agent.session_id = f"{timestamp_str}_{short_uuid}"
+
+    from agent.run_envelope import RunEnvelope, reasoning_effort
+
+    agent._run_envelope_external = run_envelope is not None
+    agent.run_envelope = run_envelope or RunEnvelope.create(
+        session_id=agent.session_id,
+        task_id=None,
+        model=agent.model,
+        provider=agent.provider,
+        effort=reasoning_effort(agent.reasoning_config),
+        budget_limit=agent.max_iterations,
+    )
 
     # Expose session ID to tools (terminal, execute_code) so agents can
     # reference their own session for --resume commands, cross-session

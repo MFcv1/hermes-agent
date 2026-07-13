@@ -1103,11 +1103,6 @@ def _build_child_agent(
         session_ref=child_session_ref,
     )
 
-    # Each subagent gets its own iteration budget capped at max_iterations
-    # (configurable via delegation.max_iterations, default 50).  This means
-    # total iterations across parent + subagents can exceed the parent's
-    # max_iterations.  The user controls the per-subagent cap in config.yaml.
-
     child_thinking_cb = None
     if child_progress_cb:
 
@@ -1207,6 +1202,19 @@ def _build_child_agent(
         # openrouter/pareto-code), so we keep it inherited even when the
         # provider is overridden — it's a no-op on any other model.
 
+    from agent.run_envelope import reasoning_effort
+
+    parent_envelope = getattr(parent_agent, "run_envelope", None)
+    child_envelope = (
+        parent_envelope.derive_child(
+            model=effective_model,
+            provider=effective_provider or "",
+            effort=reasoning_effort(child_reasoning),
+        )
+        if parent_envelope is not None
+        else None
+    )
+
     child = AIAgent(
         base_url=effective_base_url,
         api_key=effective_api_key,
@@ -1237,7 +1245,7 @@ def _build_child_agent(
         provider_sort=child_provider_sort,
         openrouter_min_coding_score=child_openrouter_min_coding_score,
         tool_progress_callback=child_progress_cb,
-        iteration_budget=None,  # fresh budget per subagent
+        run_envelope=child_envelope,
     )
     child._print_fn = getattr(parent_agent, "_print_fn", None)
     # Now the child exists, its session id can ride on every relayed event
@@ -2090,6 +2098,12 @@ def delegate_task(
     """
     if parent_agent is None:
         return tool_error("delegate_task requires a parent agent context.")
+
+    parent_envelope = getattr(parent_agent, "run_envelope", None)
+    if parent_envelope is not None and parent_envelope.subagent_policy == "deny":
+        return tool_error(
+            "Subagent creation is forbidden by the active run envelope."
+        )
 
     # Operator-controlled kill switch — lets the TUI freeze new fan-out
     # when a runaway tree is detected, without interrupting already-running

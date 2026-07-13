@@ -2,8 +2,9 @@
 
 Extracted from ``run_agent.py``.  Each ``AIAgent`` instance (parent or
 subagent) holds an :class:`IterationBudget`; the parent's cap comes from
-``max_iterations`` (default 90), each subagent's cap comes from
-``delegation.max_iterations`` (default 50).
+``max_iterations`` (default 90), each subagent's local loop cap comes from
+``delegation.max_iterations`` (default 50). The separate model-call budget in
+``agent.run_envelope`` is shared across the whole parent/child run tree.
 
 ``run_agent`` re-exports ``IterationBudget`` so existing
 ``from run_agent import IterationBudget`` imports keep working unchanged.
@@ -19,11 +20,10 @@ class IterationBudget:
 
     Each agent (parent or subagent) gets its own ``IterationBudget``.
     The parent's budget is capped at ``max_iterations`` (default 90).
-    Each subagent gets an independent budget capped at
-    ``delegation.max_iterations`` (default 50) — this means total
-    iterations across parent + subagents can exceed the parent's cap.
-    Users control the per-subagent limit via ``delegation.max_iterations``
-    in config.yaml.
+    Each subagent gets a local loop budget capped at
+    ``delegation.max_iterations``. Provider calls are additionally governed
+    by the shared, strict ``RunEnvelope`` budget, so local iteration caps can
+    no longer increase the run's total model-call allowance.
 
     ``execute_code`` (programmatic tool calling) iterations are refunded via
     :meth:`refund` so they don't eat into the budget.

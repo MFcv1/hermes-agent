@@ -106,3 +106,17 @@ def test_format_autonomy_and_runs_status_keep_badges_and_preview_blocking():
     assert "⏳ <code>deploy_prod</code> · pending" in status_text
     assert "<b>🧪 Runs / gates</b>" in runs_text
     assert "🚨 <code>pytest</code> · <b>failed</b>" in runs_text
+
+
+def test_format_autonomy_marks_empty_evaluations_not_run():
+    text = format_autonomy_status(
+        {
+            "task": {"id": "op_empty", "status": "running"},
+            "evaluation_summary": {
+                "suites": {"routing": {"passed": 0, "total": 0}}
+            },
+        }
+    )
+
+    assert "Evals : <code>routing not_run</code>" in text
+    assert "0/0" not in text

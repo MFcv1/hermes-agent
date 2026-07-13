@@ -560,6 +560,30 @@ def run_conversation(
     _plugin_user_context = _ctx.plugin_user_context
     _ext_prefetch_cache = _ctx.ext_prefetch_cache
 
+    from agent.run_envelope import (
+        ModelCallBudgetExceeded,
+        RunContractViolation,
+        reasoning_effort,
+    )
+
+    try:
+        agent.run_envelope.verify_runtime(
+            model=agent.model,
+            provider=agent.provider,
+            effort=reasoning_effort(agent.reasoning_config),
+        )
+    except RunContractViolation as exc:
+        return {
+            "final_response": str(exc),
+            "messages": messages,
+            "api_calls": 0,
+            "completed": False,
+            "failed": True,
+            "error": str(exc),
+            "failure_reason": "run_contract_mismatch",
+            "run": agent.run_envelope.receipt(),
+        }
+
     # Main conversation loop counters (pure locals consumed by the loop below).
     api_call_count = 0
     final_response = None
@@ -586,7 +610,11 @@ def run_conversation(
             should_review_memory=_should_review_memory,
         )
 
-    while (api_call_count < agent.max_iterations and agent.iteration_budget.remaining > 0) or agent._budget_grace_call:
+    while (
+        api_call_count < agent.max_iterations
+        and agent.iteration_budget.remaining > 0
+        and agent.run_envelope.budget.work_remaining > 0
+    ) or agent._budget_grace_call:
         # Reset per-turn checkpoint dedup so each iteration can take one snapshot
         agent._checkpoint_mgr.new_turn()
 
@@ -1136,6 +1164,13 @@ def run_conversation(
                         _use_streaming = False
 
                 def _perform_api_call(next_api_kwargs):
+                    from agent.run_envelope import begin_model_call
+
+                    begin_model_call(
+                        agent,
+                        phase=agent.run_envelope.phase,
+                        api_request_id=api_request_id,
+                    )
                     if _use_streaming:
                         return agent._interruptible_streaming_api_call(
                             next_api_kwargs, on_first_delta=_stop_spinner
@@ -1846,7 +1881,6 @@ def run_conversation(
                     agent.session_prompt_tokens += prompt_tokens
                     agent.session_completion_tokens += completion_tokens
                     agent.session_total_tokens += total_tokens
-                    agent.session_api_calls += 1
                     agent.session_input_tokens += canonical_usage.input_tokens
                     agent.session_output_tokens += canonical_usage.output_tokens
                     agent.session_cache_read_tokens += canonical_usage.cache_read_tokens
@@ -1909,7 +1943,7 @@ def run_conversation(
                                 billing_mode="subscription_included"
                                 if cost_result.status == "included" else None,
                                 model=agent.model,
-                                api_call_count=1,
+                                api_call_count=0,
                             )
                         except Exception as e:
                             # Log token persistence failures so they're
@@ -1962,6 +1996,11 @@ def run_conversation(
                         pass
                 agent._touch_activity(f"API call #{api_call_count} completed")
                 break  # Success, exit retry loop
+
+            except ModelCallBudgetExceeded as budget_error:
+                _turn_exit_reason = "model_call_budget_exhausted"
+                logger.info("Model-call budget stopped provider retry: %s", budget_error)
+                break
 
             except InterruptedError:
                 if thinking_spinner:
@@ -3610,8 +3649,9 @@ def run_conversation(
         # (e.g. repeated context-length errors that exhausted retry_count),
         # the `response` variable is still None. Break out cleanly.
         if response is None:
-            _turn_exit_reason = "all_retries_exhausted_no_response"
-            print(f"{agent.log_prefix}❌ All API retries exhausted with no successful response.")
+            if _turn_exit_reason != "model_call_budget_exhausted":
+                _turn_exit_reason = "all_retries_exhausted_no_response"
+                print(f"{agent.log_prefix}❌ All API retries exhausted with no successful response.")
             agent._persist_session(messages, conversation_history)
             break
 

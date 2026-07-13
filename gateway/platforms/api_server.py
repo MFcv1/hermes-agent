@@ -1069,6 +1069,8 @@ class APIServerAdapter(BasePlatformAdapter):
         tool_progress_callback=None,
         tool_start_callback=None,
         tool_complete_callback=None,
+        event_callback=None,
+        run_id: Optional[str] = None,
         gateway_session_key: Optional[str] = None,
     ) -> Any:
         """
@@ -1123,11 +1125,25 @@ class APIServerAdapter(BasePlatformAdapter):
             tool_progress_callback=tool_progress_callback,
             tool_start_callback=tool_start_callback,
             tool_complete_callback=tool_complete_callback,
+            event_callback=event_callback,
             session_db=self._ensure_session_db(),
             fallback_model=fallback_model,
             reasoning_config=reasoning_config,
             gateway_session_key=gateway_session_key,
         )
+        if run_id:
+            from agent.run_envelope import RunEnvelope, reasoning_effort
+
+            agent.run_envelope = RunEnvelope.create(
+                run_id=run_id,
+                session_id=agent.session_id or session_id or "",
+                task_id=session_id,
+                model=agent.model,
+                provider=agent.provider,
+                effort=reasoning_effort(agent.reasoning_config),
+                budget_limit=agent.max_iterations,
+            )
+            agent._run_envelope_external = True
         return agent
 
     # ------------------------------------------------------------------
@@ -3841,6 +3857,14 @@ class APIServerAdapter(BasePlatformAdapter):
                     "timestamp": ts,
                     "text": preview or "",
                 })
+            elif event_type == "llm:call":
+                context = tool_name if isinstance(tool_name, dict) else kwargs
+                _push({
+                    **dict(context or {}),
+                    "event": "llm.call.started",
+                    "run_id": run_id,
+                    "timestamp": ts,
+                })
             # _thinking and subagent_progress are intentionally not forwarded
 
         return _callback
@@ -3965,6 +3989,8 @@ class APIServerAdapter(BasePlatformAdapter):
                     session_id=session_id,
                     stream_delta_callback=_text_cb,
                     tool_progress_callback=event_cb,
+                    event_callback=event_cb,
+                    run_id=run_id,
                     gateway_session_key=gateway_session_key,
                 )
                 self._active_run_agents[run_id] = agent

@@ -49,14 +49,15 @@ def finalize_turn(
     loop). See module docstring.
     """
     from agent.conversation_loop import logger
+    _run_envelope = getattr(agent, "run_envelope", None)
 
     if final_response is None and (
         api_call_count >= agent.max_iterations
         or agent.iteration_budget.remaining <= 0
+        or (_run_envelope is not None and _run_envelope.budget.work_remaining <= 0)
     ):
-        # Budget exhausted — ask the model for a summary via one extra
-        # API call with tools stripped.  _handle_max_iterations injects a
-        # user message and makes a single toolless request.
+        # Work budget exhausted — spend the final slot reserved inside the
+        # total model-call limit on a toolless synthesis request.
         _turn_exit_reason = f"max_iterations_reached({api_call_count}/{agent.max_iterations})"
         agent._emit_status(
             f"⚠️ Iteration budget exhausted ({api_call_count}/{agent.max_iterations}) "
@@ -125,6 +126,7 @@ def finalize_turn(
     completed = (
         final_response is not None
         and api_call_count < agent.max_iterations
+        and not (_run_envelope is not None and _run_envelope.budget.work_remaining <= 0)
         and not failed
     )
 
@@ -189,14 +191,21 @@ def finalize_turn(
     _resp_len = len(final_response) if final_response else 0
     _budget_used = agent.iteration_budget.used if agent.iteration_budget else 0
     _budget_max = agent.iteration_budget.max_total if agent.iteration_budget else 0
+    _call_budget = (
+        _run_envelope.budget.snapshot()
+        if _run_envelope is not None
+        else {"used": api_call_count, "limit": agent.max_iterations, "reserved": 0}
+    )
 
     _diag_msg = (
         "Turn ended: reason=%s model=%s api_calls=%d/%d budget=%d/%d "
+        "model_calls=%d/%d reserved=%d "
         "tool_turns=%d last_msg_role=%s response_len=%d session=%s"
     )
     _diag_args = (
         _turn_exit_reason, agent.model, api_call_count, agent.max_iterations,
         _budget_used, _budget_max,
+        _call_budget["used"], _call_budget["limit"], _call_budget["reserved"],
         _turn_tool_count, _last_msg_role, _resp_len,
         agent.session_id or "none",
     )
@@ -353,6 +362,7 @@ def finalize_turn(
         "last_reasoning": last_reasoning,
         "messages": messages,
         "api_calls": api_call_count,
+        "model_calls": _call_budget["used"],
         "completed": completed,
         "turn_exit_reason": _turn_exit_reason,
         "failed": failed,
@@ -377,6 +387,8 @@ def finalize_turn(
         "cost_source": agent.session_cost_source,
         "session_id": agent.session_id,
     }
+    if _run_envelope is not None:
+        result["run"] = _run_envelope.receipt()
     if agent._tool_guardrail_halt_decision is not None:
         result["guardrail"] = agent._tool_guardrail_halt_decision.to_metadata()
     # Surface any post-loop cleanup failures so the caller can distinguish a

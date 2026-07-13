@@ -2244,6 +2244,8 @@ class TestExecuteToolCalls:
 
         assert result["completed"] is True
         assert result["final_response"] == "Recovered"
+        assert result["model_calls"] == 2
+        assert agent.session_api_calls == 2
         output = captured.getvalue()
         assert "API call failed" not in output
         assert "Rate limit reached" not in output

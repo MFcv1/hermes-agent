@@ -98,7 +98,7 @@ def _evaluation_summary_line(data: dict[str, Any]) -> str:
     summary = data.get("evaluation_summary") or {}
     suites = summary.get("suites") if isinstance(summary, dict) else {}
     if not isinstance(suites, dict) or not suites:
-        return ""
+        return "not_run"
     parts = []
     for suite, item in sorted(suites.items()):
         if not isinstance(item, dict):
@@ -107,7 +107,9 @@ def _evaluation_summary_line(data: dict[str, Any]) -> str:
         passed = int(item.get("passed") or 0)
         if total:
             parts.append(f"{suite} {passed}/{total}")
-    return ", ".join(parts[:3])
+        else:
+            parts.append(f"{suite} not_run")
+    return ", ".join(parts[:3]) or "not_run"
 
 
 def _short_observation_label(item: dict[str, Any]) -> str:

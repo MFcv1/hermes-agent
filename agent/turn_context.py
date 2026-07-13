@@ -205,15 +205,35 @@ def build_turn_context(
 
     # NOTE: _turns_since_memory and _iters_since_skill are NOT reset here.
     agent.iteration_budget = IterationBudget(agent.max_iterations)
+    from agent.run_envelope import RunEnvelope, reasoning_effort
+
+    if not getattr(agent, "_run_envelope_external", False):
+        agent.run_envelope = RunEnvelope.create(
+            session_id=agent.session_id,
+            task_id=effective_task_id,
+            model=agent.model,
+            provider=agent.provider,
+            effort=reasoning_effort(agent.reasoning_config),
+            budget_limit=agent.max_iterations,
+        )
+    else:
+        agent.run_envelope.bind(
+            session_id=agent.session_id,
+            task_id=effective_task_id,
+        )
 
     # Log conversation turn start for debugging/observability.
     _preview_text = summarize_user_message_for_log(user_message)
     _msg_preview = (_preview_text[:80] + "...") if len(_preview_text) > 80 else _preview_text
     _msg_preview = _msg_preview.replace("\n", " ")
+    _run_budget = agent.run_envelope.budget.snapshot()
     logger.info(
-        "conversation turn: session=%s model=%s provider=%s platform=%s history=%d msg=%r",
+        "conversation turn: run=%s session=%s model=%s provider=%s platform=%s "
+        "history=%d budget=%d/%d reserved=%d msg=%r",
+        agent.run_envelope.run_id,
         agent.session_id or "none", agent.model, agent.provider or "unknown",
         agent.platform or "unknown", len(conversation_history or []),
+        _run_budget["used"], _run_budget["limit"], _run_budget["reserved"],
         _msg_preview,
     )
 
