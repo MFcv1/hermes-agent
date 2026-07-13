@@ -2526,6 +2526,23 @@ class TestConcurrentToolExecution:
         assert starts == [("c1", "web_search", {"query": "hello"})]
         assert completes == [("c1", "web_search", {"query": "hello"}, '{"success": true}')]
 
+    def test_sequential_interrupt_between_tools_never_starts_next(self, agent):
+        tc1 = _mock_tool_call(name="web_search", arguments='{"query":"one"}', call_id="c1")
+        tc2 = _mock_tool_call(name="web_search", arguments='{"query":"two"}', call_id="c2")
+        mock_msg = _mock_assistant_msg(content="", tool_calls=[tc1, tc2])
+        messages = []
+
+        def _first_tool_then_stop(*_args, **_kwargs):
+            agent._interrupt_requested = True
+            return '{"success": true}'
+
+        with patch("run_agent.handle_function_call", side_effect=_first_tool_then_stop) as invoke:
+            agent._execute_tool_calls_sequential(mock_msg, messages, "task-1")
+
+        assert invoke.call_count == 1
+        assert [message["tool_call_id"] for message in messages] == ["c1", "c2"]
+        assert "was not started" in messages[1]["content"]
+
     def test_concurrent_tool_callbacks_fire_for_each_tool(self, agent):
         tc1 = _mock_tool_call(name="web_search", arguments='{"query":"one"}', call_id="c1")
         tc2 = _mock_tool_call(name="web_search", arguments='{"query":"two"}', call_id="c2")

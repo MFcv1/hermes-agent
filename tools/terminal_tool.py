@@ -2152,11 +2152,41 @@ def terminal_tool(
             from tools.process_registry import process_registry
 
             session_key = get_current_session_key(default="")
+            try:
+                from gateway.session_context import get_session_env as _get_session_env
+
+                session_generation = int(
+                    _get_session_env("HERMES_SESSION_GENERATION", "0") or 0
+                )
+                run_id = _get_session_env("HERMES_RUN_ID", "")
+            except (TypeError, ValueError):
+                session_generation = 0
+                run_id = ""
             effective_cwd = _resolve_command_cwd(
                 workdir=workdir,
                 env=env,
                 default_cwd=cwd,
             )
+            from tools.heavy_job_guard import (
+                HeavyJobCancelled,
+                HeavyJobLockTimeout,
+                acquire_heavy_job,
+            )
+            from tools.environments.base import is_interrupted
+
+            try:
+                heavy_job_lease = acquire_heavy_job(
+                    command,
+                    timeout=effective_timeout,
+                    cancelled=is_interrupted,
+                )
+            except (HeavyJobCancelled, HeavyJobLockTimeout) as exc:
+                return json.dumps({
+                    "output": "",
+                    "exit_code": 130 if isinstance(exc, HeavyJobCancelled) else 124,
+                    "error": str(exc),
+                    "status": "cancelled" if isinstance(exc, HeavyJobCancelled) else "timeout",
+                }, ensure_ascii=False)
             try:
                 if env_type == "local":
                     proc_session = process_registry.spawn_local(
@@ -2164,8 +2194,11 @@ def terminal_tool(
                         cwd=effective_cwd,
                         task_id=effective_task_id,
                         session_key=session_key,
+                        session_generation=session_generation,
+                        run_id=run_id,
                         env_vars=env.env if hasattr(env, 'env') else None,
                         use_pty=effective_pty,
+                        heavy_job_lease=heavy_job_lease,
                     )
                 else:
                     proc_session = process_registry.spawn_via_env(
@@ -2174,6 +2207,9 @@ def terminal_tool(
                         cwd=effective_cwd,
                         task_id=effective_task_id,
                         session_key=session_key,
+                        session_generation=session_generation,
+                        run_id=run_id,
+                        heavy_job_lease=heavy_job_lease,
                     )
 
                 result_data = {
@@ -2369,6 +2405,8 @@ def terminal_tool(
                             "session_id": proc_session.id,
                             "check_interval": 5,
                             "session_key": session_key,
+                            "session_generation": session_generation,
+                            "run_id": run_id,
                             "platform": proc_session.watcher_platform,
                             "chat_id": proc_session.watcher_chat_id,
                             "user_id": proc_session.watcher_user_id,
@@ -2385,6 +2423,8 @@ def terminal_tool(
 
                 return json.dumps(result_data, ensure_ascii=False)
             except Exception as e:
+                if heavy_job_lease is not None:
+                    heavy_job_lease.release()
                 return json.dumps({
                     "output": "",
                     "exit_code": -1,
@@ -2392,6 +2432,8 @@ def terminal_tool(
                 }, ensure_ascii=False)
         else:
             # Run foreground command with retry logic
+            from tools.heavy_job_guard import HeavyJobCancelled, HeavyJobLockTimeout
+
             max_retries = 3
             retry_count = 0
             result = None
@@ -2406,7 +2448,25 @@ def terminal_tool(
                             default_cwd=cwd,
                         ),
                     }
-                    result = env.execute(command, **execute_kwargs)
+                    from tools.heavy_job_guard import acquire_heavy_job
+                    from tools.environments.base import is_interrupted
+
+                    _heavy_lease = acquire_heavy_job(
+                        command,
+                        timeout=effective_timeout,
+                        cancelled=is_interrupted,
+                    )
+                    try:
+                        result = env.execute(command, **execute_kwargs)
+                    finally:
+                        if _heavy_lease is not None:
+                            _heavy_lease.release()
+                except (HeavyJobCancelled, HeavyJobLockTimeout) as e:
+                    return json.dumps({
+                        "output": "",
+                        "exit_code": 130 if isinstance(e, HeavyJobCancelled) else 124,
+                        "error": str(e),
+                    }, ensure_ascii=False)
                 except Exception as e:
                     error_str = str(e).lower()
                     if "timeout" in error_str:

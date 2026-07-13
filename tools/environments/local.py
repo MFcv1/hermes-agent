@@ -646,6 +646,10 @@ class LocalEnvironment(BaseEnvironment):
                 cmd_string = _prepend_shell_init(cmd_string, init_files)
         args = [bash, "-l", "-c", cmd_string] if login else [bash, "-c", cmd_string]
         run_env = _make_run_env(self.env)
+        from tools.process_ownership import OWNER_ENV, new_owner_id
+
+        owner_id = new_owner_id()
+        run_env[OWNER_ENV] = owner_id
 
         # Recover when the cwd has been deleted out from under us — usually by
         # a previous tool call that ran ``rm -rf`` on its own working dir
@@ -694,6 +698,7 @@ class LocalEnvironment(BaseEnvironment):
                 proc._hermes_pgid = os.getpgid(proc.pid)
             except ProcessLookupError:
                 pass
+        proc._hermes_owner_id = owner_id
 
         if stdin_data is not None:
             _pipe_stdin(proc, stdin_data)
@@ -769,6 +774,12 @@ class LocalEnvironment(BaseEnvironment):
                 proc.kill()
             except Exception:
                 pass
+        finally:
+            owner_id = getattr(proc, "_hermes_owner_id", "")
+            if owner_id:
+                from tools.process_ownership import terminate_owned_processes
+
+                terminate_owned_processes(owner_id)
 
     def _update_cwd(self, result: dict):
         """Read CWD from temp file (local-only, no round-trip needed).

@@ -408,6 +408,9 @@ def _process_batch_worker(args: Tuple) -> Dict[str, Any]:
         Dict: Batch results with statistics
     """
     batch_num, batch_data, output_dir, completed_prompts_set, config = args
+    # Internal execution marker: LSP startup is disabled in batch workers by
+    # default to prevent one TypeScript server per multiprocessing worker.
+    os.environ["_HERMES_BATCH_MODE"] = "1"
     
     output_dir = Path(output_dir)
     print(f"\n🔄 Batch {batch_num}: Starting ({len(batch_data)} prompts)")
@@ -1318,4 +1321,3 @@ def main(
 
 if __name__ == "__main__":
     fire.Fire(main)
-

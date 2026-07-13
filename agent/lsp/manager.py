@@ -202,6 +202,13 @@ class LSPService:
             lsp_cfg = {}
 
         enabled = bool(lsp_cfg.get("enabled", True))
+        if os.environ.get("_HERMES_BATCH_MODE") == "1" and not bool(
+            lsp_cfg.get("batch_enabled", False)
+        ):
+            enabled = False
+            logger.info(
+                "LSP disabled for batch worker; set lsp.batch_enabled=true in config.yaml to opt in"
+            )
         wait_mode = lsp_cfg.get("wait_mode", "document")
         wait_timeout = float(lsp_cfg.get("wait_timeout", DIAGNOSTICS_DOCUMENT_WAIT))
         install_strategy = lsp_cfg.get("install_strategy", "auto")

@@ -370,7 +370,10 @@ class BaseEnvironment(ABC):
         _quoted_snap = shlex.quote(self._snapshot_path)
         _quoted_cwd_file = shlex.quote(self._cwd_file)
         bootstrap = (
-            f"export -p > {_quoted_snap}\n"
+            # Process ownership is per invocation. Persisting its marker in
+            # the reusable shell snapshot would overwrite the next Popen's
+            # fresh marker when the snapshot is sourced.
+            f"export -p | grep -v 'HERMES_PROCESS_OWNER' > {_quoted_snap}\n"
             f"declare -f | grep -vE '^_[^_]' >> {_quoted_snap}\n"
             f"alias -p >> {_quoted_snap}\n"
             f"echo 'shopt -s expand_aliases' >> {_quoted_snap}\n"
@@ -451,7 +454,9 @@ class BaseEnvironment(ABC):
 
         # Re-dump env vars to snapshot (last-writer-wins for concurrent calls)
         if self._snapshot_ready:
-            parts.append(f"export -p > {_quoted_snap} 2>/dev/null || true")
+            parts.append(
+                f"export -p | grep -v 'HERMES_PROCESS_OWNER' > {_quoted_snap} 2>/dev/null || true"
+            )
 
         # Write CWD to file (local reads this) and stdout marker (remote parses this)
         parts.append(f"pwd -P > {_quoted_cwd_file} 2>/dev/null || true")
@@ -747,6 +752,18 @@ class BaseEnvironment(ABC):
             proc.stdout.close()
         except Exception:
             pass
+
+        # A command may have daemonized via setsid/double-fork and exited its
+        # wrapper successfully. The inherited ownership marker lets the local
+        # backend reap those escaped descendants even on the natural path.
+        owner_id = getattr(proc, "_hermes_owner_id", "")
+        if owner_id:
+            try:
+                from tools.process_ownership import terminate_owned_processes
+
+                terminate_owned_processes(owner_id, discovery_seconds=0.1)
+            except Exception:
+                logger.warning("Natural-exit ownership cleanup failed", exc_info=True)
 
         if _DEBUG_INTERRUPT:
             logger.info(

@@ -10,6 +10,9 @@ from typing import Dict
 # read_file=inf prevents infinite persist->read->persist loops.
 PINNED_THRESHOLDS: Dict[str, float] = {
     "read_file": float("inf"),
+    # Vision providers can return megabytes of OCR/layout detail. Keep their
+    # inline result substantially below the generic 100K tool ceiling.
+    "vision_analyze": 20_000,
 }
 
 # Defaults matching the current hardcoded values in tool_result_storage.py.

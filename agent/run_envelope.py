@@ -111,6 +111,7 @@ class RunEnvelope:
     run_id: str
     session_id: str
     task_id: str | None
+    session_generation: int
     model: str
     provider: str
     effort: str
@@ -126,6 +127,7 @@ class RunEnvelope:
         *,
         session_id: str,
         task_id: str | None,
+        session_generation: int = 0,
         model: str,
         provider: str,
         effort: str,
@@ -143,6 +145,7 @@ class RunEnvelope:
             run_id=run_id or f"run_{uuid.uuid4().hex}",
             session_id=str(session_id or ""),
             task_id=str(task_id) if task_id else None,
+            session_generation=max(0, int(session_generation)),
             model=str(model or ""),
             provider=str(provider or ""),
             effort=str(effort or "default"),
@@ -192,6 +195,7 @@ class RunEnvelope:
             run_id=self.run_id,
             session_id=self.session_id,
             task_id=self.task_id,
+            session_generation=self.session_generation,
             model=str(model or ""),
             provider=str(provider or ""),
             effort=str(effort or "default"),
@@ -207,6 +211,7 @@ class RunEnvelope:
             "run_id": self.run_id,
             "session_id": self.session_id,
             "task_id": self.task_id,
+            "session_generation": self.session_generation,
             "model": self.model,
             "provider": self.provider,
             "effort": self.effort,

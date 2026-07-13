@@ -2533,6 +2533,16 @@ def delegate_task(
             return json.dumps(_sync_result, ensure_ascii=False)
 
         _session_key = get_current_session_key(default="")
+        try:
+            from gateway.session_context import get_session_env as _get_session_env
+
+            _session_generation = int(
+                _get_session_env("HERMES_SESSION_GENERATION", "0") or 0
+            )
+            _run_id = _get_session_env("HERMES_RUN_ID", "")
+        except (TypeError, ValueError):
+            _session_generation = 0
+            _run_id = ""
         _child_agents = [c for (_, _, c) in children]
 
         # Detach every child from the parent's interrupt-propagation list — the
@@ -2571,6 +2581,8 @@ def delegate_task(
             role=top_role,
             model=creds["model"],
             session_key=_session_key,
+            session_generation=_session_generation,
+            run_id=_run_id,
             runner=_batch_runner,
             interrupt_fn=_batch_interrupt,
             max_async_children=_get_max_async_children(),

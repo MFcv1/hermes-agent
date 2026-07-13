@@ -1044,11 +1044,20 @@ def init_agent(
         agent.session_id = f"{timestamp_str}_{short_uuid}"
 
     from agent.run_envelope import RunEnvelope, reasoning_effort
+    try:
+        from gateway.session_context import get_session_env
+
+        _session_generation = int(
+            get_session_env("HERMES_SESSION_GENERATION", "0") or 0
+        )
+    except (TypeError, ValueError):
+        _session_generation = 0
 
     agent._run_envelope_external = run_envelope is not None
     agent.run_envelope = run_envelope or RunEnvelope.create(
         session_id=agent.session_id,
         task_id=None,
+        session_generation=_session_generation,
         model=agent.model,
         provider=agent.provider,
         effort=reasoning_effort(agent.reasoning_config),

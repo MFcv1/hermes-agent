@@ -93,12 +93,15 @@ class ProcessSession:
     command: str                                 # Original command string
     task_id: str = ""                           # Task/sandbox isolation key
     session_key: str = ""                       # Gateway session key (for reset protection)
+    session_generation: int = 0                 # Conversation-boundary generation
+    run_id: str = ""                            # Owning agent run
     pid: Optional[int] = None                   # OS process ID
     process: Optional[subprocess.Popen] = None  # Popen handle (local only)
     env_ref: Any = None                         # Reference to the environment object
     cwd: Optional[str] = None                   # Working directory
     started_at: float = 0.0                     # time.time() of spawn (wall clock)
     host_start_time: Optional[int] = None       # kernel start ticks (/proc/<pid>/stat f22) — PID-reuse guard
+    owner_id: str = ""                         # inherited process ownership marker
     exited: bool = False                        # Whether the process has finished
     exit_code: Optional[int] = None             # Exit code (None if still running)
     completion_reason: str = "exited"           # exited|killed|lost|failed_start|already_exited
@@ -136,6 +139,7 @@ class ProcessSession:
     _lock: threading.Lock = field(default_factory=threading.Lock)
     _reader_thread: Optional[threading.Thread] = field(default=None, repr=False)
     _pty: Any = field(default=None, repr=False)  # ptyprocess handle (when use_pty=True)
+    _heavy_job_lease: Any = field(default=None, repr=False)
 
 
 class ProcessRegistry:
@@ -288,6 +292,8 @@ class ProcessRegistry:
                 self.completion_queue.put({
                     "session_id": session.id,
                     "session_key": session.session_key,
+                    "session_generation": session.session_generation,
+                    "run_id": session.run_id,
                     "command": session.command,
                     "type": "watch_disabled",
                     "suppressed": session._watch_suppressed,
@@ -319,6 +325,8 @@ class ProcessRegistry:
         self.completion_queue.put({
             "session_id": session.id,
             "session_key": session.session_key,
+            "session_generation": session.session_generation,
+            "run_id": session.run_id,
             "command": session.command,
             "type": "watch_match",
             "pattern": matched_pattern,
@@ -664,8 +672,11 @@ class ProcessRegistry:
         cwd: str = None,
         task_id: str = "",
         session_key: str = "",
+        session_generation: int = 0,
+        run_id: str = "",
         env_vars: dict = None,
         use_pty: bool = False,
+        heavy_job_lease: Any = None,
     ) -> ProcessSession:
         """
         Spawn a background process locally.
@@ -682,8 +693,11 @@ class ProcessRegistry:
             command=command,
             task_id=task_id,
             session_key=session_key,
+            session_generation=session_generation,
+            run_id=run_id,
             cwd=_resolve_safe_cwd(cwd or os.getcwd()),
             started_at=time.time(),
+            _heavy_job_lease=heavy_job_lease,
         )
 
         if use_pty:
@@ -696,6 +710,10 @@ class ProcessRegistry:
                 user_shell = _find_shell()
                 pty_env = _sanitize_subprocess_env(os.environ, env_vars)
                 pty_env["PYTHONUNBUFFERED"] = "1"
+                from tools.process_ownership import OWNER_ENV, new_owner_id
+
+                session.owner_id = new_owner_id()
+                pty_env[OWNER_ENV] = session.owner_id
                 pty_proc = _PtyProcessCls.spawn(
                     [user_shell, "-lic", f"set +m; {command}"],
                     cwd=session.cwd,
@@ -738,6 +756,10 @@ class ProcessRegistry:
         # stdout is a pipe, hiding output from process(action="poll")).
         bg_env = _sanitize_subprocess_env(os.environ, env_vars)
         bg_env["PYTHONUNBUFFERED"] = "1"
+        from tools.process_ownership import OWNER_ENV, new_owner_id
+
+        session.owner_id = new_owner_id()
+        bg_env[OWNER_ENV] = session.owner_id
         _popen_kwargs = {"creationflags": windows_hide_flags()} if _IS_WINDOWS else {}
 
         proc = subprocess.Popen(
@@ -804,7 +826,10 @@ class ProcessRegistry:
         cwd: str = None,
         task_id: str = "",
         session_key: str = "",
+        session_generation: int = 0,
+        run_id: str = "",
         timeout: int = 10,
+        heavy_job_lease: Any = None,
     ) -> ProcessSession:
         """
         Spawn a background process through a non-local environment backend.
@@ -822,8 +847,11 @@ class ProcessRegistry:
             command=command,
             task_id=task_id,
             session_key=session_key,
+            session_generation=session_generation,
+            run_id=run_id,
             cwd=cwd,
             started_at=time.time(),
+            _heavy_job_lease=heavy_job_lease,
             env_ref=env,
             pid_scope="sandbox",
         )
@@ -1026,6 +1054,20 @@ class ProcessRegistry:
         with the reader thread), the second call is a no-op — no duplicate
         completion notification is enqueued.
         """
+        if session.owner_id:
+            try:
+                from tools.process_ownership import terminate_owned_processes
+
+                terminate_owned_processes(session.owner_id)
+            except Exception:
+                logger.warning("Background ownership cleanup failed", exc_info=True)
+        lease = session._heavy_job_lease
+        session._heavy_job_lease = None
+        if lease is not None:
+            try:
+                lease.release()
+            except Exception:
+                logger.warning("Heavy-job lease release failed", exc_info=True)
         with self._lock:
             was_running = self._running.pop(session.id, None) is not None
             self._finished[session.id] = session
@@ -1042,6 +1084,8 @@ class ProcessRegistry:
                 "type": "completion",
                 "session_id": session.id,
                 "session_key": session.session_key,
+                "session_generation": session.session_generation,
+                "run_id": session.run_id,
                 "command": session.command,
                 "exit_code": session.exit_code,
                 "completion_reason": session.completion_reason,
@@ -1367,6 +1411,10 @@ class ProcessRegistry:
                             pass
                 except (ProcessLookupError, PermissionError):
                     session.process.kill()
+                if session.owner_id:
+                    from tools.process_ownership import terminate_owned_processes
+
+                    terminate_owned_processes(session.owner_id)
             elif session.env_ref and session.pid:
                 # Non-local -- kill inside sandbox
                 session.env_ref.execute(f"kill {session.pid} 2>/dev/null", timeout=5)
@@ -1552,6 +1600,23 @@ class ProcessRegistry:
                 killed += 1
         return killed
 
+    def kill_all_for_session(self, session_key: str) -> int:
+        """Kill every tracked process owned by one gateway session."""
+        if not session_key:
+            return 0
+        with self._lock:
+            targets = [
+                session
+                for session in self._running.values()
+                if session.session_key == session_key and not session.exited
+            ]
+        killed = 0
+        for session in targets:
+            result = self.kill_process(session.id, source="session_boundary")
+            if result.get("status") in {"killed", "already_exited"}:
+                killed += 1
+        return killed
+
     # ----- Cleanup / Pruning -----
 
     def _prune_if_needed(self):
@@ -1607,10 +1672,13 @@ class ProcessRegistry:
                             "pid": s.pid,
                             "pid_scope": s.pid_scope,
                             "host_start_time": s.host_start_time,
+                            "owner_id": s.owner_id,
                             "cwd": s.cwd,
                             "started_at": s.started_at,
                             "task_id": s.task_id,
                             "session_key": s.session_key,
+                            "session_generation": s.session_generation,
+                            "run_id": s.run_id,
                             "watcher_platform": s.watcher_platform,
                             "watcher_chat_id": s.watcher_chat_id,
                             "watcher_user_id": s.watcher_user_id,
@@ -1645,7 +1713,12 @@ class ProcessRegistry:
         recovered = 0
         for entry in entries:
             pid = entry.get("pid")
+            owner_id = str(entry.get("owner_id") or "")
             if not pid:
+                if owner_id:
+                    from tools.process_ownership import terminate_owned_processes
+
+                    terminate_owned_processes(owner_id)
                 continue
 
             pid_scope = entry.get("pid_scope", "host")
@@ -1676,6 +1749,14 @@ class ProcessRegistry:
                         "an unrelated process; refusing to adopt it.",
                         entry.get("session_id", "?"), pid,
                     )
+                # The wrapper may have exited while a setsid/double-fork child
+                # survived.  Its inherited owner marker is stronger evidence
+                # than a stale PID and lets startup clean the escaped tree
+                # without adopting or signalling an unrelated recycled PID.
+                if owner_id:
+                    from tools.process_ownership import terminate_owned_processes
+
+                    terminate_owned_processes(owner_id)
                 continue
 
             session = ProcessSession(
@@ -1683,8 +1764,11 @@ class ProcessRegistry:
                 command=entry.get("command", "unknown"),
                 task_id=entry.get("task_id", ""),
                 session_key=entry.get("session_key", ""),
+                session_generation=int(entry.get("session_generation") or 0),
+                run_id=str(entry.get("run_id") or ""),
                 pid=pid,
                 host_start_time=recorded_start,
+                owner_id=owner_id,
                 pid_scope=pid_scope,
                 cwd=entry.get("cwd"),
                 started_at=entry.get("started_at", time.time()),
@@ -1710,6 +1794,8 @@ class ProcessRegistry:
                     "session_id": session.id,
                     "check_interval": session.watcher_interval,
                     "session_key": session.session_key,
+                    "session_generation": session.session_generation,
+                    "run_id": session.run_id,
                     "platform": session.watcher_platform,
                     "chat_id": session.watcher_chat_id,
                     "user_id": session.watcher_user_id,

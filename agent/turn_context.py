@@ -211,6 +211,7 @@ def build_turn_context(
         agent.run_envelope = RunEnvelope.create(
             session_id=agent.session_id,
             task_id=effective_task_id,
+            session_generation=getattr(agent.run_envelope, "session_generation", 0),
             model=agent.model,
             provider=agent.provider,
             effort=reasoning_effort(agent.reasoning_config),
@@ -221,6 +222,12 @@ def build_turn_context(
             session_id=agent.session_id,
             task_id=effective_task_id,
         )
+    try:
+        from gateway.session_context import set_current_run_id
+
+        set_current_run_id(agent.run_envelope.run_id)
+    except Exception:
+        pass
 
     # Log conversation turn start for debugging/observability.
     _preview_text = summarize_user_message_for_log(user_message)

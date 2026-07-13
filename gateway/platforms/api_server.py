@@ -1138,6 +1138,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 run_id=run_id,
                 session_id=agent.session_id or session_id or "",
                 task_id=session_id,
+                session_generation=0,
                 model=agent.model,
                 provider=agent.provider,
                 effort=reasoning_effort(agent.reasoning_config),

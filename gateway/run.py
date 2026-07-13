@@ -2636,6 +2636,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self._pending_native_image_paths_by_session: Dict[str, List[str]] = {}
         self._busy_ack_ts: Dict[str, float] = {}  # last busy-ack timestamp per session (debounce)
         self._session_run_generation: Dict[str, int] = {}
+        # Conversation-boundary generation. Unlike _session_run_generation,
+        # this changes only when reset/stop invalidates detached work and is
+        # therefore safe to attach to long-running process/delegation events.
+        self._session_generation: Dict[str, int] = self._load_session_generations()
         # Startup restore gate: while restart-interrupted sessions are being
         # auto-resumed, real inbound messages are queued instead of competing
         # with the synthetic resume turns for the same session.  The queued
@@ -8656,6 +8660,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         event: MessageEvent,
         source: SessionSource,
         history: List[Dict[str, Any]],
+        run_generation: Optional[int] = None,
     ) -> Optional[str]:
         """Prepare inbound event text for the agent.
 
@@ -8744,6 +8749,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     message_text = await self._enrich_message_with_vision(
                         message_text,
                         image_paths,
+                        session_key=session_key,
+                        run_generation=run_generation,
                     )
 
             if audio_paths:
@@ -9061,6 +9068,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 except Exception:
                     logger.debug("Failed to record Telegram topic binding", exc_info=True)
         if getattr(session_entry, "was_auto_reset", False):
+            # Auto-reset is the same hard conversation boundary as /reset.
+            # Advance the durable generation before any new turn context is
+            # built so late process/delegation notifications from the expired
+            # conversation cannot enter the fresh one.
+            self._advance_session_generation(session_key, reason="auto_reset")
+            try:
+                from tools.async_delegation import interrupt_session
+
+                interrupt_session(session_key, reason="auto_reset")
+            except Exception:
+                logger.debug("Failed to interrupt auto-reset delegations", exc_info=True)
+            try:
+                from tools.process_registry import process_registry
+
+                process_registry.kill_all_for_session(session_key)
+            except Exception:
+                logger.debug("Failed to clean auto-reset processes", exc_info=True)
             # Treat auto-reset as a full conversation boundary — drop every
             # session-scoped transient state so the fresh session does not
             # inherit the previous conversation's model/reasoning overrides
@@ -9092,7 +9116,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         context = build_session_context(source, self.config, session_entry)
         
         # Set session context variables for tools (task-local, concurrency-safe)
-        _session_env_tokens = self._set_session_env(context)
+        _session_env_tokens = self._set_session_env(
+            context,
+            session_generation=self._current_session_generation(session_key),
+        )
         
         # Read privacy.redact_pii from config (re-read per message)
         _redact_pii = False
@@ -9657,6 +9684,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             event=event,
             source=source,
             history=history,
+            run_generation=run_generation,
         )
         if message_text is None:
             return
@@ -9924,6 +9952,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 from tools.process_registry import process_registry as _pr
                 _watch_events = _drain_gateway_watch_events(_pr.completion_queue)
                 for evt in _watch_events:
+                    if not self._event_generation_is_current(evt):
+                        continue
                     synth_text = _format_gateway_process_notification(evt)
                     if synth_text:
                         try:
@@ -12855,7 +12885,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         return delivered
 
-    def _set_session_env(self, context: SessionContext) -> list:
+    def _set_session_env(
+        self,
+        context: SessionContext,
+        *,
+        session_generation: int = 0,
+    ) -> list:
         """Set session context variables for the current async task.
 
         Uses ``contextvars`` instead of ``os.environ`` so that concurrent
@@ -12883,6 +12918,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             user_id=str(context.source.user_id) if context.source.user_id else "",
             user_name=str(context.source.user_name) if context.source.user_name else "",
             session_key=context.session_key,
+            session_id=context.session_id,
+            session_generation=session_generation,
             message_id=str(context.source.message_id) if context.source.message_id else "",
             async_delivery=_async_delivery,
         )
@@ -12925,6 +12962,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self,
         user_text: str,
         image_paths: List[str],
+        *,
+        session_key: str = "",
+        run_generation: Optional[int] = None,
     ) -> str:
         """
         Auto-analyze user-attached images with the vision tool and prepend
@@ -12952,7 +12992,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         )
 
         enriched_parts = []
-        for path in image_paths:
+        for index, path in enumerate(image_paths):
+            if (
+                run_generation is not None
+                and session_key
+                and not self._is_session_run_current(session_key, run_generation)
+            ):
+                logger.info(
+                    "Vision enrichment stopped before image %d: stale run generation %s",
+                    index + 1,
+                    run_generation,
+                )
+                break
             try:
                 logger.debug("Auto-analyzing user image: %s", path)
                 result_json = await vision_analyze_tool(
@@ -12960,9 +13011,36 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     user_prompt=analysis_prompt,
                 )
                 result = json.loads(result_json)
+                if (
+                    run_generation is not None
+                    and session_key
+                    and not self._is_session_run_current(session_key, run_generation)
+                ):
+                    logger.info(
+                        "Discarding vision result for stale run generation %s",
+                        run_generation,
+                    )
+                    break
                 if result.get("success"):
                     description = result.get("analysis", "")
                     description = sanitize_context(description)
+                    if len(description) > 20_000:
+                        from tools.tool_result_storage import persist_local_artifact
+
+                        description = persist_local_artifact(
+                            description,
+                            category="vision",
+                            artifact_id=(
+                                f"{session_key}-{run_generation}-{index + 1}"
+                            ),
+                            preview_size=2_000,
+                        )
+                        await self.hooks.emit("tool:output_spilled", {
+                            "tool": "vision_analyze",
+                            "session_key": session_key,
+                            "run_generation": run_generation,
+                            "image_index": index,
+                        })
                     enriched_parts.append(
                         f"[The user sent an image~ Here's what I can see:\n{description}]\n"
                         f"[If you need a closer look, use vision_analyze with "
@@ -13324,6 +13402,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 for evt in requeue:
                     _pr.completion_queue.put(evt)
                 for evt in async_events:
+                    if not self._event_generation_is_current(evt):
+                        continue
                     self._enrich_async_delegation_routing(evt)
                     synth_text = _format_gateway_process_notification(evt)
                     if not synth_text:
@@ -13354,6 +13434,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         session_id = watcher["session_id"]
         interval = watcher["check_interval"]
         session_key = watcher.get("session_key", "")
+        session_generation = int(watcher.get("session_generation") or 0)
         platform_name = watcher.get("platform", "")
         chat_id = watcher.get("chat_id", "")
         thread_id = watcher.get("thread_id", "")
@@ -13380,6 +13461,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         last_output_len = 0
         while True:
             await asyncio.sleep(interval)
+
+            if not self._event_generation_is_current({
+                "type": "process_watcher",
+                "session_key": session_key,
+                "session_generation": session_generation,
+            }):
+                break
 
             session = process_registry.get(session_id)
             if session is None:
@@ -13424,6 +13512,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     source = self._build_process_event_source({
                         "session_id": session_id,
                         "session_key": session_key,
+                        "session_generation": session_generation,
                         "platform": platform_name,
                         "chat_id": chat_id,
                         "thread_id": thread_id,
@@ -13832,6 +13921,92 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         generations[session_key] = next_generation
         return next_generation
 
+    def _current_session_generation(self, session_key: str) -> int:
+        if not session_key:
+            return 0
+        generations = self.__dict__.get("_session_generation") or {}
+        return int(generations.get(session_key, 0))
+
+    def _session_generation_file(self):
+        try:
+            from pathlib import Path
+
+            return Path(self.config.sessions_dir) / ".session-generations.json"
+        except Exception:
+            return None
+
+    def _load_session_generations(self) -> Dict[str, int]:
+        path = self._session_generation_file()
+        if path is None or not path.exists():
+            return {}
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(raw, dict):
+                return {}
+            return {
+                str(key): max(0, int(value))
+                for key, value in raw.items()
+                if key
+            }
+        except Exception:
+            logger.warning("Could not load session generation ledger", exc_info=True)
+            return {}
+
+    def _persist_session_generations(self) -> None:
+        path = self._session_generation_file()
+        if path is None:
+            return
+        try:
+            from utils import atomic_json_write
+
+            generations = self.__dict__.get("_session_generation") or {}
+            # Bound the defensive ledger. Dict insertion order keeps the most
+            # recently advanced session keys at the tail.
+            bounded = dict(list(generations.items())[-2048:])
+            atomic_json_write(path, bounded)
+        except Exception:
+            logger.warning("Could not persist session generation ledger", exc_info=True)
+
+    def _advance_session_generation(self, session_key: str, *, reason: str) -> int:
+        if not session_key:
+            return 0
+        generations = self.__dict__.get("_session_generation")
+        if generations is None:
+            generations = {}
+            self._session_generation = generations
+        generation = int(generations.get(session_key, 0)) + 1
+        generations.pop(session_key, None)
+        generations[session_key] = generation
+        self._persist_session_generations()
+        logger.info(
+            "Advanced session generation for %s → %d (%s)",
+            session_key,
+            generation,
+            reason,
+        )
+        return generation
+
+    def _event_generation_is_current(self, evt: dict) -> bool:
+        session_key = str(evt.get("session_key") or "")
+        raw_generation = evt.get("session_generation")
+        if not session_key or raw_generation is None:
+            return True
+        try:
+            event_generation = int(raw_generation)
+        except (TypeError, ValueError):
+            return False
+        current = self._current_session_generation(session_key)
+        if event_generation == current:
+            return True
+        logger.info(
+            "Dropping stale async event: session=%s event_generation=%d current_generation=%d type=%s",
+            session_key,
+            event_generation,
+            current,
+            evt.get("type", "unknown"),
+        )
+        return False
+
     def _invalidate_session_run_generation(self, session_key: str, *, reason: str = "") -> int:
         """Invalidate any in-flight run token for ``session_key``."""
         generation = self._begin_session_run_generation(session_key)
@@ -13879,16 +14054,38 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """Interrupt the current run and clear queued session state consistently."""
         if not session_key:
             return
+        # Close every dispatch rail before signalling workers. This ordering is
+        # the stop contract: no queued item or detached child may start while
+        # cancellation is still propagating.
+        self._invalidate_session_run_generation(session_key, reason=invalidation_reason)
+        self._advance_session_generation(session_key, reason=invalidation_reason)
+        adapter = self.adapters.get(source.platform)
+        if adapter and hasattr(adapter, "get_pending_message"):
+            adapter.get_pending_message(session_key)  # consume and discard
+        adapter_pending = getattr(adapter, "_pending_messages", None)
+        if isinstance(adapter_pending, dict):
+            adapter_pending.pop(session_key, None)
+        self._pending_messages.pop(session_key, None)
+        queued_events = getattr(self, "_queued_events", None)
+        if isinstance(queued_events, dict):
+            queued_events.pop(session_key, None)
+        try:
+            from tools.async_delegation import interrupt_session
+
+            interrupt_session(session_key, reason=interrupt_reason)
+        except Exception:
+            logger.debug("Session async-delegation interrupt failed", exc_info=True)
+        try:
+            from tools.process_registry import process_registry
+
+            process_registry.kill_all_for_session(session_key)
+        except Exception:
+            logger.debug("Session process cleanup failed", exc_info=True)
         running_agent = self._running_agents.get(session_key)
         if running_agent and running_agent is not _AGENT_PENDING_SENTINEL:
             running_agent.interrupt(interrupt_reason)
-        self._invalidate_session_run_generation(session_key, reason=invalidation_reason)
-        adapter = self.adapters.get(source.platform)
         if adapter and hasattr(adapter, "interrupt_session_activity"):
             await adapter.interrupt_session_activity(session_key, source.chat_id)
-        if adapter and hasattr(adapter, "get_pending_message"):
-            adapter.get_pending_message(session_key)  # consume and discard
-        self._pending_messages.pop(session_key, None)
         if release_running_state:
             self._release_running_agent_state(session_key)
 
@@ -17033,6 +17230,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         event=pending_event,
                         source=next_source,
                         history=updated_history,
+                        run_generation=run_generation,
                     )
                     if next_message is None:
                         return result

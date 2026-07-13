@@ -26,6 +26,7 @@ import logging
 import os
 import shlex
 import uuid
+from pathlib import Path
 
 from tools.budget_config import (
     DEFAULT_PREVIEW_SIZE_CHARS,
@@ -39,6 +40,38 @@ PERSISTED_OUTPUT_CLOSING_TAG = "</persisted-output>"
 STORAGE_DIR = "/tmp/hermes-results"
 HEREDOC_MARKER = "HERMES_PERSIST_EOF"
 _BUDGET_TOOL_NAME = "__budget_enforcement__"
+
+
+def persist_local_artifact(
+    content: str,
+    *,
+    category: str,
+    artifact_id: str,
+    preview_size: int = DEFAULT_PREVIEW_SIZE_CHARS,
+) -> str:
+    """Persist oversized pre-agent output and return a bounded reference.
+
+    Gateway auto-enrichment runs before a terminal environment necessarily
+    exists, so the normal sandbox spill path is unavailable. This local rail
+    keeps the full evidence outside the transcript under HERMES_HOME while
+    injecting only a preview and an auditable absolute path.
+    """
+    from hermes_constants import get_hermes_home
+
+    safe_category = "".join(ch for ch in str(category) if ch.isalnum() or ch in "-_") or "tool"
+    safe_id = "".join(ch for ch in str(artifact_id) if ch.isalnum() or ch in "-_") or uuid.uuid4().hex
+    artifact_dir = Path(get_hermes_home()) / "artifacts" / "tool-results" / safe_category
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    path = artifact_dir / f"{safe_id}.txt"
+    path.write_text(content, encoding="utf-8")
+    preview, has_more = generate_preview(content, max_chars=preview_size)
+    logger.warning(
+        "Persisted oversized %s artifact: %d chars -> %s",
+        safe_category,
+        len(content),
+        path,
+    )
+    return _build_persisted_message(preview, has_more, len(content), str(path))
 
 
 def _resolve_storage_dir(env) -> str:

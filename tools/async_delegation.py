@@ -157,6 +157,8 @@ def dispatch_async_delegation(
     role: str,
     model: Optional[str],
     session_key: str,
+    session_generation: int = 0,
+    run_id: str = "",
     runner: Callable[[], Dict[str, Any]],
     interrupt_fn: Optional[Callable[[], None]] = None,
     max_async_children: int = _DEFAULT_MAX_ASYNC_CHILDREN,
@@ -200,6 +202,8 @@ def dispatch_async_delegation(
         "role": role,
         "model": model,
         "session_key": session_key,
+        "session_generation": int(session_generation),
+        "run_id": str(run_id or ""),
         "status": "running",
         "dispatched_at": dispatched_at,
         "completed_at": None,
@@ -308,6 +312,8 @@ def _push_completion_event(
         # session_key routes the completion back to the originating gateway
         # session; empty string => CLI (single-session) path.
         "session_key": record.get("session_key", ""),
+        "session_generation": int(record.get("session_generation") or 0),
+        "run_id": str(record.get("run_id") or ""),
         "goal": record.get("goal", ""),
         "context": record.get("context"),
         "toolsets": record.get("toolsets"),
@@ -342,6 +348,8 @@ def dispatch_async_delegation_batch(
     role: str,
     model: Optional[str],
     session_key: str,
+    session_generation: int = 0,
+    run_id: str = "",
     runner: Callable[[], Dict[str, Any]],
     interrupt_fn: Optional[Callable[[], None]] = None,
     max_async_children: int = _DEFAULT_MAX_ASYNC_CHILDREN,
@@ -382,6 +390,8 @@ def dispatch_async_delegation_batch(
         "role": role,
         "model": model,
         "session_key": session_key,
+        "session_generation": int(session_generation),
+        "run_id": str(run_id or ""),
         "status": "running",
         "dispatched_at": dispatched_at,
         "completed_at": None,
@@ -478,6 +488,8 @@ def _finalize_batch(
         "type": "async_delegation",
         "delegation_id": delegation_id,
         "session_key": event_record.get("session_key", ""),
+        "session_generation": int(event_record.get("session_generation") or 0),
+        "run_id": str(event_record.get("run_id") or ""),
         "goal": event_record.get("goal", ""),
         "goals": event_record.get("goals"),
         "context": event_record.get("context"),
@@ -541,6 +553,42 @@ def interrupt_all(reason: str = "shutdown") -> int:
                 )
     if count:
         logger.info("Interrupted %d async delegation(s) (%s)", count, reason)
+    return count
+
+
+def interrupt_session(session_key: str, reason: str = "session stopped") -> int:
+    """Close and interrupt background delegations owned by one session."""
+    if not session_key:
+        return 0
+    count = 0
+    with _records_lock:
+        targets = [
+            record
+            for record in _records.values()
+            if record.get("status") == "running"
+            and record.get("session_key") == session_key
+        ]
+        for record in targets:
+            record["dispatch_closed"] = True
+    for record in targets:
+        fn = record.get("interrupt_fn")
+        if callable(fn):
+            try:
+                fn()
+                count += 1
+            except Exception as exc:
+                logger.debug(
+                    "interrupt_session: %s interrupt failed: %s",
+                    record.get("delegation_id"),
+                    exc,
+                )
+    if targets:
+        logger.info(
+            "Closed %d async delegation(s) for session %s (%s)",
+            len(targets),
+            session_key,
+            reason,
+        )
     return count
 
 
