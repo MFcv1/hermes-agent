@@ -246,7 +246,13 @@ class _CuaDriverCliSession:
         return {
             "data": data,
             "images": images,
-            "structuredContent": payload.get("structuredContent") or None,
+            # Native ``cua-driver call get_window_state`` returns its schema at
+            # the JSON root, unlike the MCP envelope. Preserve it for the
+            # shared backend while retaining the legacy data/images contract.
+            "structuredContent": (
+                payload.get("structuredContent")
+                or (payload if name == "get_window_state" else None)
+            ),
             "isError": is_error,
         }
 

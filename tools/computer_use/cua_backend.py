@@ -194,8 +194,14 @@ def _structured_capture_fields(content: Any) -> Tuple[List[UIElement], int, int]
             state = state[key]
             break
     dims = state.get("dimensions") or state.get("size") or {}
-    width = state.get("width", dims.get("width", 0) if isinstance(dims, dict) else 0)
-    height = state.get("height", dims.get("height", 0) if isinstance(dims, dict) else 0)
+    width = state.get(
+        "width",
+        state.get("screenshot_width", dims.get("width", 0) if isinstance(dims, dict) else 0),
+    )
+    height = state.get(
+        "height",
+        state.get("screenshot_height", dims.get("height", 0) if isinstance(dims, dict) else 0),
+    )
     try:
         width, height = int(width or 0), int(height or 0)
     except (TypeError, ValueError):
@@ -444,6 +450,10 @@ def _extract_tool_result(mcp_result: Any) -> Dict[str, Any]:
             data = json.loads(joined) if joined.strip().startswith(("{", "[")) else joined
         except json.JSONDecodeError:
             data = joined
+    if structured is None and isinstance(data, dict):
+        # Some cua-driver builds return the structured tool payload as a JSON
+        # text block instead of setting the MCP structuredContent field.
+        structured = data
     return {"data": data, "images": images, "structuredContent": structured, "isError": is_error}
 
 
