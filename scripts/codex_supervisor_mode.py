@@ -645,6 +645,7 @@ def run_telegram(args: argparse.Namespace) -> dict[str, Any]:
         app=args.telegram_app,
         mode=args.cua_mode,
         evidence_dir=args.evidence_dir,
+        cua_bridge_command=getattr(args, "cua_bridge_command", ""),
         json=False,
     )
     return telegram_smoke.run_smoke(smoke_args)
@@ -1056,6 +1057,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--telegram-app", default="Telegram")
     parser.add_argument("--cua-mode", choices=("som", "ax", "vision"), default="som")
     parser.add_argument("--evidence-dir", default=str(Path.home() / ".hermes" / "telegram-gui-smoke"))
+    parser.add_argument(
+        "--cua-bridge-command",
+        default="",
+        help=(
+            "Explicit JSON-over-stdio bridge to an external in-process CUA runtime "
+            "when the standalone Python MCP backend is unavailable."
+        ),
+    )
     parser.add_argument("--wait-after-send", type=float, default=0)
 
     parser.add_argument("--skip-cockpit", action="store_true")

@@ -110,6 +110,7 @@ def _args(tmp_path, **overrides):
         "app": "Telegram",
         "mode": "som",
         "evidence_dir": str(tmp_path),
+        "cua_bridge_command": "",
         "json": False,
     }
     data.update(overrides)
@@ -174,3 +175,74 @@ def test_reports_offscreen_telegram_window_separately(tmp_path):
     assert report["status"] == "telegram_window_not_on_current_space"
     assert report["windows"][0]["title"] == "Herme_core"
     assert report["windows"][0]["is_on_screen"] is False
+
+
+def test_mcp_backend_available_is_selected(tmp_path):
+    backend = FakeBackend()
+
+    report = telegram_smoke.run_smoke(_args(tmp_path), backend_factory=lambda: backend)
+
+    assert report["backend"] == {"selected": "mcp", "fallback_used": False}
+
+
+class MissingMcpBackend(FakeBackend):
+    def start(self) -> None:
+        exc = ModuleNotFoundError("No module named 'mcp'")
+        exc.name = "mcp"
+        raise exc
+
+
+def test_missing_mcp_uses_explicit_operational_bridge(tmp_path):
+    requests = []
+
+    def bridge_runner(command, request):
+        requests.append((command, request))
+        return {
+            "schema": 1,
+            "status": "sent_review_required",
+            "intent": request["intent"],
+            "app": request["app"],
+            "send": request["send"],
+        }
+
+    report = telegram_smoke.run_smoke(
+        _args(tmp_path, send=True, cua_bridge_command="codex-cua-bridge --stdio"),
+        backend_factory=MissingMcpBackend,
+        bridge_runner=bridge_runner,
+    )
+
+    assert report["status"] == "sent_review_required"
+    assert report["backend"]["selected"] == "external_bridge"
+    assert report["backend"]["fallback_used"] is True
+    assert report["backend"]["mcp_error_type"] == "ModuleNotFoundError"
+    assert requests[0][0] == "codex-cua-bridge --stdio"
+    assert requests[0][1]["operation"] == "telegram_desktop_cua_smoke"
+
+
+def test_missing_mcp_without_bridge_is_explicitly_blocked(tmp_path):
+    report = telegram_smoke.run_smoke(
+        _args(tmp_path, send=True),
+        backend_factory=MissingMcpBackend,
+    )
+
+    assert report["status"] == "cua_bridge_required"
+    assert report["backend"]["selected"] is None
+    assert report["backend"]["mcp_error_type"] == "ModuleNotFoundError"
+    assert report["fallback"]["available"] is False
+
+
+def test_missing_mcp_bridge_error_is_not_reported_as_success(tmp_path):
+    def broken_bridge(command, request):
+        raise RuntimeError("bridge exited 9: unavailable")
+
+    report = telegram_smoke.run_smoke(
+        _args(tmp_path, send=True, cua_bridge_command="broken-bridge"),
+        backend_factory=MissingMcpBackend,
+        bridge_runner=broken_bridge,
+    )
+
+    assert report["status"] == "cua_bridge_failed"
+    assert report["backend"]["selected"] == "external_bridge"
+    assert report["backend"]["fallback_used"] is True
+    assert report["fallback"]["ok"] is False
+    assert "bridge exited 9" in report["fallback"]["error"]

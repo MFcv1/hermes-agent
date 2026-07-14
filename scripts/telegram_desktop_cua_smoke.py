@@ -12,6 +12,8 @@ from __future__ import annotations
 import argparse
 import base64
 import json
+import shlex
+import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -132,14 +134,122 @@ def _load_backend_factory():
     return CuaDriverBackend
 
 
+def _run_external_bridge(command: str, request: dict[str, Any]) -> dict[str, Any]:
+    """Run an explicit JSON-over-stdio bridge to an in-process CUA runtime."""
+    argv = shlex.split(command)
+    if not argv:
+        raise RuntimeError("CUA bridge command is empty")
+    try:
+        completed = subprocess.run(
+            argv, input=json.dumps(request), capture_output=True, text=True,
+            check=False, timeout=120,
+        )
+    except FileNotFoundError as exc:
+        raise RuntimeError(f"CUA bridge executable not found: {argv[0]}") from exc
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError("CUA bridge timed out after 120 seconds") from exc
+    if completed.returncode != 0:
+        detail = completed.stderr.strip() or completed.stdout.strip() or "no diagnostic"
+        raise RuntimeError(f"CUA bridge exited {completed.returncode}: {detail[:1000]}")
+    try:
+        response = json.loads(completed.stdout)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("CUA bridge returned invalid JSON") from exc
+    if not isinstance(response, dict) or not str(response.get("status") or ""):
+        raise RuntimeError("CUA bridge response must be an object with a non-empty status")
+    return response
+
+
+def _is_missing_mcp(exc: BaseException) -> bool:
+    current: BaseException | None = exc
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, ModuleNotFoundError) and getattr(current, "name", None) == "mcp":
+            return True
+        current = current.__cause__ or current.__context__
+    return False
+
+
+def _bridge_request(args: argparse.Namespace, intent: str) -> dict[str, Any]:
+    return {
+        "schema": 1,
+        "operation": "telegram_desktop_cua_smoke",
+        "intent": intent,
+        "app": args.app,
+        "mode": args.mode,
+        "send": bool(args.send),
+        "no_enter": bool(args.no_enter),
+        "evidence_dir": str(Path(args.evidence_dir).expanduser()),
+    }
+
+
+def _run_bridge_fallback(
+    args: argparse.Namespace,
+    intent: str,
+    *,
+    backend_error: BaseException,
+    bridge_runner: Callable[[str, dict[str, Any]], dict[str, Any]],
+) -> dict[str, Any]:
+    command = str(getattr(args, "cua_bridge_command", "") or "").strip()
+    backend_diag = {
+        "selected": None,
+        "fallback_used": False,
+        "mcp_error_type": type(backend_error).__name__,
+        "mcp_error": str(backend_error),
+    }
+    if not command:
+        return {
+            "schema": 1,
+            "status": "cua_bridge_required",
+            "intent": intent,
+            "app": args.app,
+            "send": bool(args.send),
+            "error": (
+                "Python MCP CUA backend is unavailable; pass --cua-bridge-command "
+                "with a JSON-over-stdio bridge to an in-process CUA runtime"
+            ),
+            "backend": backend_diag,
+            "fallback": {"available": False, "selected": False},
+        }
+
+    backend_diag.update({"selected": "external_bridge", "fallback_used": True})
+    try:
+        bridged = bridge_runner(command, _bridge_request(args, intent))
+        if not isinstance(bridged, dict) or not str(bridged.get("status") or ""):
+            raise RuntimeError("CUA bridge response must contain a non-empty status")
+    except Exception as exc:
+        return {
+            "schema": 1,
+            "status": "cua_bridge_failed",
+            "intent": intent,
+            "app": args.app,
+            "send": bool(args.send),
+            "error": str(exc),
+            "backend": backend_diag,
+            "fallback": {"available": True, "selected": True, "ok": False, "error": str(exc)},
+        }
+    return {
+        **bridged,
+        "schema": 1,
+        "intent": intent,
+        "app": args.app,
+        "send": bool(args.send),
+        "backend": backend_diag,
+        "fallback": {"available": True, "selected": True, "ok": True},
+    }
+
+
 def run_smoke(
     args: argparse.Namespace,
     *,
     backend_factory: Optional[Callable[[], Any]] = None,
+    bridge_runner: Optional[Callable[[str, dict[str, Any]], dict[str, Any]]] = None,
 ) -> dict[str, Any]:
     intent = _message_from_args(args)
     evidence_dir = Path(args.evidence_dir).expanduser()
     backend_factory = backend_factory or _load_backend_factory()
+    bridge_runner = bridge_runner or _run_external_bridge
     backend = backend_factory()
 
     report: dict[str, Any] = {
@@ -152,13 +262,16 @@ def run_smoke(
     }
 
     if not backend.is_available():
-        report["status"] = "missing_cua_driver"
-        report["error"] = "CUA backend is not available on this host"
-        return report
+        return _run_bridge_fallback(
+            args, intent,
+            backend_error=RuntimeError("MCP CUA backend is not available on this host"),
+            bridge_runner=bridge_runner,
+        )
 
     capture = None
     try:
         backend.start()
+        report["backend"] = {"selected": "mcp", "fallback_used": False}
         target_app = args.app
         focus = backend.focus_app(target_app, raise_window=False)
         report["focus"] = {
@@ -220,6 +333,10 @@ def run_smoke(
         else:
             report["status"] = "screenshot_review_required"
     except Exception as exc:
+        if _is_missing_mcp(exc):
+            return _run_bridge_fallback(
+                args, intent, backend_error=exc, bridge_runner=bridge_runner
+            )
         report["status"] = "blocked"
         report["error"] = str(exc)
     finally:
@@ -273,6 +390,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--app", default="Telegram", help="macOS app name reported by CUA.")
     parser.add_argument("--mode", choices=("som", "ax", "vision"), default="som")
     parser.add_argument("--evidence-dir", default=str(_default_evidence_dir()))
+    parser.add_argument(
+        "--cua-bridge-command",
+        default="",
+        help=(
+            "Explicit external CUA bridge command. It receives a JSON request on stdin "
+            "and must return a structured JSON smoke report on stdout."
+        ),
+    )
     parser.add_argument("--json", action="store_true")
     return parser
 
