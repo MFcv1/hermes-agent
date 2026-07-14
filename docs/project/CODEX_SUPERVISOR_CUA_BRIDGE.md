@@ -1,8 +1,40 @@
-# Codex Supervisor CUA bridge
+# Codex Supervisor local CUA fallback
 
-`codex_supervisor_mode.py --send` first uses the existing Python MCP `CuaDriverBackend`. A standalone Python process cannot import or call Codex's in-process `node_repl` CUA tool. When that backend is unavailable, the supervisor therefore fails closed unless an external bridge is selected explicitly.
+`codex_supervisor_mode.py --send` uses this strict backend order:
 
-## Invocation
+1. the existing Python MCP `CuaDriverBackend` (priority);
+2. the locally installed native CLI, invoked only as `cua-driver call <tool> <JSON>`;
+3. an explicitly configured `--cua-bridge-command`, as a last resort only.
+
+The second path requires no Python `mcp` package and no configured command. The
+binary is resolved with `shutil.which("cua-driver")`, then the standard
+`~/.local/bin/cua-driver` path. It reuses the existing CUA facade for Telegram
+app/window selection, `list_windows`, `get_window_state` capture/AX,
+`type_text`, and `press_key`.
+
+The native CLI returns direct top-level tool JSON. In particular,
+`list_windows` returns `{ "current_space_id": ..., "windows": [...] }`, not
+an MCP `structuredContent` envelope. The adapter normalizes this real shape for
+the existing facade; `list_apps`, `get_window_state`, images/text, and action
+results are normalized similarly.
+
+## Failure behavior
+
+Every subprocess call uses a fixed argv (no shell), JSON serialization, captured
+stdout/stderr, and a timeout. Missing executable, timeout, non-zero exit,
+invalid/non-object JSON, absent Telegram app/window, empty capture, typing
+failure, and key failure remain explicit non-success statuses. The external
+bridge is attempted only when configured and only after the local CLI is absent
+or its smoke fails.
+
+No send occurs unless `--send` is present. For a safe local check, use the
+read-only command:
+
+```bash
+~/.local/bin/cua-driver call list_apps '{}'
+```
+
+## Optional last-resort bridge
 
 ```bash
 python3 scripts/codex_supervisor_mode.py \
@@ -11,21 +43,8 @@ python3 scripts/codex_supervisor_mode.py \
   --cua-bridge-command '/absolute/path/to/codex-cua-bridge --stdio'
 ```
 
-Replace `/absolute/path/to/codex-cua-bridge --stdio` with an operator-provided executable that actually has access to the in-process CUA runtime. This repository does **not** claim that such an executable exists and does not auto-select a command. Without the option, the result is `cua_bridge_required` and is non-success. A missing, failing, timed-out, or malformed bridge returns `cua_bridge_failed`; it is never reported as a send.
-
-## JSON-over-stdio contract
-
-The command receives one JSON object on stdin:
-
-```json
-{"schema":1,"operation":"telegram_desktop_cua_smoke","intent":"...","app":"Telegram","mode":"som","send":true,"no_enter":false,"evidence_dir":"..."}
-```
-
-It must write exactly one JSON object to stdout with a non-empty `status`. Only a response backed by the bridge's real UI execution may use `sent_review_required`. The supervisor preserves the bridge status and adds:
-
-- `backend.selected = "external_bridge"`
-- `backend.fallback_used = true`
-- MCP failure diagnostics
-- `fallback.ok = true|false`
-
-A bridge process exit code other than zero, invalid JSON, empty status, or a 120-second timeout is explicit failure. No secret or `HERMES_*` environment variable is introduced.
+The bridge receives one JSON object on stdin for operation
+`telegram_desktop_cua_smoke` and must emit one JSON object with a non-empty
+`status`. A missing, failing, timed-out, or malformed bridge returns
+`cua_bridge_failed`; it is never reported as a successful send. No secret or
+new `HERMES_*` setting is introduced.

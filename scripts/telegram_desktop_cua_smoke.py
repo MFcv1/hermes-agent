@@ -13,6 +13,7 @@ import argparse
 import base64
 import json
 import shlex
+import shutil
 import subprocess
 import sys
 from datetime import datetime, timezone
@@ -134,6 +135,145 @@ def _load_backend_factory():
     return CuaDriverBackend
 
 
+def _resolve_cua_driver_binary() -> str | None:
+    """Resolve the native CLI without requiring operator configuration."""
+    discovered = shutil.which("cua-driver")
+    if discovered:
+        return discovered
+    local = Path.home() / ".local" / "bin" / "cua-driver"
+    return str(local) if shutil.which(str(local)) else None
+
+
+class _CuaDriverCliSession:
+    """Strict subprocess adapter for ``cua-driver call TOOL JSON``."""
+
+    def __init__(self, binary: str, *, timeout: float = 30.0) -> None:
+        self.binary = binary
+        self.timeout = timeout
+
+    def start(self) -> None:
+        if not self.binary:
+            raise RuntimeError("cua-driver CLI executable is unavailable")
+
+    def stop(self) -> None:
+        return None
+
+    def call_tool(self, name: str, args: dict[str, Any], timeout: float | None = None) -> dict[str, Any]:
+        argv = [self.binary, "call", name, json.dumps(args, separators=(",", ":"))]
+        call_timeout = self.timeout if timeout is None else timeout
+        try:
+            completed = subprocess.run(
+                argv, capture_output=True, text=True, check=False, timeout=call_timeout,
+            )
+        except FileNotFoundError as exc:
+            raise RuntimeError(f"cua-driver CLI executable not found: {self.binary}") from exc
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError(f"cua-driver CLI {name} timed out after {call_timeout:g} seconds") from exc
+        if completed.returncode != 0:
+            detail = completed.stderr.strip() or completed.stdout.strip() or "no diagnostic"
+            raise RuntimeError(
+                f"cua-driver CLI {name} exited {completed.returncode}: {detail[:1000]}"
+            )
+        try:
+            payload = json.loads(completed.stdout)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(f"cua-driver CLI {name} returned invalid JSON") from exc
+        if not isinstance(payload, dict):
+            raise RuntimeError(f"cua-driver CLI {name} returned non-object JSON")
+        if {"data", "images", "isError"}.issubset(payload):
+            return payload
+
+        # ``cua-driver call`` returns the tool payload directly (not an MCP
+        # CallToolResult envelope). Normalize that real CLI shape to the
+        # facade contract consumed by CuaDriverBackend.
+        if name == "list_windows":
+            windows = payload.get("windows") or []
+            if not isinstance(windows, list):
+                raise RuntimeError("cua-driver CLI list_windows returned invalid windows")
+            return {
+                "data": payload,
+                "images": [],
+                "structuredContent": {"windows": windows},
+                "isError": False,
+            }
+        if name == "list_apps":
+            apps = payload.get("apps") or payload.get("applications") or []
+            if apps and not isinstance(apps, list):
+                raise RuntimeError("cua-driver CLI list_apps returned invalid apps")
+            normalized = dict(payload)
+            normalized["apps"] = apps
+            return {
+                "data": normalized,
+                "images": [],
+                "structuredContent": {"apps": apps},
+                "isError": False,
+            }
+
+        text_chunks: list[str] = []
+        images: list[str] = []
+        for part in payload.get("content") or []:
+            if not isinstance(part, dict):
+                continue
+            if part.get("type") == "text":
+                text_chunks.append(str(part.get("text") or ""))
+            elif part.get("type") == "image" and part.get("data"):
+                images.append(str(part["data"]))
+        if name == "get_window_state":
+            for key in ("text", "tree_markdown", "accessibility_tree", "ax_tree", "tree", "markdown"):
+                value = payload.get(key)
+                if isinstance(value, str) and value:
+                    text_chunks.append(value)
+            for key in ("screenshot_png_b64", "image", "screenshot"):
+                value = payload.get(key)
+                if isinstance(value, str) and value:
+                    images.append(value)
+                elif isinstance(value, dict) and value.get("data"):
+                    images.append(str(value["data"]))
+            raw_images = payload.get("images") or []
+            if isinstance(raw_images, list):
+                images.extend(
+                    str(item.get("data") if isinstance(item, dict) else item)
+                    for item in raw_images
+                    if item
+                )
+        joined = "\n".join(chunk for chunk in text_chunks if chunk)
+        data: Any = payload
+        if joined:
+            data = joined
+        is_error = bool(payload.get("isError", False))
+        if payload.get("success") is False or payload.get("ok") is False:
+            is_error = True
+        return {
+            "data": data,
+            "images": images,
+            "structuredContent": payload.get("structuredContent") or None,
+            "isError": is_error,
+        }
+
+
+def _load_cli_backend(binary: str):
+    """Reuse the existing CUA facade with a native CLI transport."""
+    CuaDriverBackend = _load_backend_factory()
+
+    class CuaDriverCliBackend(CuaDriverBackend):
+        def __init__(self) -> None:
+            self._session = _CuaDriverCliSession(binary)
+            self._active_pid = None
+            self._active_window_id = None
+            self._last_app = None
+
+        def start(self) -> None:
+            self._session.start()
+
+        def stop(self) -> None:
+            self._session.stop()
+
+        def is_available(self) -> bool:
+            return True
+
+    return CuaDriverCliBackend()
+
+
 def _run_external_bridge(command: str, request: dict[str, Any]) -> dict[str, Any]:
     """Run an explicit JSON-over-stdio bridge to an in-process CUA runtime."""
     argv = shlex.split(command)
@@ -190,6 +330,7 @@ def _run_bridge_fallback(
     *,
     backend_error: BaseException,
     bridge_runner: Callable[[str, dict[str, Any]], dict[str, Any]],
+    cli_error: str = "",
 ) -> dict[str, Any]:
     command = str(getattr(args, "cua_bridge_command", "") or "").strip()
     backend_diag = {
@@ -198,6 +339,8 @@ def _run_bridge_fallback(
         "mcp_error_type": type(backend_error).__name__,
         "mcp_error": str(backend_error),
     }
+    if cli_error:
+        backend_diag["cli_error"] = cli_error
     if not command:
         return {
             "schema": 1,
@@ -240,16 +383,79 @@ def _run_bridge_fallback(
     }
 
 
+def _run_fallback_chain(
+    args: argparse.Namespace,
+    intent: str,
+    *,
+    backend_error: BaseException,
+    bridge_runner: Callable[[str, dict[str, Any]], dict[str, Any]],
+    cli_binary_resolver: Callable[[], str | None],
+) -> dict[str, Any]:
+    """Try the native CLI first; retain the configured bridge as last resort."""
+    binary = cli_binary_resolver()
+    cli_error = ""
+    if binary:
+        cli_report = run_smoke(
+            args,
+            backend_factory=lambda: _load_cli_backend(binary),
+            bridge_runner=bridge_runner,
+            cli_binary_resolver=cli_binary_resolver,
+            _backend_label="cua_driver_cli",
+            _allow_fallback=False,
+        )
+        if cli_report.get("status") != "blocked":
+            cli_report["backend"].update({
+                "mcp_error_type": type(backend_error).__name__,
+                "mcp_error": str(backend_error),
+            })
+            return cli_report
+        cli_error = str(cli_report.get("error") or "native CLI smoke failed")
+
+    command = str(getattr(args, "cua_bridge_command", "") or "").strip()
+    if command:
+        return _run_bridge_fallback(
+            args, intent, backend_error=backend_error, bridge_runner=bridge_runner,
+            cli_error=cli_error or "cua-driver CLI executable is unavailable",
+        )
+
+    status = "cua_cli_failed" if binary else "cua_cli_unavailable"
+    error = cli_error or (
+        "cua-driver CLI not found via PATH or ~/.local/bin/cua-driver"
+    )
+    return {
+        "schema": 1,
+        "status": status,
+        "intent": intent,
+        "app": args.app,
+        "send": bool(args.send),
+        "error": error,
+        "backend": {
+            "selected": "cua_driver_cli" if binary else None,
+            "fallback_used": bool(binary),
+            "mcp_error_type": type(backend_error).__name__,
+            "mcp_error": str(backend_error),
+            **({"cli_error": cli_error} if cli_error else {}),
+        },
+        "fallback": {
+            "available": bool(binary), "selected": bool(binary), "ok": False,
+        },
+    }
+
+
 def run_smoke(
     args: argparse.Namespace,
     *,
     backend_factory: Optional[Callable[[], Any]] = None,
     bridge_runner: Optional[Callable[[str, dict[str, Any]], dict[str, Any]]] = None,
+    cli_binary_resolver: Optional[Callable[[], str | None]] = None,
+    _backend_label: str = "mcp",
+    _allow_fallback: bool = True,
 ) -> dict[str, Any]:
     intent = _message_from_args(args)
     evidence_dir = Path(args.evidence_dir).expanduser()
     backend_factory = backend_factory or _load_backend_factory()
     bridge_runner = bridge_runner or _run_external_bridge
+    cli_binary_resolver = cli_binary_resolver or _resolve_cua_driver_binary
     backend = backend_factory()
 
     report: dict[str, Any] = {
@@ -262,16 +468,22 @@ def run_smoke(
     }
 
     if not backend.is_available():
-        return _run_bridge_fallback(
-            args, intent,
-            backend_error=RuntimeError("MCP CUA backend is not available on this host"),
-            bridge_runner=bridge_runner,
-        )
+        unavailable = RuntimeError(f"{_backend_label} CUA backend is not available on this host")
+        if _allow_fallback:
+            return _run_fallback_chain(
+                args, intent, backend_error=unavailable, bridge_runner=bridge_runner,
+                cli_binary_resolver=cli_binary_resolver,
+            )
+        report["error"] = str(unavailable)
+        return report
 
     capture = None
     try:
         backend.start()
-        report["backend"] = {"selected": "mcp", "fallback_used": False}
+        report["backend"] = {
+            "selected": _backend_label,
+            "fallback_used": _backend_label != "mcp",
+        }
         target_app = args.app
         focus = backend.focus_app(target_app, raise_window=False)
         report["focus"] = {
@@ -333,9 +545,10 @@ def run_smoke(
         else:
             report["status"] = "screenshot_review_required"
     except Exception as exc:
-        if _is_missing_mcp(exc):
-            return _run_bridge_fallback(
-                args, intent, backend_error=exc, bridge_runner=bridge_runner
+        if _allow_fallback and _is_missing_mcp(exc):
+            return _run_fallback_chain(
+                args, intent, backend_error=exc, bridge_runner=bridge_runner,
+                cli_binary_resolver=cli_binary_resolver,
             )
         report["status"] = "blocked"
         report["error"] = str(exc)
@@ -394,8 +607,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--cua-bridge-command",
         default="",
         help=(
-            "Explicit external CUA bridge command. It receives a JSON request on stdin "
-            "and must return a structured JSON smoke report on stdout."
+            "Optional last-resort external CUA bridge after the Python MCP backend "
+            "and local cua-driver CLI fallback fail."
         ),
     )
     parser.add_argument("--json", action="store_true")

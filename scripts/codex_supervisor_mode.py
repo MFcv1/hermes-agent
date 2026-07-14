@@ -1061,8 +1061,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--cua-bridge-command",
         default="",
         help=(
-            "Explicit JSON-over-stdio bridge to an external in-process CUA runtime "
-            "when the standalone Python MCP backend is unavailable."
+            "Optional last-resort JSON-over-stdio bridge after the Python MCP backend "
+            "and local cua-driver CLI fallback fail."
         ),
     )
     parser.add_argument("--wait-after-send", type=float, default=0)
