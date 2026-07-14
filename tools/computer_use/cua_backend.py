@@ -184,6 +184,50 @@ def _split_tree_text(full_text: str) -> Tuple[str, str]:
     return summary, tree
 
 
+def _structured_capture_fields(content: Any) -> Tuple[List[UIElement], int, int]:
+    """Normalize cua-driver structured state, tolerating schema wrappers."""
+    if not isinstance(content, dict):
+        return [], 0, 0
+    state = content
+    for key in ("window_state", "windowState", "state", "data"):
+        if isinstance(state.get(key), dict):
+            state = state[key]
+            break
+    dims = state.get("dimensions") or state.get("size") or {}
+    width = state.get("width", dims.get("width", 0) if isinstance(dims, dict) else 0)
+    height = state.get("height", dims.get("height", 0) if isinstance(dims, dict) else 0)
+    try:
+        width, height = int(width or 0), int(height or 0)
+    except (TypeError, ValueError):
+        width = height = 0
+    elements: List[UIElement] = []
+    raw_elements = state.get("elements") or state.get("ui_elements") or []
+    if isinstance(raw_elements, dict):
+        raw_elements = list(raw_elements.values())
+    for position, item in enumerate(raw_elements):
+        if not isinstance(item, dict):
+            continue
+        bounds = item.get("bounds") or item.get("frame") or (0, 0, 0, 0)
+        if isinstance(bounds, dict):
+            bounds = (bounds.get("x", 0), bounds.get("y", 0),
+                      bounds.get("width", bounds.get("w", 0)),
+                      bounds.get("height", bounds.get("h", 0)))
+        if not isinstance(bounds, (list, tuple)) or len(bounds) != 4:
+            bounds = (0, 0, 0, 0)
+        try:
+            normalized_bounds = tuple(int(v or 0) for v in bounds)
+            index = int(item.get("index", item.get("element_index", position)))
+        except (TypeError, ValueError):
+            continue
+        elements.append(UIElement(
+            index=index,
+            role=str(item.get("role") or item.get("ax_role") or item.get("type") or ""),
+            label=str(item.get("label") or item.get("title") or item.get("name") or ""),
+            bounds=normalized_bounds,
+        ))
+    return elements, width, height
+
+
 def _parse_key_combo(keys: str) -> Tuple[Optional[str], List[str]]:
     """Parse a key string like 'cmd+s' into (key, modifiers).
 
@@ -524,15 +568,17 @@ class CuaDriverBackend(ComputerUseBackend):
             )
             text = gws_out["data"] if isinstance(gws_out["data"], str) else ""
             summary, tree = _split_tree_text(text)
+            structured_elements, structured_width, structured_height = (
+                _structured_capture_fields(gws_out.get("structuredContent"))
+            )
+            elements = structured_elements
+            width, height = structured_width, structured_height
 
-            # Parse element count from summary e.g. "✅ AppName — 42 elements, turn 3..."
-            m = re.search(r'(\d+)\s+elements?', summary)
-            if tree and not gws_out["images"]:
-                # ax mode — no screenshot
+            # Legacy markdown remains the fallback for older cua-driver builds.
+            if not elements and tree:
                 elements = _parse_elements_from_tree(tree)
-            elif gws_out["images"]:
+            if gws_out["images"]:
                 png_b64 = gws_out["images"][0]
-                elements = _parse_elements_from_tree(tree)
 
             # Extract window title from the AX tree first AXWindow line.
             wt = re.search(r'AXWindow\s+"([^"]+)"', tree)
