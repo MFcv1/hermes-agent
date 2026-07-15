@@ -6138,7 +6138,7 @@ class TelegramAdapter(BasePlatformAdapter):
         self._enqueue_text_event(event)
 
     async def _handle_web_app_data(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Resume a selected Hermes session from the Telegram Mini App."""
+        """Handle explicit resume/create actions from the private Mini App."""
         msg = self._effective_update_message(update)
         if not msg or not self._should_process_message(msg):
             return
@@ -6148,17 +6148,107 @@ class TelegramAdapter(BasePlatformAdapter):
         except (TypeError, ValueError):
             await msg.reply_text("Action Mini App illisible.")
             return
-        if not isinstance(payload, dict) or payload.get("action") != "session.resume":
+        if not isinstance(payload, dict):
+            await msg.reply_text("Action Mini App invalide.")
+            return
+
+        action = str(payload.get("action") or "").strip().lower()
+
+        async def dispatch(command: str) -> None:
+            event = self._build_message_event(msg, MessageType.COMMAND, update_id=update.update_id)
+            event.text = command
+            event._telegram_message = msg  # type: ignore[attr-defined]
+            event = self._apply_telegram_group_observe_attribution(event)
+            await self.handle_message(event)
+
+        if action == "session.resume":
+            session_id = str(payload.get("session_id") or "").strip()
+            if not session_id:
+                await msg.reply_text("Session Hermes introuvable.")
+                return
+            await dispatch(f"/resume {shlex.quote(session_id)}")
+            return
+
+        if action not in {"work_session.create", "work_session.resume", "work_session.delete"}:
             await msg.reply_text("Action Mini App inconnue.")
             return
-        session_id = str(payload.get("session_id") or "").strip()
-        if not session_id:
-            await msg.reply_text("Session Hermes introuvable.")
-            return
-        event = self._build_message_event(msg, MessageType.COMMAND, update_id=update.update_id)
-        event.text = f"/resume {shlex.quote(session_id)}"
-        event = self._apply_telegram_group_observe_attribution(event)
-        await self.handle_message(event)
+
+        # Worker sessions are deliberately stored separately from chat
+        # transcripts. The linked Hermes session is resumed through the
+        # existing /resume command, preserving one normal Telegram thread.
+        from work_sessions import WorkSessionStore
+
+        try:
+            with WorkSessionStore() as store:
+                if action == "work_session.create":
+                    repo = str(payload.get("repo") or "").strip() or None
+                    objective = str(payload.get("objective") or "").strip() or None
+                    title = str(payload.get("title") or objective or repo or "Nouvelle session").strip()
+                    session = store.create_session(
+                        title=title,
+                        workflow=str(payload.get("workflow") or "libre"),
+                        origin_channel="telegram",
+                        repo=repo,
+                        objective=objective,
+                        metadata={
+                            "telegram_user_id": str(getattr(getattr(msg, "from_user", None), "id", "")),
+                            "telegram_chat_id": str(getattr(msg, "chat_id", "")),
+                        },
+                    )
+                    await dispatch("/new")
+                    source = self._build_message_event(msg, MessageType.COMMAND, update_id=update.update_id).source
+                    entry = self._session_store.get_or_create_session(source) if source else None
+                    if entry:
+                        store.update_session(
+                            session["id"],
+                            hermes_session_id=getattr(entry, "session_id", None),
+                            gateway_session_key=getattr(entry, "session_key", None),
+                            status="active",
+                        )
+                    await msg.reply_text(
+                        f"Worker session créée : {session['title']}\n"
+                        "Envoie maintenant ton brief dans ce chat."
+                    )
+                    return
+
+                work_session_id = str(payload.get("work_session_id") or "").strip()
+                session = store.get_session(work_session_id)
+                if not session:
+                    await msg.reply_text("Worker session introuvable.")
+                    return
+
+                if action == "work_session.delete":
+                    store.delete_session(work_session_id)
+                    await msg.reply_text(f"Worker session supprimée : {session['title']}")
+                    return
+
+                linked_session_id = str(session.get("hermes_session_id") or "").strip()
+                if linked_session_id:
+                    await dispatch(f"/resume {shlex.quote(linked_session_id)}")
+                else:
+                    prompt = store.resume_prompt(work_session_id)
+                    if not prompt:
+                        await msg.reply_text("Paquet de reprise introuvable.")
+                        return
+                    await dispatch(prompt)
+                store.add_event(
+                    work_session_id,
+                    "session.resumed",
+                    role="user",
+                    content="Resumed from Telegram Mini App.",
+                )
+                next_actions = session.get("next_actions") or []
+                next_lines = "\n".join(f"• {item}" for item in next_actions if str(item).strip())
+                await msg.reply_text(
+                    "📌 Worker session active\n\n"
+                    f"{session['title']}\n"
+                    f"Repo : {session.get('repo') or 'non défini'}\n\n"
+                    f"État : {session.get('current_state') or session.get('summary') or 'non défini'}"
+                    + (f"\n\nProchaines actions\n{next_lines}" if next_lines else "")
+                )
+        except Exception:
+            logger.warning("[%s] Worker-session Mini App action failed", self.name, exc_info=True)
+            await msg.reply_text("Action Worker Session impossible côté Hermes.")
 
     async def send_hermes_mini_app_shortcut(self, chat_id: str) -> None:
         """Send the reply-keyboard WebApp control required by Telegram Desktop."""
