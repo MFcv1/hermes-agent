@@ -61,6 +61,23 @@ class GatewaySlashCommandsMixin:
         adapter = self.adapters.get(platform) if getattr(self, "adapters", None) else None
         return getattr(adapter, "typed_command_prefix", "/") if adapter is not None else "/"
 
+    async def _handle_app_command(self, event: MessageEvent) -> str:
+        """Open the session picker in Telegram's native Mini App surface."""
+        from gateway.config import Platform
+        from gateway.dashboard_links import hermes_mini_app_url
+
+        source = event.source
+        adapter = self.adapters.get(source.platform) if source else None
+        sender = getattr(adapter, "send_hermes_mini_app_shortcut", None)
+        if source and source.platform == Platform.TELEGRAM and callable(sender):
+            await sender(str(source.chat_id))
+            return ""
+
+        url = hermes_mini_app_url("/sessions")
+        if not url:
+            return "Mini App indisponible : configure `dashboard.public_url` avec l'URL HTTPS privée du dashboard."
+        return f"Ouvre Hermes Sessions :\n{url}"
+
     async def _handle_reset_command(self, event: MessageEvent) -> Union[str, EphemeralReply]:
         """Handle /new or /reset command."""
         source = event.source

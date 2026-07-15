@@ -77,6 +77,28 @@ const SOURCE_CONFIG: Record<string, { icon: typeof Terminal; color: string }> =
     cron: { icon: Clock, color: "text-warning" },
   };
 
+declare global {
+  interface Window {
+    Telegram?: {
+      WebApp?: {
+        ready?: () => void;
+        sendData?: (data: string) => void;
+      };
+    };
+  }
+}
+
+function isTelegramMiniApp(): boolean {
+  return typeof window !== "undefined" && Boolean(window.Telegram?.WebApp?.sendData);
+}
+
+function sendTelegramResume(sessionId: string): boolean {
+  const webApp = window.Telegram?.WebApp;
+  if (!webApp?.sendData) return false;
+  webApp.sendData(JSON.stringify({ action: "session.resume", session_id: sessionId }));
+  return true;
+}
+
 /** Render an FTS5 snippet with highlighted matches.
  *  The backend wraps matches in >>> and <<< delimiters. */
 function SnippetHighlight({ snippet }: { snippet: string }) {
@@ -394,6 +416,7 @@ function SessionRow({
   const [renameSaving, setRenameSaving] = useState(false);
   const { t } = useI18n();
   const navigate = useNavigate();
+  const telegramMiniApp = isTelegramMiniApp();
 
   useEffect(() => {
     if (isExpanded && messages === null && !loading) {
@@ -446,6 +469,22 @@ function SessionRow({
           }}
         >
           <Play />
+        </Button>
+      )}
+
+      {telegramMiniApp && (
+        <Button
+          ghost
+          size="icon"
+          className="text-muted-foreground hover:text-success"
+          aria-label="Reprendre dans Telegram"
+          title="Reprendre dans Telegram"
+          onClick={(e) => {
+            e.stopPropagation();
+            sendTelegramResume(session.id);
+          }}
+        >
+          <MessageCircle />
         </Button>
       )}
 
@@ -762,6 +801,10 @@ export default function SessionsPage() {
   const { setAfterTitle, setEnd } = usePageHeader();
   const { activeAction, actionStatus, dismissLog } = useSystemActions();
   const resumeInChatEnabled = isDashboardEmbeddedChatEnabled();
+
+  useEffect(() => {
+    window.Telegram?.WebApp?.ready?.();
+  }, []);
 
   const refreshEmptyCount = useCallback(() => {
     api

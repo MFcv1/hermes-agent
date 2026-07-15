@@ -361,6 +361,19 @@ _LOOPBACK_HOST_VALUES: frozenset = frozenset({
 })
 
 
+def _configured_public_dashboard_host() -> str:
+    """Return the one operator-declared reverse-proxy hostname, if any."""
+    try:
+        from hermes_cli.dashboard_auth.prefix import resolve_public_url
+
+        public_url = resolve_public_url()
+    except Exception:
+        return ""
+    if not public_url:
+        return ""
+    return (urllib.parse.urlparse(public_url).hostname or "").lower()
+
+
 def should_require_auth(host: str, allow_public: bool = False) -> bool:
     """Return True iff the dashboard auth gate must be active.
 
@@ -416,6 +429,13 @@ def _is_accepted_host(host_header: str, bound_host: str) -> bool:
     # (requires --insecure per web_server.start_server). No Host-layer
     # defence can protect that mode; rely on operator network controls.
     if bound_host in {"0.0.0.0", "::"}:
+        return True
+
+    # Tailscale Serve/reverse proxies keep uvicorn on loopback. Permit only
+    # the configured hostname, retaining the DNS-rebinding protection for all
+    # other host headers.
+    configured_public_host = _configured_public_dashboard_host()
+    if configured_public_host and host_only == configured_public_host:
         return True
 
     # Loopback bind: accept the loopback names

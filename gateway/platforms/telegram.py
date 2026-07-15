@@ -34,7 +34,10 @@ def normalize_cockpit_mode(mode: str | None) -> str:
     return clean if clean in REPO_COCKPIT_MODES else "ask_review"
 
 try:
-    from telegram import Update, Bot, Message, InlineKeyboardButton, InlineKeyboardMarkup
+    from telegram import (
+        Update, Bot, Message, InlineKeyboardButton, InlineKeyboardMarkup,
+        KeyboardButton, ReplyKeyboardMarkup,
+    )
     try:
         from telegram import WebAppInfo
     except ImportError:
@@ -61,6 +64,8 @@ except ImportError:
     Message = Any
     InlineKeyboardButton = Any
     InlineKeyboardMarkup = Any
+    KeyboardButton = Any
+    ReplyKeyboardMarkup = Any
     WebAppInfo = None
     LinkPreviewOptions = None
     Application = Any
@@ -510,6 +515,30 @@ class TelegramAdapter(TelegramTransportMixin, TelegramInboundFilterMixin, Telegr
         event = self._apply_telegram_group_observe_attribution(event)
         self._enqueue_text_event(event)
 
+    async def _handle_web_app_data(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Resume a selected Hermes session from the Telegram Mini App."""
+        msg = self._effective_update_message(update)
+        if not msg or not self._should_process_message(msg):
+            return
+        raw_data = getattr(getattr(msg, "web_app_data", None), "data", "")
+        try:
+            payload = json.loads(raw_data)
+        except (TypeError, ValueError):
+            await msg.reply_text("Action Mini App illisible.")
+            return
+        if not isinstance(payload, dict) or payload.get("action") != "session.resume":
+            await msg.reply_text("Action Mini App inconnue.")
+            return
+        session_id = str(payload.get("session_id") or "").strip()
+        if not session_id:
+            await msg.reply_text("Session Hermes introuvable.")
+            return
+        event = self._build_message_event(msg, MessageType.TEXT, update_id=update.update_id)
+        event.text = f"/resume {shlex.quote(session_id)}"
+        event._telegram_message = msg  # type: ignore[attr-defined]
+        event = self._apply_telegram_group_observe_attribution(event)
+        await self.handle_message(event)
+
 
 
 
@@ -694,6 +723,32 @@ class TelegramAdapter(TelegramTransportMixin, TelegramInboundFilterMixin, Telegr
             else:
                 raise
 
+    async def _send_hermes_mini_app_shortcut(self, msg: Message) -> None:
+        """Open the dashboard Sessions view through a Telegram WebApp button."""
+        from gateway.dashboard_links import hermes_mini_app_url
+
+        dashboard_url = hermes_mini_app_url("/sessions")
+        if not dashboard_url:
+            await msg.reply_text(
+                "Mini App indisponible : configure d'abord `dashboard.public_url` avec l'URL HTTPS privée du dashboard."
+            )
+            return
+        if WebAppInfo is None:
+            await msg.reply_text(f"Ouvre Hermes Sessions :\n{dashboard_url}")
+            return
+        # Telegram Desktop delivers WebApp.sendData only for a reply-keyboard
+        # WebApp button; inline buttons merely open the page.
+        keyboard = ReplyKeyboardMarkup(
+            [[KeyboardButton("Ouvrir Hermes Mini App", web_app=WebAppInfo(url=dashboard_url))]],
+            resize_keyboard=True,
+            one_time_keyboard=True,
+        )
+        await msg.reply_text(
+            "Hermes Mini App\n\nConsulte une conversation, puis utilise « Reprendre dans Telegram ».",
+            reply_markup=keyboard,
+            **self._link_preview_kwargs(),
+        )
+
     async def _send_richdemo(self, msg: Message, template: str = "daily_digest") -> None:
         """Send a Repo Cockpit Telegram Rich Message template demo."""
         allowed = {
@@ -772,6 +827,9 @@ class TelegramAdapter(TelegramTransportMixin, TelegramInboundFilterMixin, Telegr
             return
         if command_token in {"/delete", "/deletechat"}:
             await self._send_thread_action_command(msg, "delete")
+            return
+        if command_token in {"/app", "/miniapp"}:
+            await self._send_hermes_mini_app_shortcut(msg)
             return
         if command_token == "/repo":
             await self._send_repo_cockpit_shortcut(msg)
