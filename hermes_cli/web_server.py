@@ -7369,6 +7369,148 @@ def _open_session_db_for_profile(profile: Optional[str]):
     return SessionDB(db_path=Path(home) / "state.db")
 
 
+# ── Worker-session API ────────────────────────────────────────────────────
+# A worker session is the compact task-level context used to resume a piece of
+# work from Telegram. It complements, rather than replaces, a Hermes chat
+# session: the record holds the repo, objective and next actions while the
+# linked Hermes session retains the actual conversation.
+class WorkSessionCreate(BaseModel):
+    title: Optional[str] = None
+    workflow: str = "libre"
+    origin_channel: str = "dashboard"
+    repo: Optional[str] = None
+    provider: Optional[str] = None
+    cockpit_task_id: Optional[str] = None
+    objective: Optional[str] = None
+    metadata: Optional[Dict[str, Any]] = None
+    profile: Optional[str] = None
+
+
+class WorkSessionUpdate(BaseModel):
+    title: Optional[str] = None
+    status: Optional[str] = None
+    workflow: Optional[str] = None
+    origin_channel: Optional[str] = None
+    repo: Optional[str] = None
+    provider: Optional[str] = None
+    cockpit_task_id: Optional[str] = None
+    hermes_session_id: Optional[str] = None
+    gateway_session_key: Optional[str] = None
+    git_branch: Optional[str] = None
+    pr_url: Optional[str] = None
+    preview_url: Optional[str] = None
+    live_url: Optional[str] = None
+    objective: Optional[str] = None
+    summary: Optional[str] = None
+    current_state: Optional[str] = None
+    next_actions: Optional[List[str]] = None
+    metadata: Optional[Dict[str, Any]] = None
+    profile: Optional[str] = None
+
+
+def _open_work_session_store_for_profile(profile: Optional[str]):
+    from work_sessions import WorkSessionStore
+
+    if not profile:
+        return WorkSessionStore()
+    _name, home = _cron_profile_home(profile)
+    return WorkSessionStore(hermes_home=Path(home))
+
+
+@app.get("/api/work-sessions")
+async def list_work_sessions(
+    limit: int = 50,
+    offset: int = 0,
+    repo: Optional[str] = None,
+    provider: Optional[str] = None,
+    status: Optional[str] = None,
+    workflow: Optional[str] = None,
+    origin_channel: Optional[str] = None,
+    profile: Optional[str] = None,
+):
+    store = _open_work_session_store_for_profile(profile)
+    try:
+        sessions = store.list_sessions(
+            limit=limit,
+            offset=offset,
+            repo=repo,
+            provider=provider,
+            status=status,
+            workflow=workflow,
+            origin_channel=origin_channel,
+        )
+        return {"work_sessions": sessions, "total": len(sessions), "limit": limit, "offset": offset}
+    finally:
+        store.close()
+
+
+@app.post("/api/work-sessions")
+async def create_work_session(body: WorkSessionCreate):
+    store = _open_work_session_store_for_profile(body.profile)
+    try:
+        session = store.create_session(
+            title=body.title or body.objective or body.repo or "Nouvelle session",
+            workflow=body.workflow,
+            origin_channel=body.origin_channel,
+            repo=body.repo,
+            provider=body.provider,
+            cockpit_task_id=body.cockpit_task_id,
+            objective=body.objective,
+            metadata=body.metadata or {},
+        )
+        return {"ok": True, "work_session": session}
+    finally:
+        store.close()
+
+
+@app.get("/api/work-sessions/{work_session_id}")
+async def get_work_session(work_session_id: str, profile: Optional[str] = None):
+    store = _open_work_session_store_for_profile(profile)
+    try:
+        session = store.get_session(work_session_id)
+        if not session:
+            raise HTTPException(status_code=404, detail="Worker session not found")
+        return {"work_session": session}
+    finally:
+        store.close()
+
+
+@app.patch("/api/work-sessions/{work_session_id}")
+async def update_work_session(work_session_id: str, body: WorkSessionUpdate):
+    store = _open_work_session_store_for_profile(body.profile)
+    try:
+        dump = getattr(body, "model_dump", None)
+        payload = dump(exclude_unset=True) if callable(dump) else body.dict(exclude_unset=True)
+        payload.pop("profile", None)
+        session = store.update_session(work_session_id, **payload)
+        if not session:
+            raise HTTPException(status_code=404, detail="Worker session not found")
+        return {"ok": True, "work_session": session}
+    finally:
+        store.close()
+
+
+@app.get("/api/work-sessions/{work_session_id}/resume-packet")
+async def get_work_session_resume_packet(work_session_id: str, profile: Optional[str] = None):
+    store = _open_work_session_store_for_profile(profile)
+    try:
+        packet = store.resume_packet(work_session_id)
+        if not packet:
+            raise HTTPException(status_code=404, detail="Worker session not found")
+        return {"resume_packet": packet}
+    finally:
+        store.close()
+
+
+@app.delete("/api/work-sessions/{work_session_id}")
+async def delete_work_session(work_session_id: str, profile: Optional[str] = None):
+    store = _open_work_session_store_for_profile(profile)
+    try:
+        return {"ok": True, "deleted": store.delete_session(work_session_id)}
+    finally:
+        store.close()
+
+
 @app.get("/api/sessions/{session_id}")
 async def get_session_detail(session_id: str, profile: Optional[str] = None):
     db = _open_session_db_for_profile(profile)

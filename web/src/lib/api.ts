@@ -64,6 +64,7 @@ export function getManagementProfile(): string {
 // themselves — is machine-global or self-scoped and must NOT be rewritten.
 const PROFILE_SCOPED_PREFIXES = [
   "/api/status",
+  "/api/work-sessions",
   "/api/gateway",
   "/api/analytics",
   "/api/skills",
