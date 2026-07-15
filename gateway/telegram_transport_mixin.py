@@ -1677,6 +1677,12 @@ class TelegramTransportMixin:
                 filters.TEXT & ~filters.COMMAND,
                 self._handle_text_message
             ))
+            web_app_data_filter = getattr(getattr(filters, "StatusUpdate", None), "WEB_APP_DATA", None)
+            if web_app_data_filter is not None and hasattr(self, "_handle_web_app_data"):
+                self._app.add_handler(TelegramMessageHandler(
+                    web_app_data_filter,
+                    self._handle_web_app_data,
+                ))
             self._app.add_handler(TelegramMessageHandler(
                 filters.COMMAND,
                 self._handle_command

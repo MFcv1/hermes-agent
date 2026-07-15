@@ -71,6 +71,8 @@ COMMAND_REGISTRY: list[CommandDef] = [
                aliases=("reset-libre", "chatlibre"), args_hint="[watch]", gateway_only=True),
     CommandDef("dev", "Simple developer cockpit: projects, GitHub, deploy, ops", "Session",
                gateway_only=True),
+    CommandDef("app", "Open the Telegram Mini App for Hermes sessions", "Session",
+               aliases=("miniapp",), gateway_only=True),
     CommandDef("topic", "Enable or inspect Telegram DM topic sessions", "Session",
                gateway_only=True, args_hint="[off|help|session-id]"),
     CommandDef("clear", "Clear screen and start a new session", "Session",

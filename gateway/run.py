@@ -7744,6 +7744,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 logger.info("Ignoring /start platform ping for active session %s", _quick_key)
                 return ""
 
+            if _cmd_def_inner and _cmd_def_inner.name == "app":
+                return await self._handle_app_command(event)
+
             if _cmd_def_inner and _cmd_def_inner.name == "restart":
                 return await self._handle_restart_command(event)
 
@@ -8238,6 +8241,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         if canonical == "models":
             return await self._handle_models_command(event)
+
+        if canonical == "app":
+            return await self._handle_app_command(event)
 
         if canonical == "codex-runtime":
             return await self._handle_codex_runtime_command(event)

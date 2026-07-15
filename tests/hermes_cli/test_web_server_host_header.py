@@ -54,6 +54,19 @@ class TestHostHeaderValidator:
                     f"bound={bound} must reject attacker host={attacker!r}"
                 )
 
+    def test_loopback_bind_accepts_only_configured_proxy_host(self, monkeypatch):
+        import hermes_cli.web_server as web_server
+
+        monkeypatch.setattr(
+            web_server,
+            "_configured_public_dashboard_host",
+            lambda: "hermes-vps.tail59f02f.ts.net",
+        )
+        assert web_server._is_accepted_host(
+            "hermes-vps.tail59f02f.ts.net", "127.0.0.1"
+        )
+        assert not web_server._is_accepted_host("evil.example", "127.0.0.1")
+
     def test_zero_zero_bind_accepts_anything(self):
         """0.0.0.0 means operator explicitly opted into all-interfaces
         (requires --insecure). No Host-layer defence is possible — rely

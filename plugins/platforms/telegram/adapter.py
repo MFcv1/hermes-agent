@@ -16,13 +16,17 @@ import os
 import tempfile
 import html as _html
 import re
+import shlex
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Set, Any
 
 logger = logging.getLogger(__name__)
 
 try:
-    from telegram import Update, Bot, Message, InlineKeyboardButton, InlineKeyboardMarkup
+    from telegram import (
+        Update, Bot, Message, InlineKeyboardButton, InlineKeyboardMarkup,
+        KeyboardButton, ReplyKeyboardMarkup, WebAppInfo,
+    )
     try:
         from telegram import LinkPreviewOptions
     except ImportError:
@@ -45,6 +49,9 @@ except ImportError:
     Message = Any
     InlineKeyboardButton = Any
     InlineKeyboardMarkup = Any
+    KeyboardButton = Any
+    ReplyKeyboardMarkup = Any
+    WebAppInfo = None
     LinkPreviewOptions = None
     Application = Any
     CommandHandler = Any
@@ -120,7 +127,7 @@ def check_telegram_requirements() -> bool:
     so the adapter's class-level type aliases get rebound.
     """
     global TELEGRAM_AVAILABLE, Update, Bot, Message, InlineKeyboardButton
-    global InlineKeyboardMarkup, LinkPreviewOptions, Application
+    global InlineKeyboardMarkup, KeyboardButton, ReplyKeyboardMarkup, WebAppInfo, LinkPreviewOptions, Application
     global CommandHandler, CallbackQueryHandler, TelegramMessageHandler
     global ContextTypes, filters, ParseMode, ChatType, HTTPXRequest
     if TELEGRAM_AVAILABLE:
@@ -132,7 +139,10 @@ def check_telegram_requirements() -> bool:
         return False
     try:
         from telegram import Update as _Update, Bot as _Bot, Message as _Message
-        from telegram import InlineKeyboardButton as _IKB, InlineKeyboardMarkup as _IKM
+        from telegram import (
+            InlineKeyboardButton as _IKB, InlineKeyboardMarkup as _IKM,
+            KeyboardButton as _KB, ReplyKeyboardMarkup as _RKM, WebAppInfo as _WAI,
+        )
         try:
             from telegram import LinkPreviewOptions as _LPO
         except ImportError:
@@ -152,6 +162,9 @@ def check_telegram_requirements() -> bool:
     Message = _Message
     InlineKeyboardButton = _IKB
     InlineKeyboardMarkup = _IKM
+    KeyboardButton = _KB
+    ReplyKeyboardMarkup = _RKM
+    WebAppInfo = _WAI
     LinkPreviewOptions = _LPO
     Application = _App
     CommandHandler = _CH
@@ -2211,6 +2224,12 @@ class TelegramAdapter(BasePlatformAdapter):
                 filters.TEXT & ~filters.COMMAND,
                 self._handle_text_message
             ))
+            web_app_data_filter = getattr(getattr(filters, "StatusUpdate", None), "WEB_APP_DATA", None)
+            if web_app_data_filter is not None:
+                self._app.add_handler(TelegramMessageHandler(
+                    web_app_data_filter,
+                    self._handle_web_app_data,
+                ))
             self._app.add_handler(TelegramMessageHandler(
                 filters.COMMAND,
                 self._handle_command
@@ -6140,6 +6159,55 @@ class TelegramAdapter(BasePlatformAdapter):
         await self._cache_replied_media(msg, event)
         event = self._apply_telegram_group_observe_attribution(event)
         self._enqueue_text_event(event)
+
+    async def _handle_web_app_data(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Resume a selected Hermes session from the Telegram Mini App."""
+        msg = self._effective_update_message(update)
+        if not msg or not self._should_process_message(msg):
+            return
+        raw_data = getattr(getattr(msg, "web_app_data", None), "data", "")
+        try:
+            payload = json.loads(raw_data)
+        except (TypeError, ValueError):
+            await msg.reply_text("Action Mini App illisible.")
+            return
+        if not isinstance(payload, dict) or payload.get("action") != "session.resume":
+            await msg.reply_text("Action Mini App inconnue.")
+            return
+        session_id = str(payload.get("session_id") or "").strip()
+        if not session_id:
+            await msg.reply_text("Session Hermes introuvable.")
+            return
+        event = self._build_message_event(msg, MessageType.COMMAND, update_id=update.update_id)
+        event.text = f"/resume {shlex.quote(session_id)}"
+        event = self._apply_telegram_group_observe_attribution(event)
+        await self.handle_message(event)
+
+    async def send_hermes_mini_app_shortcut(self, chat_id: str) -> None:
+        """Send the reply-keyboard WebApp control required by Telegram Desktop."""
+        from gateway.dashboard_links import hermes_mini_app_url
+
+        dashboard_url = hermes_mini_app_url("/sessions")
+        if not dashboard_url:
+            await self.send(
+                chat_id,
+                "Mini App indisponible : configure `dashboard.public_url` avec l'URL HTTPS privée du dashboard.",
+            )
+            return
+        if not self._bot or WebAppInfo is None:
+            await self.send(chat_id, f"Ouvre Hermes Sessions :\n{dashboard_url}")
+            return
+        keyboard = ReplyKeyboardMarkup(
+            [[KeyboardButton("Ouvrir Hermes Mini App", web_app=WebAppInfo(url=dashboard_url))]],
+            resize_keyboard=True,
+            one_time_keyboard=True,
+        )
+        await self._bot.send_message(
+            chat_id=int(chat_id),
+            text="Hermes Mini App\n\nConsulte une conversation, puis utilise « Reprendre dans Telegram ».",
+            reply_markup=keyboard,
+            **self._link_preview_kwargs(),
+        )
 
     async def _handle_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle incoming command messages."""
