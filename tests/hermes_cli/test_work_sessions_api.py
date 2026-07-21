@@ -1,6 +1,44 @@
 from fastapi.testclient import TestClient
 
 
+def test_github_project_catalog_uses_vps_cli(monkeypatch):
+    from hermes_cli import web_server
+
+    class Result:
+        returncode = 0
+        stderr = ""
+        stdout = """[
+          {"name":"site","nameWithOwner":"acme/site","description":"Main site","isPrivate":true,
+           "url":"https://github.com/acme/site","updatedAt":"2026-07-21T00:00:00Z"}
+        ]"""
+
+    monkeypatch.setattr(web_server.shutil, "which", lambda name: "/usr/bin/gh" if name == "gh" else None)
+    monkeypatch.setattr(web_server.subprocess, "run", lambda *args, **kwargs: Result())
+    previous_auth_required = getattr(web_server.app.state, "auth_required", None)
+    web_server.app.state.auth_required = False
+    client = TestClient(web_server.app)
+    client.headers[web_server._SESSION_HEADER_NAME] = web_server._SESSION_TOKEN
+    try:
+        response = client.get("/api/project-catalog/github")
+        assert response.status_code == 200
+        assert response.json() == {
+            "repositories": [
+                {
+                    "name": "site",
+                    "nameWithOwner": "acme/site",
+                    "description": "Main site",
+                    "isPrivate": True,
+                    "url": "https://github.com/acme/site",
+                    "updatedAt": "2026-07-21T00:00:00Z",
+                }
+            ],
+            "owner": "acme",
+            "total": 1,
+        }
+    finally:
+        web_server.app.state.auth_required = previous_auth_required
+
+
 def test_work_sessions_api_create_resume_delete(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
 
@@ -50,4 +88,3 @@ def test_work_sessions_api_create_resume_delete(tmp_path, monkeypatch):
         assert deleted.json() == {"ok": True, "deleted": True}
     finally:
         web_server.app.state.auth_required = previous_auth_required
-

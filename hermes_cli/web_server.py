@@ -362,16 +362,19 @@ _LOOPBACK_HOST_VALUES: frozenset = frozenset({
 
 
 def _configured_public_dashboard_host() -> str:
-    """Return the one operator-declared reverse-proxy hostname, if any."""
+    """Return the operator-declared public dashboard hostname, if any."""
     try:
         from hermes_cli.dashboard_auth.prefix import resolve_public_url
-
+    except Exception:
+        return ""
+    try:
         public_url = resolve_public_url()
     except Exception:
         return ""
     if not public_url:
         return ""
-    return (urllib.parse.urlparse(public_url).hostname or "").lower()
+    parsed = urllib.parse.urlparse(public_url)
+    return (parsed.hostname or "").lower()
 
 
 def should_require_auth(host: str, allow_public: bool = False) -> bool:
@@ -402,6 +405,7 @@ def _is_accepted_host(host_header: str, bound_host: str) -> bool:
     Accepts:
     - Exact bound host (with or without port suffix)
     - Loopback aliases when bound to loopback
+    - The configured dashboard.public_url host, when present
     - Any host when bound to 0.0.0.0 (explicit opt-in to non-loopback,
       no protection possible at this layer)
     """
@@ -431,9 +435,10 @@ def _is_accepted_host(host_header: str, bound_host: str) -> bool:
     if bound_host in {"0.0.0.0", "::"}:
         return True
 
-    # Tailscale Serve/reverse proxies keep uvicorn on loopback. Permit only
-    # the configured hostname, retaining the DNS-rebinding protection for all
-    # other host headers.
+    # Reverse-proxy / Tailscale Serve mode commonly keeps uvicorn bound to
+    # loopback while exposing the dashboard through a declared public host.
+    # Accept only that operator-configured host, preserving the DNS-rebinding
+    # rejection for arbitrary attacker-controlled Host headers.
     configured_public_host = _configured_public_dashboard_host()
     if configured_public_host and host_only == configured_public_host:
         return True
@@ -7230,6 +7235,319 @@ class BulkDeleteSessions(BaseModel):
     profile: Optional[str] = None
 
 
+class WorkSessionCreate(BaseModel):
+    title: Optional[str] = None
+    workflow: str = "libre"
+    origin_channel: str = "telegram"
+    repo: Optional[str] = None
+    provider: Optional[str] = None
+    cockpit_task_id: Optional[str] = None
+    hermes_session_id: Optional[str] = None
+    gateway_session_key: Optional[str] = None
+    objective: Optional[str] = None
+    metadata: Optional[Dict[str, Any]] = None
+    profile: Optional[str] = None
+
+
+class WorkSessionUpdate(BaseModel):
+    title: Optional[str] = None
+    status: Optional[str] = None
+    workflow: Optional[str] = None
+    origin_channel: Optional[str] = None
+    repo: Optional[str] = None
+    provider: Optional[str] = None
+    cockpit_task_id: Optional[str] = None
+    hermes_session_id: Optional[str] = None
+    gateway_session_key: Optional[str] = None
+    git_branch: Optional[str] = None
+    pr_url: Optional[str] = None
+    preview_url: Optional[str] = None
+    live_url: Optional[str] = None
+    brief_path: Optional[str] = None
+    report_path: Optional[str] = None
+    screenshots_dir: Optional[str] = None
+    objective: Optional[str] = None
+    summary: Optional[str] = None
+    current_state: Optional[str] = None
+    next_actions: Optional[List[str]] = None
+    metadata: Optional[Dict[str, Any]] = None
+    profile: Optional[str] = None
+
+
+class WorkSessionEventCreate(BaseModel):
+    event_type: str
+    role: Optional[str] = None
+    content: Optional[str] = None
+    payload: Optional[Dict[str, Any]] = None
+    profile: Optional[str] = None
+
+
+class WorkSessionDeleteMany(BaseModel):
+    ids: List[str]
+    profile: Optional[str] = None
+
+
+def _github_repository_catalog(limit: int = 200) -> List[Dict[str, Any]]:
+    """Return repositories visible to the VPS GitHub CLI account.
+
+    The dashboard calls the existing ``gh`` CLI instead of adding a model
+    tool or storing another GitHub credential.  Only repository metadata is
+    returned; tokens and local auth details never leave the server process.
+    """
+    gh = shutil.which("gh")
+    if not gh:
+        raise HTTPException(status_code=503, detail="GitHub CLI is not installed")
+    try:
+        proc = subprocess.run(
+            [
+                gh,
+                "repo",
+                "list",
+                "--limit",
+                str(max(1, min(int(limit), 500))),
+                "--json",
+                "name,nameWithOwner,description,isPrivate,url,updatedAt",
+            ],
+            cwd=str(get_hermes_home()),
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=20,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise HTTPException(status_code=503, detail="GitHub repository catalog is unavailable") from exc
+    if proc.returncode != 0:
+        raise HTTPException(status_code=503, detail="GitHub authentication is unavailable on the VPS")
+    try:
+        rows = json.loads(proc.stdout or "[]")
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=502, detail="GitHub returned an invalid repository catalog") from exc
+    if not isinstance(rows, list):
+        raise HTTPException(status_code=502, detail="GitHub returned an invalid repository catalog")
+    repositories = []
+    for row in rows:
+        if not isinstance(row, dict) or not row.get("nameWithOwner"):
+            continue
+        repositories.append(
+            {
+                "name": str(row.get("name") or ""),
+                "nameWithOwner": str(row["nameWithOwner"]),
+                "description": str(row.get("description") or ""),
+                "isPrivate": bool(row.get("isPrivate")),
+                "url": str(row.get("url") or ""),
+                "updatedAt": str(row.get("updatedAt") or ""),
+            }
+        )
+    return repositories
+
+
+@app.get("/api/project-catalog/github")
+async def get_github_repository_catalog(limit: int = 200):
+    repositories = await asyncio.to_thread(_github_repository_catalog, limit)
+    owner = repositories[0]["nameWithOwner"].split("/", 1)[0] if repositories else ""
+    return {"repositories": repositories, "owner": owner, "total": len(repositories)}
+
+
+def _open_work_session_store_for_profile(profile: Optional[str]):
+    from work_sessions import WorkSessionStore
+
+    if not profile:
+        return WorkSessionStore()
+    _name, home = _cron_profile_home(profile)
+    return WorkSessionStore(hermes_home=Path(home))
+
+
+def _mini_app_public_api_enabled() -> bool:
+    return cfg_get(load_config(), "dashboard", "mini_app_public_api", default=False) is True
+
+
+def _require_mini_app_public_api() -> None:
+    if not _mini_app_public_api_enabled():
+        raise HTTPException(status_code=403, detail="Mini App public API is disabled")
+
+
+@app.get("/api/mini-app/work-sessions")
+async def list_mini_app_work_sessions(
+    limit: int = 50,
+    offset: int = 0,
+    repo: Optional[str] = None,
+    provider: Optional[str] = None,
+    status: Optional[str] = None,
+    workflow: Optional[str] = None,
+    origin_channel: Optional[str] = None,
+):
+    _require_mini_app_public_api()
+    store = _open_work_session_store_for_profile(None)
+    try:
+        sessions = store.list_sessions(
+            limit=limit,
+            offset=offset,
+            repo=repo,
+            provider=provider,
+            status=status,
+            workflow=workflow,
+            origin_channel=origin_channel,
+        )
+        return {"work_sessions": sessions, "total": len(sessions), "limit": limit, "offset": offset}
+    finally:
+        store.close()
+
+
+@app.get("/api/mini-app/work-sessions/resume-packet")
+async def get_mini_app_work_session_resume_packet(work_session_id: str):
+    _require_mini_app_public_api()
+    store = _open_work_session_store_for_profile(None)
+    try:
+        packet = store.resume_packet(work_session_id)
+        if not packet:
+            raise HTTPException(status_code=404, detail="Work session not found")
+        return {"resume_packet": packet}
+    finally:
+        store.close()
+
+
+@app.get("/api/work-sessions")
+async def list_work_sessions(
+    limit: int = 50,
+    offset: int = 0,
+    repo: Optional[str] = None,
+    provider: Optional[str] = None,
+    status: Optional[str] = None,
+    workflow: Optional[str] = None,
+    origin_channel: Optional[str] = None,
+    profile: Optional[str] = None,
+):
+    store = _open_work_session_store_for_profile(profile)
+    try:
+        sessions = store.list_sessions(
+            limit=limit,
+            offset=offset,
+            repo=repo,
+            provider=provider,
+            status=status,
+            workflow=workflow,
+            origin_channel=origin_channel,
+        )
+        return {"work_sessions": sessions, "total": len(sessions), "limit": limit, "offset": offset}
+    finally:
+        store.close()
+
+
+@app.post("/api/work-sessions")
+async def create_work_session(body: WorkSessionCreate):
+    store = _open_work_session_store_for_profile(body.profile)
+    try:
+        session = store.create_session(
+            title=body.title or body.objective or "Nouvelle session",
+            workflow=body.workflow,
+            origin_channel=body.origin_channel,
+            repo=body.repo,
+            provider=body.provider,
+            cockpit_task_id=body.cockpit_task_id,
+            hermes_session_id=body.hermes_session_id,
+            gateway_session_key=body.gateway_session_key,
+            objective=body.objective,
+            metadata=body.metadata or {},
+        )
+        return {"ok": True, "work_session": session}
+    finally:
+        store.close()
+
+
+@app.post("/api/work-sessions/bulk-delete")
+async def bulk_delete_work_sessions(body: WorkSessionDeleteMany):
+    if len(body.ids) > 500:
+        raise HTTPException(status_code=400, detail="ids must contain at most 500 entries")
+    store = _open_work_session_store_for_profile(body.profile)
+    try:
+        return {"ok": True, "deleted": store.delete_many(body.ids)}
+    finally:
+        store.close()
+
+
+@app.get("/api/work-sessions/{work_session_id}")
+async def get_work_session(work_session_id: str, profile: Optional[str] = None):
+    store = _open_work_session_store_for_profile(profile)
+    try:
+        session = store.get_session(work_session_id)
+        if not session:
+            raise HTTPException(status_code=404, detail="Work session not found")
+        return {"work_session": session}
+    finally:
+        store.close()
+
+
+@app.patch("/api/work-sessions/{work_session_id}")
+async def update_work_session(work_session_id: str, body: WorkSessionUpdate):
+    store = _open_work_session_store_for_profile(body.profile)
+    try:
+        dump = getattr(body, "model_dump", None)
+        payload = dump(exclude_unset=True) if callable(dump) else body.dict(exclude_unset=True)
+        payload.pop("profile", None)
+        session = store.update_session(work_session_id, **payload)
+        if not session:
+            raise HTTPException(status_code=404, detail="Work session not found")
+        return {"ok": True, "work_session": session}
+    finally:
+        store.close()
+
+
+@app.post("/api/work-sessions/{work_session_id}/events")
+async def add_work_session_event(work_session_id: str, body: WorkSessionEventCreate):
+    store = _open_work_session_store_for_profile(body.profile)
+    try:
+        if not store.get_session(work_session_id):
+            raise HTTPException(status_code=404, detail="Work session not found")
+        event_id = store.add_event(
+            work_session_id,
+            body.event_type,
+            role=body.role,
+            content=body.content,
+            payload=body.payload or {},
+        )
+        return {"ok": True, "event_id": event_id}
+    finally:
+        store.close()
+
+
+@app.get("/api/work-sessions/{work_session_id}/events")
+async def list_work_session_events(
+    work_session_id: str,
+    limit: int = 100,
+    profile: Optional[str] = None,
+):
+    store = _open_work_session_store_for_profile(profile)
+    try:
+        if not store.get_session(work_session_id):
+            raise HTTPException(status_code=404, detail="Work session not found")
+        return {"events": store.list_events(work_session_id, limit=limit)}
+    finally:
+        store.close()
+
+
+@app.get("/api/work-sessions/{work_session_id}/resume-packet")
+async def get_work_session_resume_packet(work_session_id: str, profile: Optional[str] = None):
+    store = _open_work_session_store_for_profile(profile)
+    try:
+        packet = store.resume_packet(work_session_id)
+        if not packet:
+            raise HTTPException(status_code=404, detail="Work session not found")
+        return {"resume_packet": packet}
+    finally:
+        store.close()
+
+
+@app.delete("/api/work-sessions/{work_session_id}")
+async def delete_work_session(work_session_id: str, profile: Optional[str] = None):
+    store = _open_work_session_store_for_profile(profile)
+    try:
+        deleted = store.delete_session(work_session_id)
+        return {"ok": True, "deleted": deleted}
+    finally:
+        store.close()
+
+
 @app.post("/api/sessions/bulk-delete")
 async def bulk_delete_sessions_endpoint(body: BulkDeleteSessions):
     """Delete every session in ``body.ids`` in a single DB transaction.
@@ -7367,148 +7685,6 @@ def _open_session_db_for_profile(profile: Optional[str]):
         return SessionDB()
     _name, home = _cron_profile_home(profile)
     return SessionDB(db_path=Path(home) / "state.db")
-
-
-# ── Worker-session API ────────────────────────────────────────────────────
-# A worker session is the compact task-level context used to resume a piece of
-# work from Telegram. It complements, rather than replaces, a Hermes chat
-# session: the record holds the repo, objective and next actions while the
-# linked Hermes session retains the actual conversation.
-class WorkSessionCreate(BaseModel):
-    title: Optional[str] = None
-    workflow: str = "libre"
-    origin_channel: str = "dashboard"
-    repo: Optional[str] = None
-    provider: Optional[str] = None
-    cockpit_task_id: Optional[str] = None
-    objective: Optional[str] = None
-    metadata: Optional[Dict[str, Any]] = None
-    profile: Optional[str] = None
-
-
-class WorkSessionUpdate(BaseModel):
-    title: Optional[str] = None
-    status: Optional[str] = None
-    workflow: Optional[str] = None
-    origin_channel: Optional[str] = None
-    repo: Optional[str] = None
-    provider: Optional[str] = None
-    cockpit_task_id: Optional[str] = None
-    hermes_session_id: Optional[str] = None
-    gateway_session_key: Optional[str] = None
-    git_branch: Optional[str] = None
-    pr_url: Optional[str] = None
-    preview_url: Optional[str] = None
-    live_url: Optional[str] = None
-    objective: Optional[str] = None
-    summary: Optional[str] = None
-    current_state: Optional[str] = None
-    next_actions: Optional[List[str]] = None
-    metadata: Optional[Dict[str, Any]] = None
-    profile: Optional[str] = None
-
-
-def _open_work_session_store_for_profile(profile: Optional[str]):
-    from work_sessions import WorkSessionStore
-
-    if not profile:
-        return WorkSessionStore()
-    _name, home = _cron_profile_home(profile)
-    return WorkSessionStore(hermes_home=Path(home))
-
-
-@app.get("/api/work-sessions")
-async def list_work_sessions(
-    limit: int = 50,
-    offset: int = 0,
-    repo: Optional[str] = None,
-    provider: Optional[str] = None,
-    status: Optional[str] = None,
-    workflow: Optional[str] = None,
-    origin_channel: Optional[str] = None,
-    profile: Optional[str] = None,
-):
-    store = _open_work_session_store_for_profile(profile)
-    try:
-        sessions = store.list_sessions(
-            limit=limit,
-            offset=offset,
-            repo=repo,
-            provider=provider,
-            status=status,
-            workflow=workflow,
-            origin_channel=origin_channel,
-        )
-        return {"work_sessions": sessions, "total": len(sessions), "limit": limit, "offset": offset}
-    finally:
-        store.close()
-
-
-@app.post("/api/work-sessions")
-async def create_work_session(body: WorkSessionCreate):
-    store = _open_work_session_store_for_profile(body.profile)
-    try:
-        session = store.create_session(
-            title=body.title or body.objective or body.repo or "Nouvelle session",
-            workflow=body.workflow,
-            origin_channel=body.origin_channel,
-            repo=body.repo,
-            provider=body.provider,
-            cockpit_task_id=body.cockpit_task_id,
-            objective=body.objective,
-            metadata=body.metadata or {},
-        )
-        return {"ok": True, "work_session": session}
-    finally:
-        store.close()
-
-
-@app.get("/api/work-sessions/{work_session_id}")
-async def get_work_session(work_session_id: str, profile: Optional[str] = None):
-    store = _open_work_session_store_for_profile(profile)
-    try:
-        session = store.get_session(work_session_id)
-        if not session:
-            raise HTTPException(status_code=404, detail="Worker session not found")
-        return {"work_session": session}
-    finally:
-        store.close()
-
-
-@app.patch("/api/work-sessions/{work_session_id}")
-async def update_work_session(work_session_id: str, body: WorkSessionUpdate):
-    store = _open_work_session_store_for_profile(body.profile)
-    try:
-        dump = getattr(body, "model_dump", None)
-        payload = dump(exclude_unset=True) if callable(dump) else body.dict(exclude_unset=True)
-        payload.pop("profile", None)
-        session = store.update_session(work_session_id, **payload)
-        if not session:
-            raise HTTPException(status_code=404, detail="Worker session not found")
-        return {"ok": True, "work_session": session}
-    finally:
-        store.close()
-
-
-@app.get("/api/work-sessions/{work_session_id}/resume-packet")
-async def get_work_session_resume_packet(work_session_id: str, profile: Optional[str] = None):
-    store = _open_work_session_store_for_profile(profile)
-    try:
-        packet = store.resume_packet(work_session_id)
-        if not packet:
-            raise HTTPException(status_code=404, detail="Worker session not found")
-        return {"resume_packet": packet}
-    finally:
-        store.close()
-
-
-@app.delete("/api/work-sessions/{work_session_id}")
-async def delete_work_session(work_session_id: str, profile: Optional[str] = None):
-    store = _open_work_session_store_for_profile(profile)
-    try:
-        return {"ok": True, "deleted": store.delete_session(work_session_id)}
-    finally:
-        store.close()
 
 
 @app.get("/api/sessions/{session_id}")

@@ -7743,6 +7743,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if _cmd_def_inner and _cmd_def_inner.name == "app":
                 return await self._handle_app_command(event)
 
+            if _cmd_def_inner and _cmd_def_inner.name == "dashboard":
+                return await self._handle_dashboard_command(event)
+
             if _cmd_def_inner and _cmd_def_inner.name == "restart":
                 return await self._handle_restart_command(event)
 
@@ -8240,6 +8243,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         if canonical == "app":
             return await self._handle_app_command(event)
+
+        if canonical == "dashboard":
+            return await self._handle_dashboard_command(event)
 
         if canonical == "codex-runtime":
             return await self._handle_codex_runtime_command(event)
@@ -12094,6 +12100,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         then run ``execute``
           - ``cancel`` — return a "cancelled" message; do not run ``execute``
         """
+        # Product-owned synthetic commands are already the result of an
+        # explicit user action (for example creating a Work Session in the
+        # Telegram Mini App). They must complete synchronously so the caller
+        # can persist the final linked Hermes session id.
+        if bool(getattr(event, "_trusted_destructive_slash", False)):
+            return await execute()
+
         # Gate check.
         confirm_required = True
         try:

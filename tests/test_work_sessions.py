@@ -79,6 +79,20 @@ def test_work_session_delete_many_counts_existing_only(tmp_path):
         assert store.list_sessions() == []
 
 
+def test_work_session_can_be_archived_and_reopened(tmp_path):
+    with WorkSessionStore(hermes_home=tmp_path) as store:
+        session = store.create_session(title="Project chat", repo="acme/project")
+
+        archived = store.update_session(session["id"], status="archived")
+        assert archived is not None
+        assert archived["status"] == "archived"
+        assert archived["closed_at"] is not None
+
+        reopened = store.update_session(session["id"], status="open")
+        assert reopened is not None
+        assert reopened["status"] == "open"
+
+
 def test_get_by_hermes_session_id_returns_linked_session(tmp_path):
     with WorkSessionStore(hermes_home=tmp_path) as store:
         session = store.create_session(

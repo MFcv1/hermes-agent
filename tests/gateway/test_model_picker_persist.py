@@ -51,6 +51,7 @@ def _make_runner(adapter):
     runner.adapters = {Platform.TELEGRAM: adapter}
     runner._voice_mode = {}
     runner._session_model_overrides = {}
+    runner._session_reasoning_overrides = {}
     runner._running_agents = {}
     return runner
 
@@ -135,6 +136,15 @@ async def _drive_picker(runner, event):
     return await adapter.captured_callback("12345", "gpt-5.5", "openrouter")
 
 
+async def _drive_picker_with_reasoning(runner, event, effort):
+    sent = await runner._handle_model_command(event)
+    assert sent is None
+    adapter = runner.adapters[Platform.TELEGRAM]
+    return await adapter.captured_callback(
+        "12345", "gpt-5.5", "openrouter", effort
+    )
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "seed_model",
@@ -201,3 +211,23 @@ async def test_picker_tap_session_flag_does_not_persist(tmp_path, monkeypatch):
     written = yaml.safe_load(cfg_path.read_text(encoding="utf-8"))
     assert written["model"]["default"] == "old-model"
     assert written["model"]["provider"] == "openai-codex"
+
+
+@pytest.mark.asyncio
+async def test_picker_applies_reasoning_to_same_session(tmp_path, monkeypatch):
+    adapter = _FakePickerAdapter()
+    _setup_isolated_home(
+        tmp_path, monkeypatch, {"default": "old-model", "provider": "openai-codex"}
+    )
+    runner = _make_runner(adapter)
+
+    confirmation = await _drive_picker_with_reasoning(
+        runner, _make_event("/model --session"), "high"
+    )
+
+    assert "Reasoning: High" in confirmation
+    assert "Conversation and current project preserved" in confirmation
+    assert any(
+        value == {"enabled": True, "effort": "high"}
+        for value in runner._session_reasoning_overrides.values()
+    )

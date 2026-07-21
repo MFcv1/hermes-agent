@@ -21,8 +21,8 @@ import {
 import {
   Activity,
   BarChart3,
-  BriefcaseBusiness,
   BookOpen,
+  BriefcaseBusiness,
   Clock,
   Code,
   Cpu,
@@ -170,7 +170,7 @@ const BUILTIN_NAV_REST: NavItem[] = [
     label: "Sessions",
     icon: MessageSquare,
   },
-  { path: "/work-sessions", label: "Worker Sessions", icon: BriefcaseBusiness },
+  { path: "/work-sessions", label: "Work Sessions", icon: BriefcaseBusiness },
   { path: "/files", label: "Files", icon: FolderOpen },
   {
     path: "/analytics",
@@ -207,6 +207,7 @@ const BUILTIN_NAV_REST: NavItem[] = [
 const ICON_MAP: Record<string, ComponentType<{ className?: string }>> = {
   Activity,
   BarChart3,
+  BriefcaseBusiness,
   Clock,
   Cpu,
   FileText,

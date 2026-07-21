@@ -91,6 +91,7 @@ from gateway.platforms.base import (
     _TEXT_INJECT_EXTENSIONS,
     utf16_len,
 )
+from gateway.telegram_model_picker_mixin import TelegramModelPickerMixin
 from plugins.platforms.telegram.telegram_network import (
     TelegramFallbackTransport,
     discover_fallback_ips,
@@ -561,6 +562,9 @@ class TelegramAdapter(BasePlatformAdapter):
         self._dm_topics: Dict[str, int] = {}
         # Track forum chats where we've already registered bot commands
         self._forum_command_registered: set[int] = set()
+        # Private chats inherit the shared private-chat command menu. Clear
+        # legacy per-chat scopes once so stale ordering cannot mask /app.
+        self._private_command_scope_cleared: set[int] = set()
         # Lock per la registrazione sicura dei comandi nei forum supergroup
         self._forum_lock = asyncio.Lock()
         # Status indicator: when enabled, the bot's short description (the line
@@ -3788,10 +3792,27 @@ class TelegramAdapter(BasePlatformAdapter):
         page_info = f" ({start + 1}–{end} of {total})" if total_pages > 1 else ""
         return InlineKeyboardMarkup(rows), page_info
 
+    _reasoning_label = staticmethod(TelegramModelPickerMixin._reasoning_label)
+
+    async def _show_model_reasoning_step(self, query, state: dict, model_id: str) -> None:
+        await TelegramModelPickerMixin._show_model_reasoning_step(self, query, state, model_id)
+
+    async def _show_model_review(self, query, state: dict) -> None:
+        await TelegramModelPickerMixin._show_model_review(self, query, state)
+
+    async def _apply_model_picker_selection(self, query, state: dict, chat_id: str) -> None:
+        await TelegramModelPickerMixin._apply_model_picker_selection(self, query, state, chat_id)
+
     async def _handle_model_picker_callback(
         self, query, data: str, chat_id: str
     ) -> None:
-        """Handle model picker inline keyboard callbacks (mp:/mm:/mc:/mb:/mx:/mg:)."""
+        """Use the shared provider → model → reasoning → review workflow."""
+        return await TelegramModelPickerMixin._handle_model_picker_callback(
+            self, query, data, chat_id
+        )
+
+        # Legacy local branches remain temporarily for compatibility with
+        # downstream forks; the shared workflow above is the active path.
         state = self._model_picker_state.get(chat_id)
         if not state:
             await query.answer(text="Picker expired — use /model again.")
@@ -6081,18 +6102,29 @@ class TelegramAdapter(BasePlatformAdapter):
         return self._message_matches_mention_patterns(message)
 
     async def _ensure_forum_commands(self, message) -> None:
-        """Lazy-register bot commands for forum supergroups.
+        """Maintain chat-specific command scopes where Telegram requires them.
 
         Forum topics don't inherit AllGroupChats scope — Telegram resolves
         via BotCommandScopeChat(chat_id).  Register on first message so the
-        command menu works in topic views.
+        command menu works in topic views. Private chats remove legacy
+        per-chat scopes so they inherit the current AllPrivateChats menu.
         """
         async with self._forum_lock:
             try:
                 chat = getattr(message, "chat", None)
-                if not chat or not getattr(chat, "is_forum", False):
+                if not chat:
                     return
                 chat_id = int(chat.id)
+                if getattr(chat, "type", None) == "private":
+                    if chat_id in self._private_command_scope_cleared:
+                        return
+                    from telegram import BotCommandScopeChat
+                    await self._bot.delete_my_commands(scope=BotCommandScopeChat(chat_id=chat_id))
+                    self._private_command_scope_cleared.add(chat_id)
+                    logger.info("[%s] Cleared legacy command scope for private chat %s", self.name, chat_id)
+                    return
+                if not getattr(chat, "is_forum", False):
+                    return
                 if chat_id in self._forum_command_registered:
                     return
                 from telegram import BotCommand, BotCommandScopeChat
