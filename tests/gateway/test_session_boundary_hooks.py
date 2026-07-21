@@ -125,6 +125,32 @@ async def test_finalize_before_reset(mock_invoke_hook):
 
 @pytest.mark.asyncio
 @patch("hermes_cli.plugins.invoke_hook")
+async def test_work_session_reset_discards_only_empty_predecessor(mock_invoke_hook):
+    """The trusted Work Session boundary removes its empty technical session."""
+    runner = _make_runner()
+    runner._session_db = MagicMock()
+    event = _make_event("/new")
+    event._discard_empty_previous_session = True
+
+    await runner._handle_reset_command(event)
+
+    runner._session_db.delete_session_if_empty.assert_called_once_with("sess-old")
+
+
+@pytest.mark.asyncio
+@patch("hermes_cli.plugins.invoke_hook")
+async def test_ordinary_reset_keeps_predecessor_in_history(mock_invoke_hook):
+    """Normal user /new behavior must continue to preserve session history."""
+    runner = _make_runner()
+    runner._session_db = MagicMock()
+
+    await runner._handle_reset_command(_make_event("/new"))
+
+    runner._session_db.delete_session_if_empty.assert_not_called()
+
+
+@pytest.mark.asyncio
+@patch("hermes_cli.plugins.invoke_hook")
 async def test_shutdown_fires_finalize_for_active_agents(mock_invoke_hook):
     """Gateway stop() must fire on_session_finalize for each active agent."""
     from gateway.run import GatewayRunner

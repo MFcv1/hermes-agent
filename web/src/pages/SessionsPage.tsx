@@ -5,7 +5,6 @@ import {
   useCallback,
   useRef,
 } from "react";
-import { useNavigate } from "react-router-dom";
 import {
   AlertTriangle,
   CheckCircle2,
@@ -30,6 +29,7 @@ import {
   Archive,
 } from "lucide-react";
 import { api } from "@/lib/api";
+import { shouldRefreshSessions } from "@/lib/session-refresh";
 import type {
   SessionInfo,
   SessionMessage,
@@ -75,6 +75,35 @@ const SOURCE_CONFIG: Record<string, { icon: typeof Terminal; color: string }> =
     whatsapp: { icon: Globe, color: "text-success" },
     cron: { icon: Clock, color: "text-warning" },
   };
+
+declare global {
+  interface Window {
+    Telegram?: {
+      WebApp?: {
+        ready?: () => void;
+        close?: () => void;
+        sendData?: (data: string) => void;
+        openLink?: (url: string) => void;
+      };
+    };
+  }
+}
+
+function isTelegramMiniApp(): boolean {
+  return (
+    typeof window !== "undefined" &&
+    Boolean(window.Telegram?.WebApp?.sendData)
+  );
+}
+
+function sendTelegramAction(payload: Record<string, unknown>): boolean {
+  const webApp = window.Telegram?.WebApp;
+  if (!webApp?.sendData) return false;
+  webApp.sendData(JSON.stringify(payload));
+  // sendData owns the Telegram close lifecycle. Closing synchronously here
+  // can race the native bridge on Telegram Desktop and drop the action.
+  return true;
+}
 
 /** Render an FTS5 snippet with highlighted matches.
  *  The backend wraps matches in >>> and <<< delimiters. */
@@ -392,7 +421,7 @@ function SessionRow({
   const [renameValue, setRenameValue] = useState(session.title ?? "");
   const [renameSaving, setRenameSaving] = useState(false);
   const { t } = useI18n();
-  const navigate = useNavigate();
+  const telegramMiniApp = isTelegramMiniApp();
 
   useEffect(() => {
     if (isExpanded && messages === null && !loading) {
@@ -433,18 +462,35 @@ function SessionRow({
       </Badge>
 
       {resumeInChatEnabled && (
+        <a
+          href={`${window.__HERMES_BASE_PATH__ || ""}/chat?resume=${encodeURIComponent(session.id)}`}
+          className="relative grid aspect-square cursor-pointer place-items-center p-2 text-muted-foreground hover:bg-midground/10 hover:text-success"
+          aria-label="Continuer dans l'app"
+          title="Continuer dans l'app"
+          onClick={(e) => {
+            e.stopPropagation();
+          }}
+        >
+          <Play className="h-3.5 w-3.5" />
+        </a>
+      )}
+
+      {telegramMiniApp && (
         <Button
           ghost
           size="icon"
           className="text-muted-foreground hover:text-success"
-          aria-label={t.sessions.resumeInChat}
-          title={t.sessions.resumeInChat}
+          aria-label="Reprendre dans Telegram"
+          title="Reprendre dans Telegram"
           onClick={(e) => {
             e.stopPropagation();
-            navigate(`/chat?resume=${encodeURIComponent(session.id)}`);
+            sendTelegramAction({
+              action: "session.resume",
+              session_id: session.id,
+            });
           }}
         >
-          <Play />
+          <MessageCircle />
         </Button>
       )}
 
@@ -762,6 +808,10 @@ export default function SessionsPage() {
   const { activeAction, actionStatus, dismissLog } = useSystemActions();
   const resumeInChatEnabled = isDashboardEmbeddedChatEnabled();
 
+  useEffect(() => {
+    window.Telegram?.WebApp?.ready?.();
+  }, []);
+
   const refreshEmptyCount = useCallback(() => {
     api
       .getEmptySessionsCount()
@@ -794,10 +844,9 @@ export default function SessionsPage() {
       <Button
         outlined
         size="sm"
-        className="gap-1.5"
         onClick={() => setPruneOpen(true)}
+        prefix={<Archive />}
       >
-        <Archive className="h-3.5 w-3.5" />
         Prune old sessions
       </Button>,
     );
@@ -806,8 +855,12 @@ export default function SessionsPage() {
     };
   }, [setEnd]);
 
-  const loadSessions = useCallback((p: number) => {
-    setLoading(true);
+  const loadSessions = useCallback((p: number, silent = false) => {
+    // ``silent`` skips the loading spinner so background refreshes
+    // (triggered when the overview poll detects a new session from
+    // another process) don't flicker the whole page or drop the user's
+    // scroll position.
+    if (!silent) setLoading(true);
     api
       .getSessions(PAGE_SIZE, p * PAGE_SIZE)
       .then((resp) => {
@@ -815,7 +868,9 @@ export default function SessionsPage() {
         setTotal(resp.total);
       })
       .catch(() => {})
-      .finally(() => setLoading(false));
+      .finally(() => {
+        if (!silent) setLoading(false);
+      });
   }, []);
 
   const loadStats = useCallback(() => {
@@ -828,6 +883,15 @@ export default function SessionsPage() {
   useEffect(() => {
     loadStats();
   }, [loadStats]);
+
+  // Refs for the overview poll's new-session detection. The poll effect
+  // below is mounted once with stable deps, so it reads the current page
+  // and the last-seen newest session id through refs instead of capturing
+  // stale values. ``newestSeenRef`` starts null so the first poll sets a
+  // baseline without triggering a redundant reload (mount already loads).
+  const newestSeenRef = useRef<string | null>(null);
+  const pageRef = useRef(page);
+  pageRef.current = page;
 
   useEffect(() => {
     loadSessions(page);
@@ -842,13 +906,27 @@ export default function SessionsPage() {
         .catch(() => {});
       api
         .getSessions(50)
-        .then((r) => setOverviewSessions(r.sessions))
+        .then((r) => {
+          setOverviewSessions(r.sessions);
+          // The dashboard server and a terminal CLI are separate
+          // processes sharing one session DB — there is no push channel,
+          // so we detect sessions created in another process here. The
+          // overview poll already fetches the 50 newest sessions, so we
+          // reuse its head id as a cheap change signal: when it changes,
+          // silently refresh the paginated list so the new session shows
+          // up in real time without a visible loading flicker.
+          const newest = r.sessions[0]?.id ?? null;
+          if (shouldRefreshSessions(newestSeenRef.current, newest)) {
+            loadSessions(pageRef.current, true);
+          }
+          newestSeenRef.current = newest;
+        })
         .catch(() => {});
     };
     loadOverview();
     const id = setInterval(loadOverview, 5000);
     return () => clearInterval(id);
-  }, []);
+  }, [loadSessions]);
 
   useEffect(() => {
     const el = logScrollRef.current;
@@ -1327,7 +1405,7 @@ export default function SessionsPage() {
             <span className="text-lg font-semibold tabular-nums leading-none text-success">
               {stats.active_store}
             </span>
-            <span className="text-xs text-muted-foreground">Active in store</span>
+            <span className="text-xs text-muted-foreground">Unarchived</span>
           </div>
           <div className="flex flex-col">
             <span className="text-lg font-semibold tabular-nums leading-none">
@@ -1491,8 +1569,8 @@ export default function SessionsPage() {
                 onClick={() => setDeleteEmptyOpen(true)}
                 aria-label={t.sessions.deleteEmpty}
                 title={t.sessions.deleteEmpty}
+                prefix={<Eraser />}
               >
-                <Eraser className="h-3.5 w-3.5" />
                 <span className="font-mondwest normal-case text-xs">
                   {t.sessions.deleteEmpty} ({emptyCount})
                 </span>
@@ -1565,8 +1643,8 @@ export default function SessionsPage() {
               "{count}",
               String(selectedIds.size),
             )}
+            prefix={<Trash2 />}
           >
-            <Trash2 className="h-3.5 w-3.5" />
             <span className="font-mondwest normal-case text-xs">
               {t.sessions.deleteSelected.replace(
                 "{count}",

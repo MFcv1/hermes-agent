@@ -46,4 +46,15 @@ PUBLIC_API_PATHS: frozenset[str] = frozenset({
     # Read-only theme + plugin manifests for the dashboard skin engine.
     "/api/dashboard/themes",
     "/api/dashboard/plugins",
+    # Chronos managed-cron fire webhook (NAS -> agent). NOT cookie-gated: it
+    # carries its own short-lived NAS-minted JWT (purpose=cron_fire), which the
+    # handler verifies as the real auth. Must bypass the dashboard auth gate so
+    # the NAS relay's bearer-only callback reaches the verifier instead of a
+    # 401 no_cookie. The JWT — not this allowlist — is the security boundary.
+    "/api/cron/fire",
+    # Telegram Mini App read API. The handlers are intentionally separate from
+    # the admin /api/work-sessions endpoints and still check
+    # dashboard.mini_app_public_api before returning data.
+    "/api/mini-app/work-sessions",
+    "/api/mini-app/work-sessions/resume-packet",
 })

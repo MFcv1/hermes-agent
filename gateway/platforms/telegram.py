@@ -34,7 +34,15 @@ def normalize_cockpit_mode(mode: str | None) -> str:
     return clean if clean in REPO_COCKPIT_MODES else "ask_review"
 
 try:
-    from telegram import Update, Bot, Message, InlineKeyboardButton, InlineKeyboardMarkup
+    from telegram import (
+        Update,
+        Bot,
+        Message,
+        InlineKeyboardButton,
+        InlineKeyboardMarkup,
+        KeyboardButton,
+        ReplyKeyboardMarkup,
+    )
     try:
         from telegram import WebAppInfo
     except ImportError:
@@ -61,6 +69,8 @@ except ImportError:
     Message = Any
     InlineKeyboardButton = Any
     InlineKeyboardMarkup = Any
+    KeyboardButton = Any
+    ReplyKeyboardMarkup = Any
     WebAppInfo = None
     LinkPreviewOptions = None
     Application = Any
@@ -381,6 +391,10 @@ class TelegramAdapter(TelegramTransportMixin, TelegramInboundFilterMixin, Telegr
         self._dm_topics: Dict[str, int] = {}
         # Track forum chats where we've already registered bot commands
         self._forum_command_registered: set[int] = set()
+        # Track private chats where stale per-chat command scopes were cleared.
+        # Private chats should inherit BotCommandScopeAllPrivateChats so menu
+        # changes (notably /app priority) apply without an older chat override.
+        self._private_command_scope_cleared: set[int] = set()
         # Lock per la registrazione sicura dei comandi nei forum supergroup
         self._forum_lock = asyncio.Lock()
         # DM Topics config from extra.dm_topics
@@ -453,18 +467,30 @@ class TelegramAdapter(TelegramTransportMixin, TelegramInboundFilterMixin, Telegr
 
 
     async def _ensure_forum_commands(self, message) -> None:
-        """Lazy-register bot commands for forum supergroups.
+        """Maintain chat-specific command scopes where Telegram requires them.
 
         Forum topics don't inherit AllGroupChats scope — Telegram resolves
         via BotCommandScopeChat(chat_id).  Register on first message so the
-        command menu works in topic views.
+        command menu works in topic views. Private chats should do the
+        opposite: remove any legacy per-chat scope so they inherit the current
+        AllPrivateChats menu instead of retaining stale command ordering.
         """
         async with self._forum_lock:
             try:
                 chat = getattr(message, "chat", None)
-                if not chat or not getattr(chat, "is_forum", False):
+                if not chat:
                     return
                 chat_id = int(chat.id)
+                if getattr(chat, "type", None) == "private":
+                    if chat_id in self._private_command_scope_cleared:
+                        return
+                    from telegram import BotCommandScopeChat
+                    await self._bot.delete_my_commands(scope=BotCommandScopeChat(chat_id=chat_id))
+                    self._private_command_scope_cleared.add(chat_id)
+                    logger.info("[%s] Cleared legacy command scope for private chat %s", self.name, chat_id)
+                    return
+                if not getattr(chat, "is_forum", False):
+                    return
                 if chat_id in self._forum_command_registered:
                     return
                 from telegram import BotCommand, BotCommandScopeChat
@@ -509,6 +535,260 @@ class TelegramAdapter(TelegramTransportMixin, TelegramInboundFilterMixin, Telegr
         await self._cache_replied_media(msg, event)
         event = self._apply_telegram_group_observe_attribution(event)
         self._enqueue_text_event(event)
+
+    async def _handle_web_app_data(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Handle Telegram Mini App actions delivered via WebApp.sendData."""
+        msg = self._effective_update_message(update)
+        if not msg:
+            return
+        if not self._should_process_message(msg):
+            return
+        data_obj = getattr(msg, "web_app_data", None)
+        raw_data = getattr(data_obj, "data", "") if data_obj is not None else ""
+        try:
+            payload = json.loads(raw_data)
+        except (TypeError, ValueError):
+            await msg.reply_text("Action Mini App illisible.")
+            return
+        if not isinstance(payload, dict):
+            await msg.reply_text("Action Mini App invalide.")
+            return
+        await self._handle_work_session_webapp_action(msg, payload, update_id=update.update_id)
+
+    async def _reset_current_work_session_chat(
+        self,
+        msg: Message,
+        *,
+        update_id: Optional[int] = None,
+    ) -> tuple[Optional[str], Optional[str]]:
+        """Start a clean Hermes chat for a newly-created work session."""
+        event = self._build_message_event(msg, MessageType.TEXT, update_id=update_id)
+        event.text = "/new"
+        # Creating a Work Session is itself an explicit request to start a new
+        # conversation. Routing this synthetic /new through the ordinary
+        # destructive-command confirmation used to return before approval,
+        # link the Work Session to a placeholder session, then rotate to a
+        # second session when the user eventually approved. Mark this
+        # in-process event as trusted so the reset completes synchronously and
+        # the id persisted below is the one that remains active.
+        event._trusted_destructive_slash = True  # type: ignore[attr-defined]
+        event._discard_empty_previous_session = True  # type: ignore[attr-defined]
+        event = self._apply_telegram_group_observe_attribution(event)
+
+        handler = getattr(self, "_message_handler", None)
+        if handler is not None:
+            try:
+                await handler(event)
+            except Exception:
+                logger.warning("[%s] Mini App session reset failed", self.name, exc_info=True)
+
+        store = getattr(self, "_session_store", None)
+        source = getattr(event, "source", None)
+        if store is None or source is None:
+            return None, None
+
+        try:
+            entry = store.get_or_create_session(source)
+            return getattr(entry, "session_id", None), getattr(entry, "session_key", None)
+        except Exception:
+            logger.debug("[%s] Could not resolve Mini App Hermes session id", self.name, exc_info=True)
+            return None, None
+
+    async def _handle_work_session_webapp_action(
+        self,
+        msg: Message,
+        payload: dict[str, Any],
+        *,
+        update_id: Optional[int] = None,
+    ) -> None:
+        """Route Mini App work-session actions into Telegram and the agent."""
+        from work_sessions import WorkSessionStore
+
+        action = str(payload.get("action") or payload.get("type") or "").strip().lower()
+        if action in {"create", "new", "new_chat"}:
+            action = "work_session.create"
+        elif action in {"resume", "open"}:
+            action = "work_session.resume"
+        elif action in {"delete", "remove"}:
+            action = "work_session.delete"
+        elif action in {"archive", "close"}:
+            action = "work_session.archive"
+        elif action in {"unarchive", "reopen"}:
+            action = "work_session.unarchive"
+        elif action in {"list", "sessions"}:
+            action = "work_session.list"
+
+        user_id = str(getattr(getattr(msg, "from_user", None), "id", "") or getattr(msg, "chat_id", ""))
+        chat_id = str(getattr(msg, "chat_id", ""))
+        metadata = {
+            "telegram_user_id": user_id,
+            "telegram_chat_id": chat_id,
+            "webapp_payload": payload,
+        }
+
+        def resume_context_text(session: dict[str, Any]) -> str:
+            work_session_id = str(session.get("id") or "")
+            title = str(session.get("title") or work_session_id)
+            repo = str(session.get("repo") or "Clavardage libre")
+            objective = str(session.get("objective") or "Non défini")
+            current_state = str(session.get("current_state") or session.get("summary") or "Non défini")
+            next_actions = session.get("next_actions") or []
+            next_lines = "\n".join(f"• {item}" for item in next_actions if str(item).strip())
+            if not next_lines:
+                next_lines = "• Aucune action enregistrée"
+            return (
+                "📌 Contexte actif\n\n"
+                f"{title}\n"
+                f"Repo : {repo}\n"
+                f"Work-session : {work_session_id}\n\n"
+                f"Objectif\n{objective}\n\n"
+                f"État actuel\n{current_state}\n\n"
+                f"Prochaines actions\n{next_lines}\n\n"
+                "Tu peux continuer à écrire ici : tes prochains messages utiliseront cette conversation."
+            )
+
+        try:
+            with WorkSessionStore() as store:
+                if action in {"session.resume", "hermes_session.resume", "session.open"}:
+                    session_id = str(payload.get("session_id") or payload.get("id") or "").strip()
+                    if not session_id:
+                        await msg.reply_text("Session Hermes introuvable.")
+                        return
+                    event = self._build_message_event(msg, MessageType.TEXT, update_id=update_id)
+                    event.text = f"/resume {shlex.quote(session_id)}"
+                    event._telegram_message = msg  # type: ignore[attr-defined]
+                    event = self._apply_telegram_group_observe_attribution(event)
+                    await self.handle_message(event)
+                    linked_work_session = store.get_by_hermes_session_id(session_id)
+                    if linked_work_session:
+                        await msg.reply_text(resume_context_text(linked_work_session))
+                    return
+
+                if action == "work_session.create":
+                    repo = payload.get("repo") or payload.get("repository")
+                    objective = payload.get("objective") or payload.get("brief") or payload.get("prompt")
+                    workflow = str(payload.get("workflow") or payload.get("mode") or "libre")
+                    title = payload.get("title") or objective or repo or "Nouvelle session"
+                    providers = payload.get("providers")
+                    if not isinstance(providers, list):
+                        providers = []
+                    project_mode = str(payload.get("project_mode") or "existing").strip().lower()
+                    metadata.update(
+                        {
+                            "project_mode": project_mode,
+                            "providers": [str(item) for item in providers if str(item).strip()],
+                            "visibility": str(payload.get("visibility") or "private"),
+                        }
+                    )
+                    session = store.create_session(
+                        title=str(title),
+                        workflow=workflow,
+                        origin_channel="telegram",
+                        repo=str(repo) if repo else None,
+                        provider=str(payload.get("provider")) if payload.get("provider") else None,
+                        cockpit_task_id=str(payload.get("task_id")) if payload.get("task_id") else None,
+                        objective=str(objective) if objective else None,
+                        metadata=metadata,
+                    )
+                    hermes_session_id, gateway_session_key = await self._reset_current_work_session_chat(
+                        msg,
+                        update_id=update_id,
+                    )
+                    if hermes_session_id or gateway_session_key:
+                        session = store.update_session(
+                            session["id"],
+                            hermes_session_id=hermes_session_id,
+                            gateway_session_key=gateway_session_key,
+                        ) or session
+                    await msg.reply_text(
+                        ("Nouveau projet préparé.\n" if project_mode == "new" else "Session de travail créée.\n")
+                        + f"ID: {session['id']}\n"
+                        + f"Repo: {session.get('repo') or 'non défini'}\n\n"
+                        + (
+                            "Le dépôt et les services externes ne seront créés qu'après ta demande dans le chat "
+                            "et les validations nécessaires.\n\n"
+                            if project_mode == "new"
+                            else ""
+                        )
+                        + (
+                            f"Brief préparé : {objective}\n\n"
+                            if objective
+                            else ""
+                        )
+                        + "Continue maintenant dans ce chat pour lancer le travail."
+                    )
+                    store.add_event(
+                        session["id"],
+                        "telegram.prompt.requested",
+                        role="assistant",
+                        content="Waiting for the user's brief in Telegram.",
+                    )
+                    return
+
+                if action in {"work_session.archive", "work_session.unarchive"}:
+                    work_session_id = str(payload.get("work_session_id") or payload.get("id") or "").strip()
+                    status = "archived" if action.endswith("archive") and not action.endswith("unarchive") else "open"
+                    session = store.update_session(work_session_id, status=status)
+                    if not session:
+                        await msg.reply_text("Session de travail introuvable.")
+                        return
+                    await msg.reply_text(
+                        f"Session {work_session_id} archivée."
+                        if status == "archived"
+                        else f"Session {work_session_id} réactivée."
+                    )
+                    return
+
+                if action == "work_session.resume":
+                    work_session_id = str(payload.get("work_session_id") or payload.get("id") or "").strip()
+                    session = store.get_session(work_session_id)
+                    prompt = store.resume_prompt(work_session_id)
+                    if not session or not prompt:
+                        await msg.reply_text("Session de travail introuvable.")
+                        return
+                    store.add_event(
+                        work_session_id,
+                        "session.resumed",
+                        role="user",
+                        content="Resumed from Telegram Mini App.",
+                        payload=metadata,
+                    )
+                    linked_session_id = str(session.get("hermes_session_id") or "").strip()
+                    event = self._build_message_event(msg, MessageType.TEXT, update_id=update_id)
+                    event.text = f"/resume {shlex.quote(linked_session_id)}" if linked_session_id else prompt
+                    event._telegram_message = msg  # type: ignore[attr-defined]
+                    event = self._apply_telegram_group_observe_attribution(event)
+                    await self.handle_message(event)
+                    await msg.reply_text(resume_context_text(session))
+                    return
+
+                if action == "work_session.delete":
+                    work_session_id = str(payload.get("work_session_id") or payload.get("id") or "").strip()
+                    deleted = store.delete_session(work_session_id)
+                    await msg.reply_text(
+                        f"Session {work_session_id} supprimée définitivement."
+                        if deleted else "Session de travail introuvable."
+                    )
+                    return
+
+                if action == "work_session.list":
+                    repo = payload.get("repo") or payload.get("repository")
+                    sessions = store.list_sessions(repo=str(repo) if repo else None, limit=10)
+                    if not sessions:
+                        await msg.reply_text("Aucune session de travail trouvée.")
+                        return
+                    lines = ["Sessions de travail :"]
+                    for session in sessions:
+                        repo_label = f" · {session.get('repo')}" if session.get("repo") else ""
+                        lines.append(f"- {session['id']} · {session.get('title')}{repo_label}")
+                    await msg.reply_text("\n".join(lines))
+                    return
+        except Exception as exc:
+            logger.warning("[%s] Mini App action failed: %s", self.name, exc, exc_info=True)
+            await msg.reply_text("Action Mini App impossible côté Hermes.")
+            return
+
+        await msg.reply_text("Action Mini App inconnue.")
 
 
 
@@ -658,24 +938,48 @@ class TelegramAdapter(TelegramTransportMixin, TelegramInboundFilterMixin, Telegr
                 raise
 
 
-    async def _send_repo_cockpit_shortcut(self, msg: Message) -> None:
-        """Send the Repo Cockpit WebApp shortcut without replacing Telegram's command menu."""
-        cockpit_url = self._repo_cockpit_url("/")
-        button_kwargs = (
-            {"web_app": WebAppInfo(url=cockpit_url)}
-            if WebAppInfo is not None
-            else {"url": cockpit_url}
-        )
-        keyboard = InlineKeyboardMarkup([[
-            InlineKeyboardButton("🌐 Ouvrir Repo Cockpit", **button_kwargs)
-        ]])
+    async def _send_repo_cockpit_shortcut(
+        self,
+        msg: Message,
+        *,
+        path: str = "/",
+        button_label: str = "🌐 Ouvrir Repo Cockpit",
+        title: str = "🌐 Repo Cockpit",
+        description: str = "Choisis un repo, puis le cockpit revient automatiquement dans ce chat.",
+    ) -> None:
+        """Send a Telegram WebApp shortcut without replacing the command menu."""
+        if path.lstrip("/") in {"sessions", "work-sessions"}:
+            from gateway.dashboard_links import hermes_mini_app_url
+
+            cockpit_url = hermes_mini_app_url(path)
+        else:
+            cockpit_url = self._repo_cockpit_url(path)
+        mini_app_action_path = path.lstrip("/") in {"sessions", "work-sessions"}
+        if mini_app_action_path and WebAppInfo is not None:
+            # WebApp.sendData is delivered to the bot only when Telegram
+            # launches the Mini App from a KeyboardButton. Inline web_app
+            # buttons open the page but silently drop sendData on Desktop.
+            keyboard = ReplyKeyboardMarkup(
+                [[KeyboardButton(button_label, web_app=WebAppInfo(url=cockpit_url))]],
+                resize_keyboard=True,
+                one_time_keyboard=True,
+            )
+        else:
+            button_kwargs = (
+                {"web_app": WebAppInfo(url=cockpit_url)}
+                if WebAppInfo is not None
+                else {"url": cockpit_url}
+            )
+            keyboard = InlineKeyboardMarkup([[
+                InlineKeyboardButton(button_label, **button_kwargs)
+            ]])
         html_text = (
-            "<b>🌐 Repo Cockpit</b>\n\n"
-            "Choisis un repo, puis le cockpit revient automatiquement dans ce chat."
+            f"<b>{title}</b>\n\n"
+            f"{description}"
         )
         plain_text = (
-            "🌐 Repo Cockpit\n\n"
-            "Choisis un repo, puis le cockpit revient automatiquement dans ce chat."
+            f"{title}\n\n"
+            f"{description}"
         )
         try:
             await msg.reply_text(
@@ -691,6 +995,56 @@ class TelegramAdapter(TelegramTransportMixin, TelegramInboundFilterMixin, Telegr
                     reply_markup=keyboard,
                     **self._link_preview_kwargs(),
                 )
+            else:
+                raise
+
+    async def _send_dashboard_shortcut(self, msg: Message) -> None:
+        """Send the full dashboard as a normal browser URL, not a Mini App.
+
+        A Telegram ``web_app`` button intentionally opens inside Telegram's
+        constrained Mini App viewport.  ``/dashboard`` is the desktop/full
+        browser counterpart, so its button must use the ordinary ``url``
+        field and the URL must remain visible/copyable in the message.
+        """
+        from gateway.dashboard_links import hermes_dashboard_url
+
+        url = hermes_dashboard_url("/sessions")
+        if not url:
+            await msg.reply_text(
+                "Dashboard Hermes privé.\n\n"
+                "Aucune URL web publique n'est configurée. Si ton tunnel SSH "
+                "est ouvert sur ce Mac, ouvre :\n"
+                "http://127.0.0.1:9120/sessions\n\n"
+                "Configure dashboard.public_url pour activer le bouton web.",
+                **self._link_preview_kwargs(),
+            )
+            return
+
+        keyboard = InlineKeyboardMarkup([[
+            InlineKeyboardButton("🖥 Ouvrir le Dashboard web", url=url)
+        ]])
+        html_text = (
+            "<b>Dashboard Hermes — version web complète</b>\n\n"
+            "Interface optimisée pour un navigateur sur ordinateur. "
+            "La conversation et le projet courant restent les mêmes.\n\n"
+            f"Lien copiable :\n<code>{_html.escape(url)}</code>"
+        )
+        plain_text = (
+            "Dashboard Hermes — version web complète\n\n"
+            "Interface optimisée pour un navigateur sur ordinateur. "
+            "La conversation et le projet courant restent les mêmes.\n\n"
+            f"Lien copiable :\n{url}"
+        )
+        try:
+            await msg.reply_text(
+                html_text,
+                parse_mode=ParseMode.HTML,
+                reply_markup=keyboard,
+                **self._link_preview_kwargs(),
+            )
+        except Exception as exc:
+            if self._is_bad_request_error(exc):
+                await msg.reply_text(plain_text, reply_markup=keyboard)
             else:
                 raise
 
@@ -748,15 +1102,8 @@ class TelegramAdapter(TelegramTransportMixin, TelegramInboundFilterMixin, Telegr
         text = msg.text or ""
         command_token = text.strip().split(maxsplit=1)[0].split("@", 1)[0].lower()
         command_args = text.split(maxsplit=1)[1] if len(text.split(maxsplit=1)) > 1 else ""
-        await self._log_cockpit_message(msg, direction="incoming", role="command_echo", command=command_token)
         if command_token in {"/new", "/newchat"}:
-            await self._send_new_command(msg, command_args)
-            return
-        if command_token in {"/libre", "/reset-libre", "/chatlibre"}:
-            await self._send_libre_command(msg, command_args)
-            return
-        if command_token == "/dev":
-            await self._send_dev_command(msg, command_args)
+            await self._reset_current_work_session_chat(msg, update_id=update.update_id)
             return
         if command_token in {"/chat", "/current"}:
             await self._send_chat_status_command(msg)
@@ -773,8 +1120,17 @@ class TelegramAdapter(TelegramTransportMixin, TelegramInboundFilterMixin, Telegr
         if command_token in {"/delete", "/deletechat"}:
             await self._send_thread_action_command(msg, "delete")
             return
-        if command_token == "/repo":
-            await self._send_repo_cockpit_shortcut(msg)
+        if command_token in {"/app", "/miniapp"}:
+            await self._send_repo_cockpit_shortcut(
+                msg,
+                path="/work-sessions",
+                button_label="Ouvrir Hermes Mini App",
+                title="Hermes Mini App",
+                description="Choisis un projet GitHub ou prépare un nouveau projet, puis démarre une conversation.",
+            )
+            return
+        if command_token in {"/dashboard", "/dash"}:
+            await self._send_dashboard_shortcut(msg)
             return
         if command_token == "/serveurstatut":
             await self._send_vps_command(msg)
@@ -782,38 +1138,11 @@ class TelegramAdapter(TelegramTransportMixin, TelegramInboundFilterMixin, Telegr
         if command_token in {"/vps", "/vpsstatus", "/serverstatus"}:
             await self._send_vps_command(msg)
             return
-        if command_token == "/watch":
-            await self._send_watch_command(msg, command_args)
-            return
         if command_token == "/jobs":
             await self._send_jobs_command(msg, command_args)
             return
         if command_token in {"/updatecheck", "/update-check"}:
             await self._send_updatecheck_command(msg, command_args)
-            return
-        if command_token == "/tasks":
-            await self._send_tasks_command(msg, command_args)
-            return
-        if command_token in {"/prs", "/pulls", "/pr"}:
-            await self._send_pending_prs_command(msg, command_args)
-            return
-        if command_token in {"/audit", "/auditer"}:
-            await self._send_audit_command(msg, command_args)
-            return
-        if command_token == "/task":
-            await self._send_task_command(msg, command_args)
-            return
-        if command_token == "/status":
-            await self._send_status_command(msg, command_args)
-            return
-        if command_token == "/runs":
-            await self._send_runs_command(msg, command_args)
-            return
-        if command_token == "/approve":
-            await self._send_approve_command(msg, command_args)
-            return
-        if command_token == "/worker":
-            await self._send_worker_command(msg, command_args)
             return
         if command_token == "/quota":
             await self._send_quota_command(msg)

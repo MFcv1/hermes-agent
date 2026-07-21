@@ -26,15 +26,17 @@ import { Button } from "@nous-research/ui/ui/components/button";
 import { Typography } from "@nous-research/ui/ui/components/typography/index";
 import { HERMES_BASE_PATH, buildWsAuthParam } from "@/lib/api";
 import { cn } from "@/lib/utils";
-import { Copy, PanelRight, RotateCcw, X } from "lucide-react";
+import { Copy, MessageCircle, PanelRight, RotateCcw, X } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { useSearchParams } from "react-router-dom";
 
 import { ChatSidebar } from "@/components/ChatSidebar";
+import { ChatSessionList } from "@/components/ChatSessionList";
 import { usePageHeader } from "@/contexts/usePageHeader";
 import { useI18n } from "@/i18n";
 import { api } from "@/lib/api";
+import { normalizeSessionTitle } from "@/lib/chat-title";
 import { PluginSlot } from "@/plugins";
 import { useTheme } from "@/themes";
 import { useProfileScope } from "@/contexts/useProfileScope";
@@ -62,11 +64,30 @@ function buildWsUrl(
 // (subscriber).  Generated once per mount so a tab refresh starts a fresh
 // channel — the previous PTY child terminates with the old WS, and its
 // channel auto-evicts when no subscribers remain.
-function generateChannelId(): string {
+function generateChannelId(scope?: string): string {
+  const prefix = scope ? "chat" : "chat-fresh";
   if (typeof crypto !== "undefined" && "randomUUID" in crypto) {
-    return crypto.randomUUID();
+    return `${prefix}-${crypto.randomUUID()}`;
   }
-  return `chat-${Math.random().toString(36).slice(2)}-${Date.now().toString(36)}`;
+  return `${prefix}-${Math.random().toString(36).slice(2)}-${Date.now().toString(
+    36,
+  )}`;
+}
+
+function isTelegramMiniApp(): boolean {
+  return (
+    typeof window !== "undefined" &&
+    Boolean(window.Telegram?.WebApp?.sendData)
+  );
+}
+
+function sendTelegramAction(payload: Record<string, unknown>): boolean {
+  const webApp = window.Telegram?.WebApp;
+  if (!webApp?.sendData) return false;
+  webApp.sendData(JSON.stringify(payload));
+  // Let Telegram complete sendData before it closes the Mini App. Calling
+  // close synchronously can discard the native bridge payload on Desktop.
+  return true;
 }
 
 // Colors for the terminal body.  Matches the dashboard's dark teal canvas
@@ -153,6 +174,15 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
     setBanner(null);
     setReconnectNonce((n) => n + 1);
   }, []);
+  const startFreshDashboardChat = useCallback(() => {
+    const next = new URLSearchParams(searchParams);
+
+    next.delete("resume");
+    setSearchParams(next, { replace: true });
+    setSessionEnded(false);
+    setBanner(null);
+    setReconnectNonce((n) => n + 1);
+  }, [searchParams, setSearchParams]);
   // Raw state for the mobile side-sheet + a derived value that force-
   // closes whenever the chat tab isn't active.  The *derived* value is
   // what side-effects (body-scroll lock, keydown listener, portal render)
@@ -163,7 +193,11 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
   // tabs because the dep wouldn't change on tab switch.
   const [mobilePanelOpenRaw, setMobilePanelOpenRaw] = useState(false);
   const mobilePanelOpen = isActive && mobilePanelOpenRaw;
-  const { setEnd } = usePageHeader();
+  const { setEnd, setTitle } = usePageHeader();
+  const [sessionTitleState, setSessionTitleState] = useState<{
+    scope: string;
+    title: string | null;
+  }>({ scope: "", title: null });
   const { t } = useI18n();
   const closeMobilePanel = useCallback(() => setMobilePanelOpenRaw(false), []);
   const modelToolsLabel = useMemo(
@@ -197,7 +231,47 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
   // management profile. Changing it remounts the terminal (key below /
   // effect dep) so the user explicitly starts a fresh scoped session.
   const { profile: scopedProfile } = useProfileScope();
-  const channel = useMemo(() => generateChannelId(), [resumeParam, scopedProfile]);
+  const channel = useMemo(
+    () => generateChannelId(`${resumeParam ?? ""}\0${scopedProfile}`),
+    [resumeParam, scopedProfile],
+  );
+  const titleScope = `${channel}\0${reconnectNonce}`;
+  const sessionTitle =
+    sessionTitleState.scope === titleScope ? sessionTitleState.title : null;
+  const handleSessionTitleChange = useCallback(
+    (title: string | null) => setSessionTitleState({ scope: titleScope, title }),
+    [titleScope],
+  );
+
+  useEffect(() => {
+    if (!isActive) {
+      setTitle(null);
+      return;
+    }
+
+    setTitle(sessionTitle);
+    return () => setTitle(null);
+  }, [isActive, sessionTitle, setTitle]);
+
+  useEffect(() => {
+    if (!resumeParam) return;
+
+    let cancelled = false;
+
+    api
+      .getSessionDetail(resumeParam, scopedProfile)
+      .then((session) => {
+        if (cancelled) return;
+        handleSessionTitleChange(normalizeSessionTitle(session.title));
+      })
+      .catch(() => {
+        // Best-effort: the PTY-side session.info stream can still supply it.
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [resumeParam, scopedProfile, handleSessionTitleChange]);
 
   useEffect(() => {
     if (!resumeParam) return;
@@ -262,30 +336,57 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
       setEnd(null);
       return;
     }
-    if (!narrow) {
+    const telegramMiniApp = isTelegramMiniApp();
+    const canResumeInTelegram = telegramMiniApp && Boolean(resumeParam);
+    if (!narrow && !canResumeInTelegram) {
       setEnd(null);
       return;
     }
     setEnd(
-      <Button
-        ghost
-        onClick={() => setMobilePanelOpenRaw(true)}
-        aria-expanded={mobilePanelOpen}
-        aria-controls="chat-side-panel"
-        className={cn(
-          "shrink-0 rounded border border-current/20",
-          "px-2 py-1 text-xs font-medium tracking-wide",
-          "text-text-secondary hover:text-midground hover:bg-midground/5",
+      <div className="flex items-center gap-1.5">
+        {canResumeInTelegram && (
+          <Button
+            ghost
+            onClick={() =>
+              sendTelegramAction({
+                action: "session.resume",
+                session_id: resumeParam,
+              })
+            }
+            className={cn(
+              "shrink-0 rounded border border-current/20",
+              "px-2 py-1 text-xs font-medium tracking-wide",
+              "text-text-secondary hover:text-midground hover:bg-midground/5",
+            )}
+          >
+            <span className="inline-flex items-center gap-1.5">
+              <MessageCircle className="h-3 w-3 shrink-0" />
+              Telegram
+            </span>
+          </Button>
         )}
-      >
-        <span className="inline-flex items-center gap-1.5">
-          <PanelRight className="h-3 w-3 shrink-0" />
-          {modelToolsLabel}
-        </span>
-      </Button>,
+        {narrow && (
+          <Button
+            ghost
+            onClick={() => setMobilePanelOpenRaw(true)}
+            aria-expanded={mobilePanelOpen}
+            aria-controls="chat-side-panel"
+            className={cn(
+              "shrink-0 rounded border border-current/20",
+              "px-2 py-1 text-xs font-medium tracking-wide",
+              "text-text-secondary hover:text-midground hover:bg-midground/5",
+            )}
+          >
+            <span className="inline-flex items-center gap-1.5">
+              <PanelRight className="h-3 w-3 shrink-0" />
+              {modelToolsLabel}
+            </span>
+          </Button>
+        )}
+      </div>,
     );
     return () => setEnd(null);
-  }, [isActive, narrow, mobilePanelOpen, modelToolsLabel, setEnd]);
+  }, [isActive, narrow, mobilePanelOpen, modelToolsLabel, resumeParam, setEnd]);
 
   const handleCopyLast = () => {
     const ws = wsRef.current;
@@ -881,7 +982,21 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
               "border-t border-current/10",
             )}
           >
-            <ChatSidebar channel={channel} profile={scopedProfile} />
+            <div className="border-b border-current/10 px-1 py-2">
+              <ChatSidebar
+                channel={channel}
+                profile={scopedProfile}
+                onDashboardNewSessionRequest={startFreshDashboardChat}
+                onSessionTitleChange={handleSessionTitleChange}
+                showTools={false}
+              />
+            </div>
+            <ChatSessionList
+              activeSessionId={resumeParam}
+              profile={scopedProfile}
+              onPicked={closeMobilePanel}
+              onNewChat={startFreshDashboardChat}
+            />
           </div>
         </div>
       </>,
@@ -964,10 +1079,26 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
             id="chat-side-panel"
             role="complementary"
             aria-label={modelToolsLabel}
-            className="flex min-h-0 shrink-0 flex-col overflow-hidden lg:h-full lg:w-80"
+            className="flex min-h-0 shrink-0 flex-col gap-3 overflow-hidden lg:h-full lg:w-60"
           >
+            {/* Model picker (tools card hidden — keeps the rail thin). */}
+            <div className="shrink-0">
+              <ChatSidebar
+                channel={channel}
+                profile={scopedProfile}
+                onDashboardNewSessionRequest={startFreshDashboardChat}
+                onSessionTitleChange={handleSessionTitleChange}
+                showTools={false}
+              />
+            </div>
+
+            {/* Session switcher fills the remaining height below the model box. */}
             <div className="min-h-0 flex-1 overflow-hidden">
-              <ChatSidebar channel={channel} profile={scopedProfile} />
+              <ChatSessionList
+                activeSessionId={resumeParam}
+                profile={scopedProfile}
+                onNewChat={startFreshDashboardChat}
+              />
             </div>
           </div>
         )}

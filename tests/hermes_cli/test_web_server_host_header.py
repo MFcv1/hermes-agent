@@ -54,6 +54,22 @@ class TestHostHeaderValidator:
                     f"bound={bound} must reject attacker host={attacker!r}"
                 )
 
+    def test_loopback_bind_accepts_configured_public_dashboard_host(self, monkeypatch):
+        """Tailscale Serve / reverse proxies can expose a loopback-bound
+        dashboard through the operator-declared public URL only."""
+        from hermes_cli.dashboard_auth import prefix
+        from hermes_cli.web_server import _is_accepted_host
+
+        monkeypatch.setattr(
+            prefix,
+            "resolve_public_url",
+            lambda: "https://hermes-vps.tail59f02f.ts.net",
+        )
+
+        assert _is_accepted_host("hermes-vps.tail59f02f.ts.net", "127.0.0.1")
+        assert _is_accepted_host("hermes-vps.tail59f02f.ts.net:443", "127.0.0.1")
+        assert not _is_accepted_host("evil.example", "127.0.0.1")
+
     def test_zero_zero_bind_accepts_anything(self):
         """0.0.0.0 means operator explicitly opted into all-interfaces
         (requires --insecure). No Host-layer defence is possible — rely

@@ -67,6 +67,10 @@ COMMAND_REGISTRY: list[CommandDef] = [
                gateway_only=True),
     CommandDef("new", "Start a new session (fresh session ID + history)", "Session",
                aliases=("reset",), args_hint="[name]"),
+    CommandDef("app", "Open the Telegram Mini App for repos and work sessions", "Session",
+               aliases=("miniapp",), gateway_only=True),
+    CommandDef("dashboard", "Open the Hermes dashboard", "Session",
+               aliases=("dash",), gateway_only=True),
     CommandDef("topic", "Enable or inspect Telegram DM topic sessions", "Session",
                gateway_only=True, args_hint="[off|help|session-id]"),
     CommandDef("clear", "Clear screen and start a new session", "Session",
@@ -78,6 +82,8 @@ COMMAND_REGISTRY: list[CommandDef] = [
     CommandDef("save", "Save the current conversation", "Session",
                cli_only=True),
     CommandDef("retry", "Retry the last message (resend to agent)", "Session"),
+    CommandDef("prompt", "Compose your next prompt in $EDITOR (markdown), then send it", "Session",
+               cli_only=True, args_hint="[initial text]", aliases=("compose",)),
     CommandDef("undo", "Back up N user turns and re-prompt (default 1)", "Session",
                args_hint="[N]"),
     CommandDef("title", "Set a title for the current session", "Session",
@@ -123,18 +129,22 @@ COMMAND_REGISTRY: list[CommandDef] = [
     # Configuration
     CommandDef("config", "Show current configuration", "Configuration",
                cli_only=True),
-    CommandDef("model", "Switch model for this session", "Configuration",
-               args_hint="[model] [--provider name] [--global] [--refresh]"),
+    CommandDef("model", "Switch model (persists by default)", "Configuration",
+               args_hint="[model] [--provider name] [--global|--session] [--refresh]"),
+    CommandDef("models", "Pick model and reasoning (Telegram UI)", "Configuration",
+               gateway_only=True,
+               args_hint="[model] [low|medium|high|xhigh|none]"),
     CommandDef("codex-runtime", "Toggle codex app-server runtime for OpenAI/Codex models",
                "Configuration", aliases=("codex_runtime",),
                args_hint="[auto|codex_app_server]"),
-    CommandDef("gquota", "Show Google Gemini Code Assist quota usage", "Info",
-               cli_only=True),
 
     CommandDef("personality", "Set a predefined personality", "Configuration",
                args_hint="[name]"),
     CommandDef("statusbar", "Toggle the context/model status bar", "Configuration",
                cli_only=True, aliases=("sb",)),
+    CommandDef("timestamps", "Toggle [HH:MM] timestamps on messages and /history", "Configuration",
+               cli_only=True, args_hint="[on|off|status]",
+               subcommands=("on", "off", "status"), aliases=("ts",)),
     CommandDef("verbose", "Cycle tool progress display: off -> new -> all -> verbose",
                "Configuration", cli_only=True,
                gateway_config_gate="display.tool_progress_command"),
@@ -144,8 +154,8 @@ COMMAND_REGISTRY: list[CommandDef] = [
     CommandDef("yolo", "Toggle YOLO mode (skip all dangerous command approvals)",
                "Configuration"),
     CommandDef("reasoning", "Manage reasoning effort and display", "Configuration",
-               args_hint="[level|show|hide]",
-               subcommands=("none", "minimal", "low", "medium", "high", "xhigh", "show", "hide", "on", "off")),
+               args_hint="[level|show|hide|full|clamp]",
+               subcommands=("none", "minimal", "low", "medium", "high", "xhigh", "show", "hide", "on", "off", "full", "clamp")),
     CommandDef("fast", "Toggle fast mode — OpenAI Priority Processing / Anthropic Fast Mode (Normal/Fast)", "Configuration",
                args_hint="[normal|fast|status]",
                subcommands=("normal", "fast", "status", "on", "off")),
@@ -184,6 +194,10 @@ COMMAND_REGISTRY: list[CommandDef] = [
                subcommands=("accept", "dismiss", "catalog", "clear")),
     CommandDef("blueprint", "Set up an automation from a blueprint template",
                "Tools & Skills", aliases=("bp",), args_hint="[name] [slot=value ...]"),
+    CommandDef("jobs", "List and manage scheduled jobs from Telegram",
+               "Tools & Skills", gateway_only=True,
+               args_hint="[list|pause|resume|remove] [id]",
+               subcommands=("list", "pause", "resume", "remove")),
     CommandDef("curator", "Background skill maintenance (status, run, pin, archive, list-archived)",
                "Tools & Skills", args_hint="[subcommand]",
                subcommands=("status", "run", "pause", "resume", "pin", "unpin", "restore", "list-archived")),
@@ -201,6 +215,10 @@ COMMAND_REGISTRY: list[CommandDef] = [
                aliases=("reload_mcp",)),
     CommandDef("reload-skills", "Re-scan ~/.hermes/skills/ for newly installed or removed skills",
                "Tools & Skills", aliases=("reload_skills",)),
+    CommandDef("learn", "Learn a new skill from URLs, files, directory or conversation and create SKILL.md",
+               "Tools & Skills", args_hint="<description of what to learn>"),
+    CommandDef("myskills", "List your personal /learn and local extension skills",
+               "Tools & Skills", aliases=("myskill", "mes-skills")),
     CommandDef("browser", "Connect browser tools to your live Chromium-family browser via CDP", "Tools & Skills",
                cli_only=True, args_hint="[connect|disconnect|status]",
                subcommands=("connect", "disconnect", "status")),
@@ -215,12 +233,16 @@ COMMAND_REGISTRY: list[CommandDef] = [
                gateway_only=True),
     CommandDef("usage", "Show token usage and rate limits for the current session", "Info"),
     CommandDef("credits", "Show Nous credit balance and top up", "Info"),
+    CommandDef("billing", "Manage Nous terminal billing — buy credits, auto-reload, limits", "Info",
+               cli_only=True),
     CommandDef("insights", "Show usage insights and analytics", "Info",
                args_hint="[days]"),
     CommandDef("platforms", "Show gateway/messaging platform status", "Info",
                cli_only=True, aliases=("gateway",)),
     CommandDef("platform", "Pause, resume, or list a failing gateway platform", "Info",
                gateway_only=True, args_hint="<pause|resume|list> [name]"),
+    CommandDef("vps", "Show concise VPS, disk, cron, and service status", "Info",
+               gateway_only=True, aliases=("vpsstatus",)),
     CommandDef("copy", "Copy the last assistant response to clipboard", "Info",
                cli_only=True, args_hint="[number]"),
     CommandDef("paste", "Attach clipboard image from your clipboard", "Info",
@@ -228,6 +250,8 @@ COMMAND_REGISTRY: list[CommandDef] = [
     CommandDef("image", "Attach a local image file for your next prompt", "Info",
                cli_only=True, args_hint="<path>"),
     CommandDef("update", "Update Hermes Agent to the latest version", "Info"),
+    CommandDef("updatecheck", "Read-only Hermes update readiness report", "Info",
+               aliases=("update-check",)),
     CommandDef("version", "Show Hermes Agent version", "Info", aliases=("v",)),
     CommandDef("debug", "Upload debug report (system info + logs) and get shareable links", "Info"),
 
@@ -362,6 +386,7 @@ ACTIVE_SESSION_BYPASS_COMMANDS: frozenset[str] = frozenset(
         "steer",
         "stop",
         "update",
+        "updatecheck",
         "version",
     }
 )
@@ -526,8 +551,13 @@ def telegram_bot_commands() -> list[tuple[str, str]]:
 
 
 _TELEGRAM_MENU_PRIORITY = (
-    # Most-typed everyday commands first.
+    # Product entry points first. Telegram preselects the first matching
+    # BotCommand while the user types, so /app must beat /approve for "/ap".
+    "app",
+    "dashboard",
+    # Most-typed everyday commands next.
     "help",
+    "dev",
     "new",
     "stop",
     "status",
@@ -537,6 +567,10 @@ _TELEGRAM_MENU_PRIORITY = (
     # Maintenance / diagnostics — the ones that prompted this priority list.
     "debug",
     "restart",
+    "vps",
+    "watch",
+    "jobs",
+    "updatecheck",
     "update",
     "verbose",
     "commands",
@@ -1053,8 +1087,16 @@ _SLACK_PRIORITY_ALIASES = ("btw", "bg")
 # the telegram-parity test reads it so an entry here is a deliberate
 # "Slack-via-/hermes" decision, not a silent clamp.
 #   - credits: the billing/top-up surface; reached via /hermes credits on Slack.
+#   - billing: the terminal-billing surface (buy/auto-reload/limit); /hermes billing.
 #   - debug: the log/report upload surface; reached via /hermes debug on Slack.
-_SLACK_VIA_HERMES_ONLY = frozenset({"credits", "debug"})
+#   - app/dashboard: dashboard launchers; reached via /hermes on Slack.
+#   - platform/update/updatecheck/version/vps: low-frequency operator commands
+#     that became visible after the legacy Telegram cockpit commands were
+#     removed; they remain reachable through /hermes on Slack.
+_SLACK_VIA_HERMES_ONLY = frozenset({
+    "credits", "billing", "debug", "app", "dashboard",
+    "platform", "update", "updatecheck", "version", "vps",
+})
 
 
 def _sanitize_slack_name(raw: str) -> str:

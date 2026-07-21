@@ -32,7 +32,7 @@ def _ensure_telegram_mock():
 _ensure_telegram_mock()
 
 from gateway.config import PlatformConfig
-from gateway.platforms.telegram import TelegramAdapter
+from plugins.platforms.telegram.adapter import TelegramAdapter
 
 
 def _make_adapter():
@@ -99,12 +99,7 @@ class TestTelegramModelPicker:
         assert "`model_1`" in edit_kwargs["text"]
 
     @pytest.mark.asyncio
-    async def test_model_selected_edits_message_on_success(self):
-        """Regression: the mm: (model selected → switch) success path must
-        edit the picker message to show the confirmation and remove the
-        buttons.  An earlier revision of this PR over-indented the
-        edit_message_text block so it lived inside the except branch and
-        only fired when the callback raised."""
+    async def test_model_and_reasoning_are_applied_only_after_review(self):
         adapter = _make_adapter()
         callback = AsyncMock(return_value="Switched to `gpt-5`")
         adapter._model_picker_state["12345"] = {
@@ -129,7 +124,16 @@ class TestTelegramModelPicker:
 
         await adapter._handle_model_picker_callback(query, "mm:0", "12345")
 
-        callback.assert_awaited_once()
+        callback.assert_not_awaited()
+        assert "Select reasoning effort" in query.edit_message_text.call_args[1]["text"]
+
+        await adapter._handle_model_picker_callback(query, "mr:2", "12345")
+        callback.assert_not_awaited()
+        assert "Review model switch" in query.edit_message_text.call_args[1]["text"]
+
+        await adapter._handle_model_picker_callback(query, "ma", "12345")
+
+        callback.assert_awaited_once_with("12345", "gpt-5", "openai", "high")
         query.edit_message_text.assert_awaited()
         edit_kwargs = query.edit_message_text.call_args[1]
         assert "MARKDOWN_V2" in repr(edit_kwargs["parse_mode"])
@@ -147,7 +151,8 @@ class TestTelegramModelPicker:
         which is robust to whether `telegram` is the real SDK or the module
         mock (the SDK markup objects don't expose a plain iterable under the
         mock)."""
-        import gateway.platforms.telegram as tg
+        import plugins.platforms.telegram.adapter as tg
+        import gateway.telegram_model_picker_mixin as picker_mixin
 
         built: list = []
 
@@ -163,6 +168,8 @@ class TestTelegramModelPicker:
 
         monkeypatch.setattr(tg, "InlineKeyboardButton", _RecordingButton)
         monkeypatch.setattr(tg, "InlineKeyboardMarkup", _RecordingMarkup)
+        monkeypatch.setattr(picker_mixin, "InlineKeyboardButton", _RecordingButton)
+        monkeypatch.setattr(picker_mixin, "InlineKeyboardMarkup", _RecordingMarkup)
 
         adapter = _make_adapter()
 
@@ -244,8 +251,37 @@ class TestTelegramModelPicker:
 
         await adapter._handle_model_picker_callback(query, "mc:0", "12345")
 
-        callback.assert_awaited_once_with("12345", "openai/gpt-5.5-pro", "openrouter")
+        callback.assert_not_awaited()
+        assert "Review model switch" in query.edit_message_text.call_args[1]["text"]
+
+        await adapter._handle_model_picker_callback(query, "ma", "12345")
+
+        callback.assert_awaited_once_with(
+            "12345", "openai/gpt-5.5-pro", "openrouter", None
+        )
         assert "12345" not in adapter._model_picker_state
+
+    def test_reasoning_options_are_provider_and_model_specific(self):
+        from gateway.telegram_model_quick_picks import reasoning_levels_for_model
+
+        assert reasoning_levels_for_model("openai-codex", "gpt-5.6-sol") == [
+            ("Low", "low"),
+            ("Medium", "medium"),
+            ("High", "high"),
+            ("Extra High", "xhigh"),
+            ("Ultra", "max"),
+        ]
+        assert reasoning_levels_for_model(
+            "xai-oauth", "grok-4.20-multi-agent-0309"
+        ) == [
+            ("Low", "low"),
+            ("Medium", "medium"),
+            ("High", "high"),
+            ("Extra High", "xhigh"),
+        ]
+        assert reasoning_levels_for_model(
+            "xai-oauth", "grok-4.20-0309-reasoning"
+        ) == []
 
     @pytest.mark.asyncio
     async def test_retries_without_thread_when_thread_not_found(self):
