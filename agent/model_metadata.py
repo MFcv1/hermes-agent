@@ -336,6 +336,7 @@ _GROK_EFFORT_CAPABLE_PREFIXES = (
     "grok-3-mini",
     "grok-4.20-multi-agent",
     "grok-4.3",
+    "grok-4.5",
 )
 
 

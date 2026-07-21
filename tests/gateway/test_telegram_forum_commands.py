@@ -19,14 +19,16 @@ def _make_test_adapter():
     # ``name`` is a property derived from platform.value.title()
     adapter._bot = MagicMock()
     adapter._bot.set_my_commands = AsyncMock()
+    adapter._bot.delete_my_commands = AsyncMock()
     adapter._forum_command_registered = set()
+    adapter._private_command_scope_cleared = set()
     adapter._forum_lock = asyncio.Lock()
     return adapter
 
 
-def _forum_message(chat_id=-100, is_forum=True):
+def _forum_message(chat_id=-100, is_forum=True, chat_type="supergroup"):
     return SimpleNamespace(
-        chat=SimpleNamespace(id=chat_id, is_forum=is_forum),
+        chat=SimpleNamespace(id=chat_id, is_forum=is_forum, type=chat_type),
     )
 
 
@@ -35,6 +37,23 @@ async def test_ensure_forum_commands_skips_non_forum():
     adapter = _make_test_adapter()
     msg = _forum_message(is_forum=False)
     await adapter._ensure_forum_commands(msg)
+    adapter._bot.set_my_commands.assert_not_called()
+    adapter._bot.delete_my_commands.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_private_chat_clears_legacy_per_chat_scope_once():
+    adapter = _make_test_adapter()
+    msg = _forum_message(chat_id=123, is_forum=False, chat_type="private")
+
+    with patch("telegram.BotCommandScopeChat") as MockScope:
+        MockScope.side_effect = lambda chat_id: SimpleNamespace(chat_id=chat_id)
+        await adapter._ensure_forum_commands(msg)
+        await adapter._ensure_forum_commands(msg)
+
+    adapter._bot.delete_my_commands.assert_awaited_once()
+    assert adapter._bot.delete_my_commands.call_args.kwargs["scope"].chat_id == 123
+    assert 123 in adapter._private_command_scope_cleared
     adapter._bot.set_my_commands.assert_not_called()
 
 

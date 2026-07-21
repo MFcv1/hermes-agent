@@ -1681,7 +1681,7 @@ class TelegramTransportMixin:
             if web_app_data_filter is not None and hasattr(self, "_handle_web_app_data"):
                 self._app.add_handler(TelegramMessageHandler(
                     web_app_data_filter,
-                    self._handle_web_app_data,
+                    self._handle_web_app_data
                 ))
             self._app.add_handler(TelegramMessageHandler(
                 filters.COMMAND,
@@ -3387,7 +3387,7 @@ class TelegramTransportMixin:
             return
 
         # --- Model picker callbacks ---
-        if data.startswith(("mp:", "mpg:", "mm:", "mc:", "mb", "mx", "mg:")):
+        if data.startswith(("mp:", "mpg:", "mm:", "mc:", "mr:", "mrr", "mrm", "ma", "mb", "mx", "mg:")):
             chat_id = str(query.message.chat_id) if query.message else None
             if chat_id:
                 await self._handle_model_picker_callback(query, data, chat_id)

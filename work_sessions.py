@@ -19,7 +19,7 @@ from typing import Any, Iterable
 from hermes_constants import get_hermes_home
 
 
-_STATUSES = {"open", "active", "blocked", "done", "failed", "deleted"}
+_STATUSES = {"open", "active", "blocked", "done", "failed", "archived", "deleted"}
 _WORKFLOWS = {
     "supervisor",
     "pilote",
@@ -306,7 +306,7 @@ class WorkSessionStore:
             return self.get_session(work_session_id)
         updates.append("updated_at = ?")
         params.append(_now())
-        if fields.get("status") in {"done", "failed"}:
+        if fields.get("status") in {"done", "failed", "archived"}:
             updates.append("closed_at = COALESCE(closed_at, ?)")
             params.append(_now())
         params.append(_clean(work_session_id, 120))
@@ -472,4 +472,3 @@ class WorkSessionStore:
             if self.delete_session(str(work_session_id)):
                 count += 1
         return count
-

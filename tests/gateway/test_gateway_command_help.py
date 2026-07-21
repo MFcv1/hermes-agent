@@ -37,6 +37,56 @@ def test_start_is_known_gateway_command():
 
 
 @pytest.mark.asyncio
+async def test_app_command_points_to_sessions_mini_app(monkeypatch):
+    monkeypatch.setenv("REPO_COCKPIT_URL", "https://cockpit.example/")
+
+    result = await _make_runner()._handle_app_command(
+        _make_event("/app", Platform.TELEGRAM)
+    )
+
+    assert "Mini App Hermes" in result
+    assert "https://cockpit.example/work-sessions?" in result
+
+
+@pytest.mark.asyncio
+async def test_app_command_prefers_dashboard_public_url(monkeypatch):
+    monkeypatch.setenv("HERMES_DASHBOARD_PUBLIC_URL", "https://hermes.tailnet.ts.net")
+
+    result = await _make_runner()._handle_app_command(
+        _make_event("/app", Platform.TELEGRAM)
+    )
+
+    assert "Mini App Hermes" in result
+    assert "https://hermes.tailnet.ts.net/work-sessions?" in result
+
+
+@pytest.mark.asyncio
+async def test_dashboard_command_uses_configured_public_url(monkeypatch):
+    monkeypatch.setattr("gateway.dashboard_links.time.time", lambda: 1234)
+    monkeypatch.setenv("HERMES_DASHBOARD_PUBLIC_URL", "https://hermes.example.com")
+
+    result = await _make_runner()._handle_dashboard_command(
+        _make_event("/dashboard", Platform.TELEGRAM)
+    )
+
+    assert "Dashboard Hermes" in result
+    assert "https://hermes.example.com/sessions?v=1234" in result
+    assert "projet courant restent les mêmes" in result
+
+
+@pytest.mark.asyncio
+async def test_dashboard_command_falls_back_to_private_tunnel_hint(monkeypatch):
+    monkeypatch.delenv("HERMES_DASHBOARD_PUBLIC_URL", raising=False)
+
+    result = await _make_runner()._handle_dashboard_command(
+        _make_event("/dashboard", Platform.TELEGRAM)
+    )
+
+    assert "mode privé" in result
+    assert "http://127.0.0.1:9120/sessions" in result
+
+
+@pytest.mark.asyncio
 async def test_help_sanitizes_slash_command_mentions_for_telegram(monkeypatch):
     """Telegram help output must not expose invalid uppercase/hyphenated slashes."""
     monkeypatch.setattr(

@@ -101,6 +101,36 @@ async def test_gate_off_runs_execute_immediately(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_trusted_product_reset_bypasses_confirmation_without_persisting_opt_out():
+    """A Mini App Work Session reset must finish synchronously so its caller
+    links the final session id, while ordinary user /new commands remain
+    confirmation-gated."""
+    from tools import slash_confirm as _slash_confirm_mod
+
+    runner = _make_runner()
+    runner._read_user_config = lambda: {"approvals": {"destructive_slash_confirm": True}}
+    session_key = build_session_key(_make_source())
+    runner._session_key_for_source = lambda src: session_key
+    _slash_confirm_mod.clear(session_key)
+    event = _make_event("/new")
+    event._trusted_destructive_slash = True
+    execute = AsyncMock(return_value="fresh linked session")
+
+    result = await runner._maybe_confirm_destructive_slash(
+        event=event,
+        command="new",
+        title="/new",
+        detail="Discards history.",
+        execute=execute,
+    )
+
+    assert result == "fresh linked session"
+    execute.assert_awaited_once()
+    runner.adapters[Platform.TELEGRAM].send_slash_confirm.assert_not_awaited()
+    assert _slash_confirm_mod.get_pending(session_key) is None
+
+
+@pytest.mark.asyncio
 async def test_gate_on_text_fallback_returns_prompt_without_executing(monkeypatch):
     """When the gate is on and the adapter has no button UI, the user gets
     a text prompt back and the destructive action is NOT yet run."""

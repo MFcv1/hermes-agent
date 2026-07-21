@@ -62,21 +62,50 @@ class GatewaySlashCommandsMixin:
         return getattr(adapter, "typed_command_prefix", "/") if adapter is not None else "/"
 
     async def _handle_app_command(self, event: MessageEvent) -> str:
-        """Open the session picker in Telegram's native Mini App surface."""
-        from gateway.config import Platform
+        """Handle /app when the platform did not render a native Mini App button."""
         from gateway.dashboard_links import hermes_mini_app_url
 
-        source = event.source
-        adapter = self.adapters.get(source.platform) if source else None
-        sender = getattr(adapter, "send_hermes_mini_app_shortcut", None)
-        if source and source.platform == Platform.TELEGRAM and callable(sender):
-            await sender(str(source.chat_id))
-            return ""
+        url = hermes_mini_app_url("/work-sessions")
+        if event.source and event.source.platform == Platform.TELEGRAM:
+            return (
+                "Ouvre la Mini App Hermes ici :\n"
+                f"{url}\n\n"
+                "Si ton client Telegram ne montre pas le bouton, utilise ce lien."
+            )
+        return (
+            "La Mini App Hermes est optimisée pour Telegram.\n"
+            f"URL web : {url}"
+        )
 
-        url = hermes_mini_app_url("/sessions")
-        if not url:
-            return "Mini App indisponible : configure `dashboard.public_url` avec l'URL HTTPS privée du dashboard."
-        return f"Ouvre Hermes Sessions :\n{url}"
+    async def _handle_dashboard_command(self, event: MessageEvent) -> str:
+        """Handle /dashboard with a safe operator-configured URL."""
+        from gateway.dashboard_links import hermes_dashboard_url
+
+        url = hermes_dashboard_url("/sessions")
+        if url:
+            return (
+                "Dashboard Hermes — version web complète :\n"
+                f"{url}\n\n"
+                "La conversation et le projet courant restent les mêmes. "
+                "Le lien est protégé par l'accès privé/authentifié du VPS."
+            )
+
+        tunnel_url = "http://127.0.0.1:9120/sessions"
+        if event.source and event.source.platform == Platform.TELEGRAM:
+            return (
+                "Le dashboard Hermes VPS est en mode privé, donc je ne publie "
+                "pas d'URL Internet brute.\n\n"
+                "Si ton tunnel SSH est ouvert sur ton Mac, ouvre :\n"
+                f"{tunnel_url}\n\n"
+                "Pour avoir un bouton Telegram direct depuis Mac et téléphone, "
+                "configure `dashboard.public_url` avec une URL Tailscale/HTTPS "
+                "sécurisée accessible depuis tes appareils."
+            )
+        return (
+            "Dashboard Hermes privé.\n"
+            f"URL tunnel locale si ouvert : {tunnel_url}\n"
+            "Configure `dashboard.public_url` pour publier un lien sécurisé."
+        )
 
     async def _handle_reset_command(self, event: MessageEvent) -> Union[str, EphemeralReply]:
         """Handle /new or /reset command."""
@@ -183,6 +212,27 @@ class GatewaySlashCommandsMixin:
             # No existing session, just create one
             new_entry = self.session_store.get_or_create_session(source, force_new=True)
             header = self._telegram_topic_new_header(source) or t("gateway.reset.header_new")
+
+        # A Mini App Work Session may start while Telegram only has an empty
+        # technical placeholder. Once the synchronous reset above has
+        # produced the real linked session, remove only that empty, untitled
+        # predecessor. Real transcripts and titled sessions are preserved by
+        # SessionDB.delete_session_if_empty's transactional guard.
+        if (
+            bool(getattr(event, "_discard_empty_previous_session", False))
+            and _old_sid
+            and new_entry is not None
+            and _old_sid != new_entry.session_id
+            and self._session_db is not None
+        ):
+            try:
+                self._session_db.delete_session_if_empty(_old_sid)
+            except Exception:
+                logger.debug(
+                    "Could not discard empty Work Session predecessor %s",
+                    _old_sid,
+                    exc_info=True,
+                )
 
         # Set session title if provided with /new <title>
         _title_arg = event.get_command_args().strip()
@@ -1169,11 +1219,24 @@ class GatewaySlashCommandsMixin:
                     _cur_provider = current_provider
                     _cur_base_url = current_base_url
                     _cur_api_key = current_api_key
+                    _cur_reasoning_cfg = self._resolve_session_reasoning_config(
+                        source=event.source,
+                        session_key=session_key,
+                    )
+                    _cur_reasoning = (
+                        _cur_reasoning_cfg.get("effort")
+                        if isinstance(_cur_reasoning_cfg, dict)
+                        and _cur_reasoning_cfg.get("enabled") is not False
+                        else None
+                    )
 
                     async def _on_model_selected(
-                        _chat_id: str, model_id: str, provider_slug: str
+                        _chat_id: str,
+                        model_id: str,
+                        provider_slug: str,
+                        reasoning_effort: Optional[str] = None,
                     ) -> str:
-                        """Perform the model switch and return confirmation text."""
+                        """Apply the reviewed model + reasoning choice together."""
                         result = _switch_model(
                             raw_input=model_id,
                             current_provider=_cur_provider,
@@ -1272,6 +1335,11 @@ class GatewaySlashCommandsMixin:
                             "base_url": result.base_url,
                             "api_mode": result.api_mode,
                         }
+                        if reasoning_effort:
+                            _self._set_session_reasoning_override(
+                                _session_key,
+                                {"enabled": True, "effort": reasoning_effort},
+                            )
 
                         # Evict cached agent so the next turn creates a fresh
                         # agent from the override rather than relying on the
@@ -1303,6 +1371,12 @@ class GatewaySlashCommandsMixin:
                                     _persist_model_cfg["base_url"] = result.base_url
                                 if str(result.target_provider or "").strip().lower() != "custom":
                                     clear_model_endpoint_credentials(_persist_model_cfg)
+                                if reasoning_effort:
+                                    _persist_agent_cfg = _persist_cfg.setdefault("agent", {})
+                                    if not isinstance(_persist_agent_cfg, dict):
+                                        _persist_agent_cfg = {}
+                                        _persist_cfg["agent"] = _persist_agent_cfg
+                                    _persist_agent_cfg["reasoning_effort"] = reasoning_effort
                                 from hermes_cli.config import save_config
                                 save_config(_persist_cfg)
                             except Exception as e:
@@ -1312,6 +1386,18 @@ class GatewaySlashCommandsMixin:
                         plabel = result.provider_label or result.target_provider
                         lines = [t("gateway.model.switched", model=result.new_model)]
                         lines.append(t("gateway.model.provider_label", provider=plabel))
+                        if reasoning_effort:
+                            _reasoning_label = {
+                                "low": "Low",
+                                "medium": "Medium",
+                                "high": "High",
+                                "xhigh": "Extra High",
+                                "max": "Ultra",
+                            }.get(reasoning_effort, reasoning_effort)
+                            lines.append(f"Reasoning: {_reasoning_label}")
+                        else:
+                            lines.append("Reasoning: automatic (model-managed)")
+                        lines.append("Conversation and current project preserved.")
                         mi = result.model_info
                         from hermes_cli.model_switch import resolve_display_context_length
                         _sw_config_ctx = None
@@ -1350,7 +1436,7 @@ class GatewaySlashCommandsMixin:
                         return "\n".join(lines)
 
                     metadata = self._thread_metadata_for_source(source, self._reply_anchor_for_event(event))
-                    result = await adapter.send_model_picker(
+                    picker_kwargs = dict(
                         chat_id=source.chat_id,
                         providers=providers,
                         current_model=current_model,
@@ -1359,6 +1445,9 @@ class GatewaySlashCommandsMixin:
                         on_model_selected=_on_model_selected,
                         metadata=metadata,
                     )
+                    if source.platform == Platform.TELEGRAM:
+                        picker_kwargs["current_reasoning"] = _cur_reasoning
+                    result = await adapter.send_model_picker(**picker_kwargs)
                     if result.success:
                         return None  # Picker sent — adapter handles the response
 
@@ -2442,7 +2531,7 @@ class GatewaySlashCommandsMixin:
             return t("gateway.reasoning.reset_done")
         if effort == "none":
             parsed = {"enabled": False}
-        elif effort in {"minimal", "low", "medium", "high", "xhigh"}:
+        elif effort in {"minimal", "low", "medium", "high", "xhigh", "max"}:
             parsed = {"enabled": True, "effort": effort}
         else:
             return t(

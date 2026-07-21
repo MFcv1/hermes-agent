@@ -5,7 +5,6 @@ import {
   useCallback,
   useRef,
 } from "react";
-import { useNavigate } from "react-router-dom";
 import {
   AlertTriangle,
   CheckCircle2,
@@ -82,20 +81,27 @@ declare global {
     Telegram?: {
       WebApp?: {
         ready?: () => void;
+        close?: () => void;
         sendData?: (data: string) => void;
+        openLink?: (url: string) => void;
       };
     };
   }
 }
 
 function isTelegramMiniApp(): boolean {
-  return typeof window !== "undefined" && Boolean(window.Telegram?.WebApp?.sendData);
+  return (
+    typeof window !== "undefined" &&
+    Boolean(window.Telegram?.WebApp?.sendData)
+  );
 }
 
-function sendTelegramResume(sessionId: string): boolean {
+function sendTelegramAction(payload: Record<string, unknown>): boolean {
   const webApp = window.Telegram?.WebApp;
   if (!webApp?.sendData) return false;
-  webApp.sendData(JSON.stringify({ action: "session.resume", session_id: sessionId }));
+  webApp.sendData(JSON.stringify(payload));
+  // sendData owns the Telegram close lifecycle. Closing synchronously here
+  // can race the native bridge on Telegram Desktop and drop the action.
   return true;
 }
 
@@ -415,7 +421,6 @@ function SessionRow({
   const [renameValue, setRenameValue] = useState(session.title ?? "");
   const [renameSaving, setRenameSaving] = useState(false);
   const { t } = useI18n();
-  const navigate = useNavigate();
   const telegramMiniApp = isTelegramMiniApp();
 
   useEffect(() => {
@@ -457,19 +462,17 @@ function SessionRow({
       </Badge>
 
       {resumeInChatEnabled && (
-        <Button
-          ghost
-          size="icon"
-          className="text-muted-foreground hover:text-success"
-          aria-label={t.sessions.resumeInChat}
-          title={t.sessions.resumeInChat}
+        <a
+          href={`${window.__HERMES_BASE_PATH__ || ""}/chat?resume=${encodeURIComponent(session.id)}`}
+          className="relative grid aspect-square cursor-pointer place-items-center p-2 text-muted-foreground hover:bg-midground/10 hover:text-success"
+          aria-label="Continuer dans l'app"
+          title="Continuer dans l'app"
           onClick={(e) => {
             e.stopPropagation();
-            navigate(`/chat?resume=${encodeURIComponent(session.id)}`);
           }}
         >
-          <Play />
-        </Button>
+          <Play className="h-3.5 w-3.5" />
+        </a>
       )}
 
       {telegramMiniApp && (
@@ -481,7 +484,10 @@ function SessionRow({
           title="Reprendre dans Telegram"
           onClick={(e) => {
             e.stopPropagation();
-            sendTelegramResume(session.id);
+            sendTelegramAction({
+              action: "session.resume",
+              session_id: session.id,
+            });
           }}
         >
           <MessageCircle />
@@ -1399,7 +1405,7 @@ export default function SessionsPage() {
             <span className="text-lg font-semibold tabular-nums leading-none text-success">
               {stats.active_store}
             </span>
-            <span className="text-xs text-muted-foreground">Active in store</span>
+            <span className="text-xs text-muted-foreground">Unarchived</span>
           </div>
           <div className="flex flex-col">
             <span className="text-lg font-semibold tabular-nums leading-none">

@@ -1,10 +1,14 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import {
+  Archive,
+  ArchiveRestore,
   BriefcaseBusiness,
+  Github,
   MessageCircle,
   Play,
   RefreshCw,
   Search,
+  Sparkles,
   Trash2,
 } from "lucide-react";
 import { Button } from "@nous-research/ui/ui/components/button";
@@ -16,7 +20,7 @@ import { cn } from "@/lib/utils";
 import { usePageHeader } from "@/contexts/usePageHeader";
 import { isDashboardEmbeddedChatEnabled } from "@/lib/dashboard-flags";
 
-type WorkSession = {
+interface WorkSession {
   id: string;
   title: string;
   status: string;
@@ -35,17 +39,33 @@ type WorkSession = {
   summary?: string | null;
   current_state?: string | null;
   next_actions?: string[];
+  metadata?: Record<string, unknown>;
   updated_at: number;
   created_at: number;
-};
+}
 
-type WorkSessionsResponse = {
+interface GitHubRepository {
+  name: string;
+  nameWithOwner: string;
+  description: string;
+  isPrivate: boolean;
+  url: string;
+  updatedAt: string;
+}
+
+interface WorkSessionsResponse {
   work_sessions: WorkSession[];
-};
+}
 
-type ResumePacketResponse = {
+interface RepositoryCatalogResponse {
+  repositories: GitHubRepository[];
+  owner: string;
+  total: number;
+}
+
+interface ResumePacketResponse {
   resume_packet: Record<string, unknown>;
-};
+}
 
 declare global {
   interface Window {
@@ -60,8 +80,11 @@ declare global {
   }
 }
 
-const WORKFLOWS = ["supervisor", "pilote", "autopilot", "ask_review", "libre", "debug", "deploy"];
-const STATUSES = ["", "open", "active", "blocked", "done", "failed"];
+const STATUSES = ["", "open", "active", "blocked", "done", "failed", "archived"];
+const PROVIDERS = [
+  { id: "cloudflare", label: "Cloudflare" },
+  { id: "supabase", label: "Supabase" },
+];
 
 function isTelegramMiniApp(): boolean {
   return typeof window !== "undefined" && Boolean(window.Telegram?.WebApp?.sendData);
@@ -71,13 +94,11 @@ function sendTelegramAction(payload: Record<string, unknown>): boolean {
   const webApp = window.Telegram?.WebApp;
   if (!webApp?.sendData) return false;
   webApp.sendData(JSON.stringify(payload));
-  // Telegram closes a sendData Mini App itself. A second synchronous close
-  // can win the race on Desktop before the payload reaches the bot.
   return true;
 }
 
 function formatTime(ts: number): string {
-  if (!ts) return "never";
+  if (!ts) return "jamais";
   return new Date(ts * 1000).toLocaleString();
 }
 
@@ -92,25 +113,28 @@ function groupByRepo(sessions: WorkSession[]): Array<[string, WorkSession[]]> {
 
 export default function WorkSessionsPage() {
   const { setEnd } = usePageHeader();
+  const telegram = isTelegramMiniApp();
+  const resumeInChatEnabled = isDashboardEmbeddedChatEnabled();
   const [sessions, setSessions] = useState<WorkSession[]>([]);
+  const [repositories, setRepositories] = useState<GitHubRepository[]>([]);
+  const [githubOwner, setGithubOwner] = useState("");
   const [selected, setSelected] = useState<WorkSession | null>(null);
   const [resumePacket, setResumePacket] = useState<Record<string, unknown> | null>(null);
   const [loading, setLoading] = useState(false);
+  const [catalogLoading, setCatalogLoading] = useState(false);
   const [error, setError] = useState("");
+  const [catalogError, setCatalogError] = useState("");
   const [repoFilter, setRepoFilter] = useState("");
   const [statusFilter, setStatusFilter] = useState("");
+  const [projectMode, setProjectMode] = useState<"existing" | "new">("existing");
+  const [selectedRepo, setSelectedRepo] = useState("");
+  const [newProjectName, setNewProjectName] = useState("");
   const [title, setTitle] = useState("");
-  const [repo, setRepo] = useState("");
-  const [workflow, setWorkflow] = useState("supervisor");
+  const [objective, setObjective] = useState("");
+  const [visibility, setVisibility] = useState<"private" | "public">("private");
+  const [providers, setProviders] = useState<string[]>(["cloudflare"]);
 
-  const telegram = isTelegramMiniApp();
-  const resumeInChatEnabled = isDashboardEmbeddedChatEnabled();
-  // The Mini App is served by the same private dashboard and receives the
-  // ephemeral dashboard token injected into its HTML. Keep this API behind
-  // normal dashboard authentication instead of exposing a second public path.
-  const workSessionsApi = "/api/work-sessions";
-
-  const load = useCallback(async () => {
+  const loadSessions = useCallback(async () => {
     setLoading(true);
     setError("");
     try {
@@ -118,7 +142,7 @@ export default function WorkSessionsPage() {
       if (repoFilter.trim()) params.set("repo", repoFilter.trim());
       if (statusFilter) params.set("status", statusFilter);
       const qs = params.toString();
-      const data = await fetchJSON<WorkSessionsResponse>(`${workSessionsApi}${qs ? `?${qs}` : ""}`);
+      const data = await fetchJSON<WorkSessionsResponse>(`/api/work-sessions${qs ? `?${qs}` : ""}`);
       setSessions(data.work_sessions);
       setSelected((current) => {
         if (!current) return data.work_sessions[0] ?? null;
@@ -129,22 +153,37 @@ export default function WorkSessionsPage() {
     } finally {
       setLoading(false);
     }
-  }, [repoFilter, statusFilter, workSessionsApi]);
+  }, [repoFilter, statusFilter]);
+
+  const loadRepositories = useCallback(async () => {
+    setCatalogLoading(true);
+    setCatalogError("");
+    try {
+      const data = await fetchJSON<RepositoryCatalogResponse>("/api/project-catalog/github");
+      setRepositories(data.repositories);
+      setGithubOwner(data.owner);
+      setSelectedRepo((current) => current || data.repositories[0]?.nameWithOwner || "");
+    } catch (err) {
+      setCatalogError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setCatalogLoading(false);
+    }
+  }, []);
 
   useEffect(() => {
     window.Telegram?.WebApp?.ready?.();
-    void load();
-  }, [load]);
+    void Promise.all([loadSessions(), loadRepositories()]);
+  }, [loadRepositories, loadSessions]);
 
   useEffect(() => {
     setEnd(
-      <Button onClick={() => void load()} outlined size="sm">
+      <Button onClick={() => void Promise.all([loadSessions(), loadRepositories()])} outlined size="sm">
         <RefreshCw className="h-4 w-4" />
-        Refresh
+        Actualiser
       </Button>,
     );
     return () => setEnd(null);
-  }, [load, setEnd]);
+  }, [loadRepositories, loadSessions, setEnd]);
 
   useEffect(() => {
     if (!selected) {
@@ -152,8 +191,7 @@ export default function WorkSessionsPage() {
       return;
     }
     let cancelled = false;
-    const url = `/api/work-sessions/${encodeURIComponent(selected.id)}/resume-packet`;
-    fetchJSON<ResumePacketResponse>(url)
+    fetchJSON<ResumePacketResponse>(`/api/work-sessions/${encodeURIComponent(selected.id)}/resume-packet`)
       .then((data) => {
         if (!cancelled) setResumePacket(data.resume_packet);
       })
@@ -163,17 +201,40 @@ export default function WorkSessionsPage() {
     return () => {
       cancelled = true;
     };
-  }, [selected, telegram]);
+  }, [selected]);
 
   const grouped = useMemo(() => groupByRepo(sessions), [sessions]);
+  const repoForCreation = projectMode === "existing"
+    ? selectedRepo
+    : `${githubOwner ? `${githubOwner}/` : ""}${newProjectName.trim()}`;
+  const canCreate = Boolean(repoForCreation && (title.trim() || newProjectName.trim() || selectedRepo));
+
+  function toggleProvider(provider: string) {
+    setProviders((current) => current.includes(provider)
+      ? current.filter((item) => item !== provider)
+      : [...current, provider]);
+  }
 
   async function createSession() {
+    if (!canCreate) return;
+    const cleanTitle = title.trim()
+      || (projectMode === "existing" ? selectedRepo.split("/").pop() : newProjectName.trim())
+      || "Nouvelle conversation";
     const payload = {
       action: "work_session.create",
-      title: title.trim() || repo.trim() || "Nouvelle session",
-      repo: repo.trim() || undefined,
-      workflow,
-      origin_channel: "telegram",
+      title: cleanTitle,
+      repo: repoForCreation,
+      workflow: "libre",
+      origin_channel: telegram ? "telegram" : "dashboard",
+      objective: objective.trim() || undefined,
+      project_mode: projectMode,
+      providers: projectMode === "new" ? providers : [],
+      visibility,
+      metadata: {
+        project_mode: projectMode,
+        providers: projectMode === "new" ? providers : [],
+        visibility,
+      },
     };
     if (telegram && sendTelegramAction(payload)) return;
     const data = await fetchJSON<{ work_session: WorkSession }>("/api/work-sessions", {
@@ -182,8 +243,9 @@ export default function WorkSessionsPage() {
       body: JSON.stringify(payload),
     });
     setTitle("");
-    setRepo("");
-    await load();
+    setObjective("");
+    setNewProjectName("");
+    await loadSessions();
     setSelected(data.work_session);
   }
 
@@ -202,49 +264,135 @@ export default function WorkSessionsPage() {
   }
 
   function resumeInTelegram(session: WorkSession) {
-    sendTelegramAction({
-      action: "work_session.resume",
+    sendTelegramAction({ action: "work_session.resume", work_session_id: session.id });
+  }
+
+  async function setArchived(session: WorkSession, archived: boolean) {
+    const payload = {
+      action: archived ? "work_session.archive" : "work_session.unarchive",
       work_session_id: session.id,
+    };
+    if (telegram && sendTelegramAction(payload)) return;
+    await fetchJSON(`/api/work-sessions/${encodeURIComponent(session.id)}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ status: archived ? "archived" : "open" }),
     });
+    await loadSessions();
   }
 
   async function deleteSession(session: WorkSession) {
-    if (!window.confirm(`Supprimer définitivement "${session.title}" ?`)) return;
+    if (!window.confirm(`Supprimer définitivement « ${session.title} » ?`)) return;
     const payload = { action: "work_session.delete", work_session_id: session.id };
     if (telegram && sendTelegramAction(payload)) return;
     await fetchJSON(`/api/work-sessions/${encodeURIComponent(session.id)}`, { method: "DELETE" });
     setSelected(null);
-    await load();
+    await loadSessions();
   }
 
   return (
     <div className="min-h-full bg-background text-text-primary">
-      <div className="grid min-h-[calc(100vh-4rem)] grid-cols-1 border-t border-border lg:grid-cols-[20rem_1fr]">
+      <div className="grid min-h-[calc(100vh-4rem)] grid-cols-1 border-t border-border lg:grid-cols-[22rem_1fr]">
         <aside className="border-b border-border bg-surface/60 lg:border-b-0 lg:border-r">
-          <div className="space-y-3 border-b border-border p-4">
+          <div className="space-y-4 border-b border-border p-4">
             <div className="flex items-center gap-2 text-sm font-medium">
               <BriefcaseBusiness className="h-4 w-4 text-text-secondary" />
-              Worker Sessions
+              Projets
               {telegram && <Badge tone="secondary">Telegram</Badge>}
             </div>
-            <div className="grid gap-2">
-              <Input value={title} onChange={(event) => setTitle(event.target.value)} placeholder="Titre" />
-              <Input value={repo} onChange={(event) => setRepo(event.target.value)} placeholder="Repo" />
-              <select
-                className="h-9 border border-border bg-background px-2 text-sm"
-                value={workflow}
-                onChange={(event) => setWorkflow(event.target.value)}
+
+            <div className="grid grid-cols-2 gap-2">
+              <Button
+                onClick={() => setProjectMode("existing")}
+                outlined={projectMode !== "existing"}
+                size="sm"
               >
-                {WORKFLOWS.map((item) => (
-                  <option key={item} value={item}>{item}</option>
-                ))}
-              </select>
-              <Button onClick={() => void createSession()} size="sm">
-                <Play className="h-4 w-4" />
-                Nouveau chat
+                <Github className="h-4 w-4" />
+                Repo existant
+              </Button>
+              <Button
+                onClick={() => setProjectMode("new")}
+                outlined={projectMode !== "new"}
+                size="sm"
+              >
+                <Sparkles className="h-4 w-4" />
+                Nouveau projet
               </Button>
             </div>
+
+            {projectMode === "existing" ? (
+              <div className="space-y-2">
+                <label className="text-xs uppercase text-text-tertiary">Dépôt GitHub</label>
+                <select
+                  className="h-10 w-full border border-border bg-background px-2 text-sm"
+                  value={selectedRepo}
+                  onChange={(event) => setSelectedRepo(event.target.value)}
+                  disabled={catalogLoading}
+                >
+                  {repositories.map((repo) => (
+                    <option key={repo.nameWithOwner} value={repo.nameWithOwner}>
+                      {repo.nameWithOwner}{repo.isPrivate ? " · privé" : ""}
+                    </option>
+                  ))}
+                </select>
+                {catalogLoading && <div className="text-xs text-text-secondary">Chargement des repos…</div>}
+                {catalogError && <div className="text-xs text-destructive">{catalogError}</div>}
+              </div>
+            ) : (
+              <div className="space-y-3">
+                <div>
+                  <label className="text-xs uppercase text-text-tertiary">Nom du nouveau projet</label>
+                  <Input
+                    value={newProjectName}
+                    onChange={(event) => setNewProjectName(event.target.value)}
+                    placeholder="mon-nouveau-projet"
+                  />
+                </div>
+                <div className="grid grid-cols-2 gap-2">
+                  {PROVIDERS.map((provider) => (
+                    <label key={provider.id} className="flex items-center gap-2 border border-border px-3 py-2 text-sm">
+                      <input
+                        type="checkbox"
+                        checked={providers.includes(provider.id)}
+                        onChange={() => toggleProvider(provider.id)}
+                      />
+                      {provider.label}
+                    </label>
+                  ))}
+                </div>
+                <select
+                  className="h-10 w-full border border-border bg-background px-2 text-sm"
+                  value={visibility}
+                  onChange={(event) => setVisibility(event.target.value as "private" | "public")}
+                >
+                  <option value="private">Repo privé</option>
+                  <option value="public">Repo public</option>
+                </select>
+              </div>
+            )}
+
+            <Input
+              value={title}
+              onChange={(event) => setTitle(event.target.value)}
+              placeholder="Titre de la conversation"
+            />
+            <textarea
+              className="min-h-24 w-full resize-y border border-border bg-background px-3 py-2 text-sm"
+              value={objective}
+              onChange={(event) => setObjective(event.target.value)}
+              placeholder="Que veux-tu construire ou modifier ?"
+            />
+            <Button onClick={() => void createSession()} disabled={!canCreate} size="sm" className="w-full">
+              <Play className="h-4 w-4" />
+              {projectMode === "new" ? "Préparer le projet" : "Nouveau chat"}
+            </Button>
+            {projectMode === "new" && (
+              <p className="text-xs text-text-secondary">
+                Hermes préparera GitHub et les fournisseurs sélectionnés dans le chat, avec validation avant création.
+              </p>
+            )}
           </div>
+
           <div className="space-y-2 border-b border-border p-4">
             <div className="relative">
               <Search className="pointer-events-none absolute left-2 top-2.5 h-4 w-4 text-text-tertiary" />
@@ -252,7 +400,7 @@ export default function WorkSessionsPage() {
                 className="pl-8"
                 value={repoFilter}
                 onChange={(event) => setRepoFilter(event.target.value)}
-                placeholder="Filtrer repo"
+                placeholder="Filtrer les projets"
               />
             </div>
             <select
@@ -261,19 +409,20 @@ export default function WorkSessionsPage() {
               onChange={(event) => setStatusFilter(event.target.value)}
             >
               {STATUSES.map((item) => (
-                <option key={item || "all"} value={item}>{item || "tous statuts"}</option>
+                <option key={item || "all"} value={item}>{item || "toutes les discussions"}</option>
               ))}
             </select>
           </div>
-          <div className="max-h-[calc(100vh-21rem)] overflow-y-auto p-2">
+
+          <div className="max-h-[calc(100vh-31rem)] overflow-y-auto p-2 lg:max-h-[calc(100vh-34rem)]">
             {loading && <Spinner className="m-4" />}
             {error && <div className="p-3 text-sm text-destructive">{error}</div>}
             {!loading && grouped.length === 0 && (
-              <div className="p-3 text-sm text-text-secondary">Aucune session.</div>
+              <div className="p-3 text-sm text-text-secondary">Aucune discussion.</div>
             )}
             {grouped.map(([repoName, items]) => (
               <div key={repoName} className="mb-3">
-                <div className="px-2 py-1 text-xs font-medium uppercase text-text-tertiary">{repoName}</div>
+                <div className="truncate px-2 py-1 text-xs font-medium uppercase text-text-tertiary">{repoName}</div>
                 {items.map((item) => (
                   <button
                     key={item.id}
@@ -285,8 +434,8 @@ export default function WorkSessionsPage() {
                   >
                     <span className="truncate font-medium">{item.title}</span>
                     <span className="flex items-center gap-2 text-xs text-text-secondary">
-                      <span>{item.workflow}</span>
                       <span>{item.status}</span>
+                      <span>{formatTime(item.updated_at)}</span>
                     </span>
                   </button>
                 ))}
@@ -298,7 +447,7 @@ export default function WorkSessionsPage() {
         <main className="min-w-0 p-5">
           {!selected ? (
             <div className="flex h-full items-center justify-center text-sm text-text-secondary">
-              Sélectionne ou crée une session.
+              Choisis un projet ou crée une discussion.
             </div>
           ) : (
             <div className="mx-auto max-w-5xl space-y-5">
@@ -307,32 +456,32 @@ export default function WorkSessionsPage() {
                   <h1 className="truncate text-2xl font-semibold">{selected.title}</h1>
                   <div className="mt-2 flex flex-wrap gap-2">
                     <Badge>{selected.status}</Badge>
-                    <Badge tone="secondary">{selected.workflow}</Badge>
                     {selected.repo && <Badge tone="secondary">{selected.repo}</Badge>}
                   </div>
                 </div>
-                <div className="flex gap-2">
+                <div className="flex flex-wrap gap-2">
                   {resumeInChatEnabled && selected.hermes_session_id && (
-                    <Button
-                      onClick={() => resumeInChat(selected)}
-                      outlined
-                      size="sm"
-                      title="Reprendre dans le terminal"
-                    >
+                    <Button onClick={() => resumeInChat(selected)} outlined size="sm">
                       <Play className="h-4 w-4" />
-                      Terminal
+                      Ouvrir le chat
                     </Button>
                   )}
-                  {telegram && (
-                    <Button
-                      onClick={() => resumeInTelegram(selected)}
-                      size="sm"
-                      title="Reprendre dans Telegram"
-                    >
+                  {telegram && selected.status !== "archived" && (
+                    <Button onClick={() => resumeInTelegram(selected)} size="sm">
                       <MessageCircle className="h-4 w-4" />
                       Reprendre dans Telegram
                     </Button>
                   )}
+                  <Button
+                    onClick={() => void setArchived(selected, selected.status !== "archived")}
+                    outlined
+                    size="sm"
+                  >
+                    {selected.status === "archived"
+                      ? <ArchiveRestore className="h-4 w-4" />
+                      : <Archive className="h-4 w-4" />}
+                    {selected.status === "archived" ? "Réactiver" : "Archiver"}
+                  </Button>
                   <Button onClick={() => void deleteSession(selected)} destructive size="sm">
                     <Trash2 className="h-4 w-4" />
                     Supprimer
@@ -342,14 +491,11 @@ export default function WorkSessionsPage() {
 
               <section className="grid gap-3 text-sm md:grid-cols-2">
                 {[
-                  ["ID", selected.id],
-                  ["Repo", selected.repo],
-                  ["Provider", selected.provider],
-                  ["Task Cockpit", selected.cockpit_task_id],
+                  ["Projet", selected.repo],
                   ["Branche", selected.git_branch],
-                  ["PR", selected.pr_url],
+                  ["Pull request", selected.pr_url],
                   ["Preview", selected.preview_url],
-                  ["Live", selected.live_url],
+                  ["Site live", selected.live_url],
                   ["Dernière activité", formatTime(selected.updated_at)],
                 ].map(([label, value]) => (
                   <div key={label || ""} className="border-b border-border pb-2">
@@ -360,7 +506,7 @@ export default function WorkSessionsPage() {
               </section>
 
               <section className="space-y-3">
-                <h2 className="text-sm font-semibold uppercase text-text-secondary">État de reprise</h2>
+                <h2 className="text-sm font-semibold uppercase text-text-secondary">Contexte du travail</h2>
                 <div className="grid gap-3 md:grid-cols-2">
                   <div>
                     <div className="text-xs uppercase text-text-tertiary">Objectif</div>
@@ -368,7 +514,9 @@ export default function WorkSessionsPage() {
                   </div>
                   <div>
                     <div className="text-xs uppercase text-text-tertiary">État actuel</div>
-                    <p className="mt-1 whitespace-pre-wrap text-sm">{selected.current_state || selected.summary || "non défini"}</p>
+                    <p className="mt-1 whitespace-pre-wrap text-sm">
+                      {selected.current_state || selected.summary || "non défini"}
+                    </p>
                   </div>
                 </div>
                 <div>
@@ -383,12 +531,12 @@ export default function WorkSessionsPage() {
                 </div>
               </section>
 
-              <section className="space-y-2">
-                <h2 className="text-sm font-semibold uppercase text-text-secondary">Resume Packet</h2>
-                <pre className="max-h-96 overflow-auto border border-border bg-surface p-3 text-xs">
-                  {resumePacket ? JSON.stringify(resumePacket, null, 2) : "Chargement..."}
+              <details className="border-t border-border pt-3">
+                <summary className="cursor-pointer text-xs uppercase text-text-tertiary">Détails de reprise</summary>
+                <pre className="mt-3 max-h-96 overflow-auto border border-border bg-surface p-3 text-xs">
+                  {resumePacket ? JSON.stringify(resumePacket, null, 2) : "Chargement…"}
                 </pre>
-              </section>
+              </details>
             </div>
           )}
         </main>
