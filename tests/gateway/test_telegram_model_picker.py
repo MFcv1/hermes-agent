@@ -169,6 +169,36 @@ class TestTelegramModelPicker:
         assert "12345" not in adapter._model_picker_state
 
     @pytest.mark.asyncio
+    async def test_callback_router_dispatches_reasoning_selection_to_review(self):
+        adapter = _make_adapter()
+        adapter._model_picker_state["12345"] = {
+            "on_model_selected": AsyncMock(),
+            "selected_provider": "openai-codex",
+            "selected_provider_name": "OpenAI Codex",
+            "selected_model": "gpt-5.6-sol",
+            "reasoning_options": [
+                ("Low", "low"),
+                ("Medium", "medium"),
+                ("High", "high"),
+            ],
+        }
+
+        query = AsyncMock()
+        query.data = "mr:1"
+        query.message = MagicMock()
+        query.message.chat_id = 12345
+        query.from_user = MagicMock()
+        query.answer = AsyncMock()
+        query.edit_message_text = AsyncMock()
+        update = SimpleNamespace(callback_query=query)
+
+        await adapter._handle_callback_query(update, None)
+
+        assert adapter._model_picker_state["12345"]["selected_reasoning"] == "medium"
+        assert "Review model switch" in query.edit_message_text.call_args[1]["text"]
+        query.answer.assert_awaited_once_with()
+
+    @pytest.mark.asyncio
     async def test_provider_group_folds_and_drills_down(self, monkeypatch):
         """A provider family (e.g. MiniMax) collapses to one mpg: button at
         the top level; tapping it expands to its authenticated members as

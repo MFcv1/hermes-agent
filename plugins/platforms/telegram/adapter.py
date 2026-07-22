@@ -4198,7 +4198,9 @@ class TelegramAdapter(BasePlatformAdapter):
             return
 
         # --- Model picker callbacks ---
-        if data.startswith(("mp:", "mpg:", "mm:", "mc:", "mb", "mx", "mg:")):
+        if data in {"mb", "mx", "mrr", "mrm", "ma"} or data.startswith(
+            ("mp:", "mpg:", "mm:", "mc:", "mr:", "mg:")
+        ):
             chat_id = str(query.message.chat_id) if query.message else None
             if chat_id:
                 await self._handle_model_picker_callback(query, data, chat_id)
