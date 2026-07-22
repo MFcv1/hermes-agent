@@ -72,7 +72,7 @@ def _current_override(path: Path) -> dict[str, Any]:
     out: dict[str, Any] = {"path": str(path), "exists": path.exists()}
     if path.exists():
         try:
-            out["content"] = path.read_text()
+            out["content"] = path.read_text(encoding="utf-8")
         except Exception as exc:
             out["error"] = str(exc)
     return out

@@ -87,7 +87,7 @@ def _read_update_cache(hermes_home: Path) -> dict[str, Any]:
     if not path.exists():
         return out
     try:
-        data = json.loads(path.read_text())
+        data = json.loads(path.read_text(encoding="utf-8"))
     except Exception as exc:
         out["error"] = str(exc)
         return out

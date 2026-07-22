@@ -113,7 +113,7 @@ def memory_summary() -> dict[str, Any]:
     if not meminfo.exists():
         return {}
     data: dict[str, int] = {}
-    for line in meminfo.read_text().splitlines():
+    for line in meminfo.read_text(encoding="utf-8").splitlines():
         key, _, rest = line.partition(":")
         value = rest.strip().split()[0] if rest.strip() else "0"
         if value.isdigit():
