@@ -16,12 +16,9 @@ spec.loader.exec_module(vps_write_roots_audit)
 def test_collect_write_roots_warns_for_nested_roots_without_blocking(tmp_path, monkeypatch):
     hermes_home = tmp_path / ".hermes"
     hermes_agent = hermes_home / "hermes-agent"
-    repo = tmp_path / "repo-cockpit"
-    workspaces = repo / "workspaces"
-    data = repo / "data"
-    for path in (hermes_agent, workspaces / "MFcv1__repo", data):
+    work_sessions = hermes_home / "work-sessions"
+    for path in (hermes_agent, work_sessions / "ws_123"):
         path.mkdir(parents=True)
-    (data / "cockpit.sqlite").write_text("db")
     owner = vps_write_roots_audit._owner(tmp_path)
     monkeypatch.delenv("HERMES_WRITE_SAFE_ROOT", raising=False)
 
@@ -29,9 +26,7 @@ def test_collect_write_roots_warns_for_nested_roots_without_blocking(tmp_path, m
         {
             "hermes_home": str(hermes_home),
             "hermes_agent": str(hermes_agent),
-            "repo_cockpit": str(repo),
-            "repo_workspaces": str(workspaces),
-            "repo_data": str(data),
+            "work_sessions": str(work_sessions),
         },
         expected_owner=owner,
     )
@@ -39,8 +34,7 @@ def test_collect_write_roots_warns_for_nested_roots_without_blocking(tmp_path, m
     assert report["status"] == "warn"
     assert not report["issues"]
     assert any("nested roots" in warning for warning in report["warnings"])
-    assert report["roots"]["repo_workspaces"]["workspace_count"] == 1
-    assert report["roots"]["repo_data"]["db_files"] == ["cockpit.sqlite"]
+    assert report["roots"]["work_sessions"]["session_count"] == 1
     assert report["write_root_policy"]["recommended_export"].startswith(
         "HERMES_WRITE_SAFE_ROOTS="
     )
@@ -50,23 +44,18 @@ def test_collect_write_roots_warns_for_nested_roots_without_blocking(tmp_path, m
 def test_collect_write_roots_accepts_explicit_multi_root_policy(tmp_path, monkeypatch):
     hermes_home = tmp_path / ".hermes"
     hermes_agent = hermes_home / "hermes-agent"
-    repo = tmp_path / "repo-cockpit"
-    workspaces = repo / "workspaces"
-    data = repo / "data"
-    for path in (hermes_agent, workspaces / "MFcv1__repo", data):
+    work_sessions = hermes_home / "work-sessions"
+    for path in (hermes_agent, work_sessions / "ws_123"):
         path.mkdir(parents=True)
-    (data / "cockpit.sqlite").write_text("db")
     owner = vps_write_roots_audit._owner(tmp_path)
-    monkeypatch.setenv("HERMES_WRITE_SAFE_ROOTS", f"{hermes_home}:{repo}")
+    monkeypatch.setenv("HERMES_WRITE_SAFE_ROOTS", str(hermes_home))
     monkeypatch.delenv("HERMES_WRITE_SAFE_ROOT", raising=False)
 
     report = vps_write_roots_audit.collect_write_roots(
         {
             "hermes_home": str(hermes_home),
             "hermes_agent": str(hermes_agent),
-            "repo_cockpit": str(repo),
-            "repo_workspaces": str(workspaces),
-            "repo_data": str(data),
+            "work_sessions": str(work_sessions),
         },
         expected_owner=owner,
     )
@@ -74,7 +63,6 @@ def test_collect_write_roots_accepts_explicit_multi_root_policy(tmp_path, monkey
     assert report["write_root_policy"]["env_name"] == "HERMES_WRITE_SAFE_ROOTS"
     assert report["write_root_policy"]["covered"] == {
         "hermes_home": True,
-        "repo_cockpit": True,
     }
     assert not any("write-safe roots" in warning for warning in report["warnings"])
     assert any("configured write-safe roots cover" in item for item in report["ok"])

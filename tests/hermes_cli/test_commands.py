@@ -117,6 +117,22 @@ class TestResolveCommand:
         assert topic.name == "topic"
         assert "topic" in GATEWAY_KNOWN_COMMANDS
 
+    def test_app_is_gateway_command(self):
+        app = resolve_command("app")
+        assert app is not None
+        assert app.name == "app"
+        assert resolve_command("miniapp").name == "app"
+        assert "app" in GATEWAY_KNOWN_COMMANDS
+        assert "miniapp" in GATEWAY_KNOWN_COMMANDS
+
+    def test_dashboard_is_gateway_command(self):
+        dashboard = resolve_command("dashboard")
+        assert dashboard is not None
+        assert dashboard.name == "dashboard"
+        assert resolve_command("dash").name == "dashboard"
+        assert "dashboard" in GATEWAY_KNOWN_COMMANDS
+        assert "dash" in GATEWAY_KNOWN_COMMANDS
+
     def test_leading_slash_stripped(self):
         assert resolve_command("/help").name == "help"
         assert resolve_command("/bg").name == "background"
@@ -259,6 +275,15 @@ class TestTelegramBotCommands:
         assert "codex_runtime" in names
         assert "codex-runtime" not in names
 
+    def test_dashboard_command_is_exposed(self):
+        names = {name for name, _ in telegram_bot_commands()}
+        assert "dashboard" in names
+
+    def test_app_is_first_telegram_menu_entry(self):
+        """Telegram should suggest /app before similarly-prefixed /approve."""
+        menu, _ = telegram_menu_commands()
+        assert menu[0][0] == "app"
+
 
 class TestSlackSubcommandMap:
     def test_returns_dict(self):
@@ -319,6 +344,11 @@ class TestSlackNativeSlashes:
     def test_unique_names(self):
         names = [n for n, _d, _h in slack_native_slashes()]
         assert len(names) == len(set(names)), "duplicate Slack slash names"
+
+    def test_dashboard_is_via_hermes_only(self):
+        names = {n for n, _d, _h in slack_native_slashes()}
+        assert "dashboard" not in names
+        assert "dashboard" in _SLACK_VIA_HERMES_ONLY
 
     def test_includes_canonical_commands(self):
         names = {n for n, _d, _h in slack_native_slashes()}
@@ -1142,11 +1172,10 @@ class TestTelegramMenuCommands:
         assert len(names) == 30
         assert hidden > 0
         for name in (
-            "dev",
+            "app",
             "debug",
             "restart",
             "vps",
-            "watch",
             "updatecheck",
             "update",
             "verbose",

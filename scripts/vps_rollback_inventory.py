@@ -29,7 +29,7 @@ def _file_summary(snapshot: Path, *, limit: int = 80) -> dict[str, Any]:
     dbs = [
         str(p.relative_to(snapshot))
         for p in files
-        if p.suffix in {".db", ".sqlite"} or "state.db" in p.name or "cockpit.sqlite" in p.name
+        if p.suffix in {".db", ".sqlite"} or "state.db" in p.name
     ]
     return {
         "file_count": len(files),

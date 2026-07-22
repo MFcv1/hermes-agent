@@ -1247,33 +1247,6 @@ def profile_env(tmp_path, monkeypatch):
 
 ---
 
-## Autonomie V2 Roadmap
-
-Les phases Claude Fable / Autonomie V2 sont documentées dans des `.md` dédiés
-sous `docs/project/` et servent de source de reprise pour les agents :
-
-- `AUDIT-AUTONOMIE-V2.md` — plan directeur.
-- `docs/project/AUTONOMIE_V2_IMPLEMENTATION_STATUS.md` — état courant et ordre de reprise.
-- `docs/project/PHASE0_COMPLETION_REPORT.md` — Phase 0.
-- `docs/project/PHASE1_COMPLETION_REPORT.md` — Phase 1.
-- `docs/project/PHASE2_OBSERVATION_BUS_REPORT.md` — Phase 2.
-- `docs/project/PHASE3_WORKER_RUNTIME_ENGINE_REPORT.md` — Phase 3.
-- `docs/project/PHASE4_SELF_REPAIR_V2_REPORT.md` — Phase 4.
-- `docs/project/PHASE5_MEMORY_HANDOFF_STORE_REPORT.md` — Phase 5.
-- `docs/project/PHASE6_EVAL_HARNESS_REPORT.md` — Phase 6.
-- `docs/project/PHASE7_AUTONOMY_STATUS_UX_REPORT.md` — Phase 7.
-- `docs/project/RUNBOOK_REGISTRY_REPORT.md` — Quick win 9.
-- `docs/project/TELEMETRY_STORE_REPORT.md` — Quick win 11.
-- `docs/project/COST_DASHBOARD_REPORT.md` — Quick win 12.
-- `docs/project/SELFOPS_TELEMETRY_AUTONOMY_REPORT.md` — Quick win 13.
-- `docs/project/SELFOPS_ACTIONS_TELEMETRY_REPORT.md` — Quick win 14.
-- `docs/project/PRODUCT_OPS_CONTROL_REPORT.md` — product ops control : recommandations, approvals, coût 7j, rapport hebdo, sync Phase 1 VPS.
-- `docs/project/CURRENT_AUTONOMY_DEPLOYMENT_AUDIT_2026-07-09.md` — état situationnel courant : synchro Mac/GitHub, commits VPS, providers prêts, profils deploy autonomes, risques restants.
-- `docs/project/CODEX_SUPERVISOR_MODE_PLAN.md` — plan du mode superviseur Codex -> Telegram/CUA -> Hermes, avec vérification Cockpit, GitHub et hosting.
-
-Avant de poursuivre une phase, relire le rapport dédié et les contrats
-normatifs dans `docs/brain/03-implementation-contracts.md`.
-
 ## Testing
 
 **ALWAYS use `scripts/run_tests.sh`** — do not call `pytest` directly. The script enforces

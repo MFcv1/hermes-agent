@@ -18,11 +18,8 @@ from typing import Any
 
 DEFAULT_USER = "hermes"
 DEFAULT_GATEWAY_UNIT = "hermes-gateway.service"
-DEFAULT_REPO_UNIT = "hermes-repo-cockpit.service"
-DEFAULT_SAFE_ROOTS = (
-    "/home/hermes/.hermes",
-    "/home/hermes/repo-cockpit",
-)
+DEFAULT_REPO_UNIT = "hermes-dashboard.service"
+DEFAULT_SAFE_ROOTS = ("/home/hermes/.hermes",)
 
 
 def _run(argv: list[str], *, timeout: float = 5) -> dict[str, Any]:
@@ -75,7 +72,7 @@ def _current_override(path: Path) -> dict[str, Any]:
     out: dict[str, Any] = {"path": str(path), "exists": path.exists()}
     if path.exists():
         try:
-            out["content"] = path.read_text()
+            out["content"] = path.read_text(encoding="utf-8")
         except Exception as exc:
             out["error"] = str(exc)
     return out

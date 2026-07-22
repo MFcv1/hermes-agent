@@ -31,7 +31,7 @@ def test_format_report_includes_reboot_ports_and_findings():
             "reboot_required": {"required": True, "packages": ["libc6"]},
             "disk": {"free_gb": 9.2, "used_percent": 61.0},
             "memory": {"mem_available_mib": 366, "swap_free_mib": 1996},
-            "ports": {"80": True, "443": True, "8765": True, "8789": False},
+            "ports": {"80": True, "443": True, "8765": True, "9119": True},
             "issues": [],
             "warnings": ["OS reports a pending reboot"],
             "ok": ["SQLite DB integrity checks passed"],
@@ -40,5 +40,5 @@ def test_format_report_includes_reboot_ports_and_findings():
 
     assert "Hermes VPS reboot readiness: WARN" in text
     assert "Reboot: required (libc6)" in text
-    assert "Ports: 80=on, 443=on, 8765=on, 8789=off" in text
+    assert "Ports: 80=on, 443=on, 8765=on, 9119=on" in text
     assert "- OS reports a pending reboot" in text

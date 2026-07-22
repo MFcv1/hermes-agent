@@ -26,7 +26,7 @@ import { Button } from "@nous-research/ui/ui/components/button";
 import { Typography } from "@nous-research/ui/ui/components/typography/index";
 import { HERMES_BASE_PATH, buildWsAuthParam } from "@/lib/api";
 import { cn } from "@/lib/utils";
-import { Copy, PanelRight, RotateCcw, X } from "lucide-react";
+import { Copy, MessageCircle, PanelRight, RotateCcw, X } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { useSearchParams } from "react-router-dom";
@@ -72,6 +72,22 @@ function generateChannelId(scope?: string): string {
   return `${prefix}-${Math.random().toString(36).slice(2)}-${Date.now().toString(
     36,
   )}`;
+}
+
+function isTelegramMiniApp(): boolean {
+  return (
+    typeof window !== "undefined" &&
+    Boolean(window.Telegram?.WebApp?.sendData)
+  );
+}
+
+function sendTelegramAction(payload: Record<string, unknown>): boolean {
+  const webApp = window.Telegram?.WebApp;
+  if (!webApp?.sendData) return false;
+  webApp.sendData(JSON.stringify(payload));
+  // Let Telegram complete sendData before it closes the Mini App. Calling
+  // close synchronously can discard the native bridge payload on Desktop.
+  return true;
 }
 
 // Colors for the terminal body.  Matches the dashboard's dark teal canvas
@@ -320,30 +336,57 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
       setEnd(null);
       return;
     }
-    if (!narrow) {
+    const telegramMiniApp = isTelegramMiniApp();
+    const canResumeInTelegram = telegramMiniApp && Boolean(resumeParam);
+    if (!narrow && !canResumeInTelegram) {
       setEnd(null);
       return;
     }
     setEnd(
-      <Button
-        ghost
-        onClick={() => setMobilePanelOpenRaw(true)}
-        aria-expanded={mobilePanelOpen}
-        aria-controls="chat-side-panel"
-        className={cn(
-          "shrink-0 rounded border border-current/20",
-          "px-2 py-1 text-xs font-medium tracking-wide",
-          "text-text-secondary hover:text-midground hover:bg-midground/5",
+      <div className="flex items-center gap-1.5">
+        {canResumeInTelegram && (
+          <Button
+            ghost
+            onClick={() =>
+              sendTelegramAction({
+                action: "session.resume",
+                session_id: resumeParam,
+              })
+            }
+            className={cn(
+              "shrink-0 rounded border border-current/20",
+              "px-2 py-1 text-xs font-medium tracking-wide",
+              "text-text-secondary hover:text-midground hover:bg-midground/5",
+            )}
+          >
+            <span className="inline-flex items-center gap-1.5">
+              <MessageCircle className="h-3 w-3 shrink-0" />
+              Telegram
+            </span>
+          </Button>
         )}
-      >
-        <span className="inline-flex items-center gap-1.5">
-          <PanelRight className="h-3 w-3 shrink-0" />
-          {modelToolsLabel}
-        </span>
-      </Button>,
+        {narrow && (
+          <Button
+            ghost
+            onClick={() => setMobilePanelOpenRaw(true)}
+            aria-expanded={mobilePanelOpen}
+            aria-controls="chat-side-panel"
+            className={cn(
+              "shrink-0 rounded border border-current/20",
+              "px-2 py-1 text-xs font-medium tracking-wide",
+              "text-text-secondary hover:text-midground hover:bg-midground/5",
+            )}
+          >
+            <span className="inline-flex items-center gap-1.5">
+              <PanelRight className="h-3 w-3 shrink-0" />
+              {modelToolsLabel}
+            </span>
+          </Button>
+        )}
+      </div>,
     );
     return () => setEnd(null);
-  }, [isActive, narrow, mobilePanelOpen, modelToolsLabel, setEnd]);
+  }, [isActive, narrow, mobilePanelOpen, modelToolsLabel, resumeParam, setEnd]);
 
   const handleCopyLast = () => {
     const ws = wsRef.current;

@@ -13,11 +13,11 @@ from pathlib import Path
 from typing import Any
 
 
-DEFAULT_UNITS = ("hermes-gateway.service", "hermes-repo-cockpit.service")
-DEFAULT_DISABLED_UNITS = ("hermes-repo-cockpit-worker-queued-plan.timer",)
+DEFAULT_UNITS = ("hermes-gateway.service", "hermes-dashboard.service")
+DEFAULT_DISABLED_UNITS: tuple[str, ...] = ()
 DEFAULT_DBS = (
     "/home/hermes/.hermes/state.db",
-    "/home/hermes/repo-cockpit/data/cockpit.sqlite",
+    "/home/hermes/.hermes/work_sessions.db",
 )
 
 
@@ -113,7 +113,7 @@ def memory_summary() -> dict[str, Any]:
     if not meminfo.exists():
         return {}
     data: dict[str, int] = {}
-    for line in meminfo.read_text().splitlines():
+    for line in meminfo.read_text(encoding="utf-8").splitlines():
         key, _, rest = line.partition(":")
         value = rest.strip().split()[0] if rest.strip() else "0"
         if value.isdigit():
@@ -196,10 +196,10 @@ def collect_readiness(
         "80": ":80 " in ports_text,
         "443": ":443 " in ports_text,
         "8765": "127.0.0.1:8765" in ports_text,
-        "8789": "127.0.0.1:8789" in ports_text,
+        "9119": "127.0.0.1:9119" in ports_text,
     }
-    if report["ports"]["80"] and report["ports"]["443"] and report["ports"]["8765"] and not report["ports"]["8789"]:
-        report["ok"].append("expected ports are listening and 8789 is off")
+    if report["ports"]["80"] and report["ports"]["443"] and report["ports"]["8765"] and report["ports"]["9119"]:
+        report["ok"].append("expected gateway and dashboard ports are listening")
     else:
         report["issues"].append("port state does not match expected reboot baseline")
 

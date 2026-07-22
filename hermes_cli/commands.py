@@ -67,10 +67,10 @@ COMMAND_REGISTRY: list[CommandDef] = [
                gateway_only=True),
     CommandDef("new", "Start a new session (fresh session ID + history)", "Session",
                aliases=("reset",), args_hint="[name]"),
-    CommandDef("libre", "Soft-close active repo work and return to natural orchestration chat", "Session",
-               aliases=("reset-libre", "chatlibre"), args_hint="[watch]", gateway_only=True),
-    CommandDef("dev", "Simple developer cockpit: projects, GitHub, deploy, ops", "Session",
-               gateway_only=True),
+    CommandDef("app", "Open the Telegram Mini App for repos and work sessions", "Session",
+               aliases=("miniapp",), gateway_only=True),
+    CommandDef("dashboard", "Open the Hermes dashboard", "Session",
+               aliases=("dash",), gateway_only=True),
     CommandDef("topic", "Enable or inspect Telegram DM topic sessions", "Session",
                gateway_only=True, args_hint="[off|help|session-id]"),
     CommandDef("clear", "Clear screen and start a new session", "Session",
@@ -194,10 +194,6 @@ COMMAND_REGISTRY: list[CommandDef] = [
                subcommands=("accept", "dismiss", "catalog", "clear")),
     CommandDef("blueprint", "Set up an automation from a blueprint template",
                "Tools & Skills", aliases=("bp",), args_hint="[name] [slot=value ...]"),
-    CommandDef("watch", "Manage simple release and VPS watchers",
-               "Tools & Skills", gateway_only=True,
-               args_hint="[releases owner/repo|vps|list|remove id]",
-               subcommands=("releases", "vps", "list", "remove")),
     CommandDef("jobs", "List and manage scheduled jobs from Telegram",
                "Tools & Skills", gateway_only=True,
                args_hint="[list|pause|resume|remove] [id]",
@@ -555,7 +551,11 @@ def telegram_bot_commands() -> list[tuple[str, str]]:
 
 
 _TELEGRAM_MENU_PRIORITY = (
-    # Most-typed everyday commands first.
+    # Product entry points first. Telegram preselects the first matching
+    # BotCommand while the user types, so /app must beat /approve for "/ap".
+    "app",
+    "dashboard",
+    # Most-typed everyday commands next.
     "help",
     "dev",
     "new",
@@ -1089,7 +1089,14 @@ _SLACK_PRIORITY_ALIASES = ("btw", "bg")
 #   - credits: the billing/top-up surface; reached via /hermes credits on Slack.
 #   - billing: the terminal-billing surface (buy/auto-reload/limit); /hermes billing.
 #   - debug: the log/report upload surface; reached via /hermes debug on Slack.
-_SLACK_VIA_HERMES_ONLY = frozenset({"credits", "billing", "debug"})
+#   - app/dashboard: dashboard launchers; reached via /hermes on Slack.
+#   - platform/update/updatecheck/version/vps: low-frequency operator commands
+#     that became visible after the legacy Telegram commands were
+#     removed; they remain reachable through /hermes on Slack.
+_SLACK_VIA_HERMES_ONLY = frozenset({
+    "credits", "billing", "debug", "app", "dashboard",
+    "platform", "update", "updatecheck", "version", "vps",
+})
 
 
 def _sanitize_slack_name(raw: str) -> str:

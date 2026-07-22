@@ -30,6 +30,12 @@ class _ParseModeProxy:
 
         return getattr(telegram_mod.ParseMode, "HTML", "HTML")
 
+    @property
+    def MARKDOWN_V2(self) -> str:
+        from gateway.platforms import telegram as telegram_mod
+
+        return getattr(telegram_mod.ParseMode, "MARKDOWN_V2", "MarkdownV2")
+
 
 ParseMode = _ParseModeProxy()
 
@@ -43,6 +49,7 @@ class TelegramModelPickerMixin:
         current_provider: str,
         session_key: str,
         on_model_selected,
+        current_reasoning: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
         """Send an interactive inline-keyboard model picker.
@@ -99,6 +106,7 @@ class TelegramModelPickerMixin:
                 "on_model_selected": on_model_selected,
                 "current_model": current_model,
                 "current_provider": current_provider,
+                "current_reasoning": current_reasoning,
             }
 
             return SendResult(success=True, message_id=str(msg.message_id))
@@ -199,10 +207,116 @@ class TelegramModelPickerMixin:
         page_info = f" ({start + 1}–{end} of {total})" if total_pages > 1 else ""
         return InlineKeyboardMarkup(rows), page_info
 
+    @staticmethod
+    def _reasoning_label(effort: Optional[str]) -> str:
+        return {
+            "low": "Low",
+            "medium": "Medium",
+            "high": "High",
+            "xhigh": "Extra High",
+            "max": "Ultra",
+        }.get(str(effort or "").lower(), "Automatic")
+
+    async def _show_model_reasoning_step(self, query, state: dict, model_id: str) -> None:
+        from gateway.telegram_model_quick_picks import reasoning_levels_for_model
+
+        provider_slug = state.get("selected_provider", "")
+        # GitHub capability discovery may consult its authenticated live
+        # catalog; keep that network-bound lookup off Telegram's event loop.
+        options = await asyncio.to_thread(
+            reasoning_levels_for_model, provider_slug, model_id
+        )
+        state["selected_model"] = model_id
+        state["reasoning_options"] = options
+
+        if not options:
+            state["selected_reasoning"] = None
+            await self._show_model_review(query, state)
+            return
+
+        rows = []
+        buttons = [
+            InlineKeyboardButton(label, callback_data=f"mr:{idx}")
+            for idx, (label, _effort) in enumerate(options)
+        ]
+        rows.extend(buttons[i : i + 2] for i in range(0, len(buttons), 2))
+        rows.append([
+            InlineKeyboardButton("◀ Back", callback_data="mrm"),
+            InlineKeyboardButton("✗ Cancel", callback_data="mx"),
+        ])
+        await query.edit_message_text(
+            text=self.format_message(
+                f"⚙ *Model Configuration*\n\n"
+                f"Model: `{model_id}`\n\n"
+                "Select reasoning effort:"
+            ),
+            parse_mode=ParseMode.MARKDOWN_V2,
+            reply_markup=InlineKeyboardMarkup(rows),
+        )
+
+    async def _show_model_review(self, query, state: dict) -> None:
+        model_id = state.get("selected_model", "")
+        provider_name = state.get("selected_provider_name") or state.get("selected_provider", "")
+        effort = state.get("selected_reasoning")
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("✓ Apply", callback_data="ma")],
+            [
+                InlineKeyboardButton(
+                    "◀ Back",
+                    callback_data="mrr" if state.get("reasoning_options") else "mrm",
+                ),
+                InlineKeyboardButton("✗ Cancel", callback_data="mx"),
+            ],
+        ])
+        await query.edit_message_text(
+            text=self.format_message(
+                f"⚙ *Review model switch*\n\n"
+                f"Provider: *{provider_name}*\n"
+                f"Model: `{model_id}`\n"
+                f"Reasoning: *{self._reasoning_label(effort)}*\n\n"
+                "The current conversation and project will be preserved."
+            ),
+            parse_mode=ParseMode.MARKDOWN_V2,
+            reply_markup=keyboard,
+        )
+
+    async def _apply_model_picker_selection(self, query, state: dict, chat_id: str) -> None:
+        callback = state.get("on_model_selected")
+        if not callback:
+            await query.answer(text="Picker expired.")
+            return
+
+        switch_failed = False
+        try:
+            result_text = await callback(
+                chat_id,
+                state.get("selected_model", ""),
+                state.get("selected_provider", ""),
+                state.get("selected_reasoning"),
+            )
+        except Exception as exc:
+            logger.error("Model picker switch failed: %s", exc)
+            result_text = f"Error switching model: {exc}"
+            switch_failed = True
+
+        try:
+            await query.edit_message_text(
+                text=self.format_message(result_text),
+                parse_mode=ParseMode.MARKDOWN_V2,
+                reply_markup=None,
+            )
+        except Exception:
+            try:
+                await query.edit_message_text(text=result_text, parse_mode=None, reply_markup=None)
+            except Exception:
+                pass
+        await query.answer(text="Switch failed." if switch_failed else "Model switched!")
+        self._model_picker_state.pop(chat_id, None)
+
     async def _handle_model_picker_callback(
         self, query, data: str, chat_id: str
     ) -> None:
-        """Handle model picker inline keyboard callbacks (mp:/mm:/mc:/mb:/mx:/mg:)."""
+        """Handle provider → model → reasoning → review picker callbacks."""
         state = self._model_picker_state.get(chat_id)
         if not state:
             await query.answer(text="Picker expired — use /model again.")
@@ -288,7 +402,7 @@ class TelegramModelPickerMixin:
             await query.answer()
 
         elif data.startswith("mc:"):
-            # --- Expensive model confirmed: perform the switch ---
+            # --- Expensive model confirmed: continue to reasoning ---
             try:
                 idx = int(data[3:])
             except ValueError:
@@ -301,43 +415,11 @@ class TelegramModelPickerMixin:
                 return
 
             model_id = model_list[idx]
-            provider_slug = state.get("selected_provider", "")
-            callback = state.get("on_model_selected")
-
-            if not callback:
-                await query.answer(text="Picker expired.")
-                return
-
-            switch_failed = False
-            try:
-                result_text = await callback(chat_id, model_id, provider_slug)
-            except Exception as exc:
-                logger.error("Model picker switch failed: %s", exc)
-                result_text = f"Error switching model: {exc}"
-                switch_failed = True
-
-            try:
-                await query.edit_message_text(
-                    text=self.format_message(result_text),
-                    parse_mode=ParseMode.MARKDOWN_V2,
-                    reply_markup=None,
-                )
-            except Exception:
-                try:
-                    await query.edit_message_text(
-                        text=result_text,
-                        parse_mode=None,
-                        reply_markup=None,
-                    )
-                except Exception:
-                    pass
-            await query.answer(
-                text="Switch failed." if switch_failed else "Model switched!"
-            )
-            self._model_picker_state.pop(chat_id, None)
+            await self._show_model_reasoning_step(query, state, model_id)
+            await query.answer()
 
         elif data.startswith("mm:"):
-            # --- Model selected: perform the switch ---
+            # --- Model selected: validate cost, then choose reasoning ---
             try:
                 idx = int(data[3:])
             except ValueError:
@@ -351,11 +433,6 @@ class TelegramModelPickerMixin:
 
             model_id = model_list[idx]
             provider_slug = state.get("selected_provider", "")
-            callback = state.get("on_model_selected")
-
-            if not callback:
-                await query.answer(text="Picker expired.")
-                return
 
             try:
                 from hermes_cli.model_cost_guard import expensive_model_warning
@@ -387,37 +464,43 @@ class TelegramModelPickerMixin:
                 await query.answer(text="Confirm expensive model")
                 return
 
-            switch_failed = False
-            try:
-                result_text = await callback(chat_id, model_id, provider_slug)
-            except Exception as exc:
-                logger.error("Model picker switch failed: %s", exc)
-                result_text = f"Error switching model: {exc}"
-                switch_failed = True
+            await self._show_model_reasoning_step(query, state, model_id)
+            await query.answer()
 
-            # Edit message to show confirmation, remove buttons
+        elif data.startswith("mr:"):
             try:
-                await query.edit_message_text(
-                    text=self.format_message(result_text),
-                    parse_mode=ParseMode.MARKDOWN_V2,
-                    reply_markup=None,
-                )
-            except Exception:
-                # Markdown parse failure — retry as plain text
-                try:
-                    await query.edit_message_text(
-                        text=result_text,
-                        parse_mode=None,
-                        reply_markup=None,
-                    )
-                except Exception:
-                    pass
-            await query.answer(
-                text="Switch failed." if switch_failed else "Model switched!"
+                idx = int(data[3:])
+                _label, effort = state.get("reasoning_options", [])[idx]
+            except (ValueError, IndexError):
+                await query.answer(text="Invalid reasoning level.")
+                return
+            state["selected_reasoning"] = effort
+            await self._show_model_review(query, state)
+            await query.answer()
+
+        elif data == "mrr":
+            await self._show_model_reasoning_step(
+                query, state, state.get("selected_model", "")
             )
+            await query.answer()
 
-            # Clean up state
-            self._model_picker_state.pop(chat_id, None)
+        elif data == "mrm":
+            models = state.get("model_list", [])
+            page = state.get("model_page", 0)
+            keyboard, page_info = self._build_model_keyboard(models, page)
+            await query.edit_message_text(
+                text=self.format_message(
+                    f"⚙ *Model Configuration*\n\n"
+                    f"Provider: *{state.get('selected_provider_name', '')}*{page_info}\n"
+                    "Select a model:"
+                ),
+                parse_mode=ParseMode.MARKDOWN_V2,
+                reply_markup=keyboard,
+            )
+            await query.answer()
+
+        elif data == "ma":
+            await self._apply_model_picker_selection(query, state, chat_id)
 
         elif data.startswith("mpg:"):
             # --- Provider group selected: show member providers ---

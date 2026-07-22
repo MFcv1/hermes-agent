@@ -87,7 +87,7 @@ def _read_update_cache(hermes_home: Path) -> dict[str, Any]:
     if not path.exists():
         return out
     try:
-        data = json.loads(path.read_text())
+        data = json.loads(path.read_text(encoding="utf-8"))
     except Exception as exc:
         out["error"] = str(exc)
         return out
@@ -106,7 +106,7 @@ def _load_state(path: Path) -> dict[str, Any] | None:
     if not path.exists():
         return None
     try:
-        data = json.loads(path.read_text())
+        data = json.loads(path.read_text(encoding="utf-8"))
     except Exception:
         return None
     return data if isinstance(data, dict) else None
@@ -332,7 +332,7 @@ def _collect_services() -> dict[str, Any]:
     systemctl = shutil.which("systemctl")
     if systemctl:
         out["available"] = True
-        for unit in ("hermes-gateway.service", "hermes-repo-cockpit.service"):
+        for unit in ("hermes-gateway.service", "hermes-dashboard.service"):
             result = _run([systemctl, "--user", "is-active", unit], timeout=3)
             value = result.stdout.strip() or result.stderr.strip()
             out["units"][unit] = {
@@ -345,7 +345,7 @@ def _collect_services() -> dict[str, Any]:
     if ss:
         result = _run([ss, "-ltnp"], timeout=3)
         if result.returncode == 0:
-            out["ports"]["8789"] = "127.0.0.1:8789" in result.stdout
+            out["ports"]["9119"] = "127.0.0.1:9119" in result.stdout
             out["ports"]["8765"] = "127.0.0.1:8765" in result.stdout
     return out
 
@@ -513,10 +513,6 @@ def collect_updatecheck(
                 report["ok"].append(f"{unit} is active")
             elif state and "No medium found" not in state:
                 report["warnings"].append(f"{unit} state is {state!r}")
-    ports = services.get("ports", {})
-    if isinstance(ports, dict) and ports.get("8789"):
-        report["issues"].append("unexpected Repo Cockpit dev port 8789 is listening")
-
     if report["issues"]:
         report["status"] = "red"
     elif report["warnings"]:

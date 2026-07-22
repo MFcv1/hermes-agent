@@ -93,7 +93,7 @@ def collect_vps_overview(*, hermes_home: Path | None = None) -> dict[str, Any]:
     jobs = _jobs_summary(home)
     services = [
         _service_state("hermes-gateway"),
-        _service_state("hermes-repo-cockpit"),
+        _service_state("hermes-dashboard"),
     ]
     uptime = _run(["bash", "-lc", "uptime | sed 's/^ *//'"], timeout=4)
 

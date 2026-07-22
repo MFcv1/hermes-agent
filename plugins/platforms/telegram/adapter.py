@@ -16,13 +16,17 @@ import os
 import tempfile
 import html as _html
 import re
+import shlex
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Set, Any
 
 logger = logging.getLogger(__name__)
 
 try:
-    from telegram import Update, Bot, Message, InlineKeyboardButton, InlineKeyboardMarkup
+    from telegram import (
+        Update, Bot, Message, InlineKeyboardButton, InlineKeyboardMarkup,
+        KeyboardButton, ReplyKeyboardMarkup, WebAppInfo,
+    )
     try:
         from telegram import LinkPreviewOptions
     except ImportError:
@@ -43,8 +47,23 @@ except ImportError:
     Update = Any
     Bot = Any
     Message = Any
-    InlineKeyboardButton = Any
-    InlineKeyboardMarkup = Any
+    def _telegram_symbol(name: str):
+        """Resolve an SDK symbol lazily for partial/test Telegram installs."""
+        import telegram as telegram_module
+        return getattr(telegram_module, name)
+
+    def InlineKeyboardButton(*args, **kwargs):
+        return _telegram_symbol("InlineKeyboardButton")(*args, **kwargs)
+
+    def InlineKeyboardMarkup(*args, **kwargs):
+        return _telegram_symbol("InlineKeyboardMarkup")(*args, **kwargs)
+
+    def KeyboardButton(*args, **kwargs):
+        return _telegram_symbol("KeyboardButton")(*args, **kwargs)
+
+    def ReplyKeyboardMarkup(*args, **kwargs):
+        return _telegram_symbol("ReplyKeyboardMarkup")(*args, **kwargs)
+    WebAppInfo = None
     LinkPreviewOptions = None
     Application = Any
     CommandHandler = Any
@@ -52,8 +71,16 @@ except ImportError:
     TelegramMessageHandler = Any
     HTTPXRequest = Any
     filters = None
-    ParseMode = None
-    ChatType = None
+    class _TelegramConstantsProxy:
+        def __init__(self, name: str):
+            self._name = name
+
+        def __getattr__(self, attr: str):
+            from telegram import constants
+            return getattr(getattr(constants, self._name), attr)
+
+    ParseMode = _TelegramConstantsProxy("ParseMode")
+    ChatType = _TelegramConstantsProxy("ChatType")
 
     # Mock ContextTypes so type annotations using ContextTypes.DEFAULT_TYPE
     # don't crash during class definition when the library isn't installed.
@@ -84,6 +111,7 @@ from gateway.platforms.base import (
     _TEXT_INJECT_EXTENSIONS,
     utf16_len,
 )
+from gateway.telegram_model_picker_mixin import TelegramModelPickerMixin
 from plugins.platforms.telegram.telegram_network import (
     TelegramFallbackTransport,
     discover_fallback_ips,
@@ -120,7 +148,7 @@ def check_telegram_requirements() -> bool:
     so the adapter's class-level type aliases get rebound.
     """
     global TELEGRAM_AVAILABLE, Update, Bot, Message, InlineKeyboardButton
-    global InlineKeyboardMarkup, LinkPreviewOptions, Application
+    global InlineKeyboardMarkup, KeyboardButton, ReplyKeyboardMarkup, WebAppInfo, LinkPreviewOptions, Application
     global CommandHandler, CallbackQueryHandler, TelegramMessageHandler
     global ContextTypes, filters, ParseMode, ChatType, HTTPXRequest
     if TELEGRAM_AVAILABLE:
@@ -132,7 +160,10 @@ def check_telegram_requirements() -> bool:
         return False
     try:
         from telegram import Update as _Update, Bot as _Bot, Message as _Message
-        from telegram import InlineKeyboardButton as _IKB, InlineKeyboardMarkup as _IKM
+        from telegram import (
+            InlineKeyboardButton as _IKB, InlineKeyboardMarkup as _IKM,
+            KeyboardButton as _KB, ReplyKeyboardMarkup as _RKM, WebAppInfo as _WAI,
+        )
         try:
             from telegram import LinkPreviewOptions as _LPO
         except ImportError:
@@ -152,6 +183,9 @@ def check_telegram_requirements() -> bool:
     Message = _Message
     InlineKeyboardButton = _IKB
     InlineKeyboardMarkup = _IKM
+    KeyboardButton = _KB
+    ReplyKeyboardMarkup = _RKM
+    WebAppInfo = _WAI
     LinkPreviewOptions = _LPO
     Application = _App
     CommandHandler = _CH
@@ -548,6 +582,9 @@ class TelegramAdapter(BasePlatformAdapter):
         self._dm_topics: Dict[str, int] = {}
         # Track forum chats where we've already registered bot commands
         self._forum_command_registered: set[int] = set()
+        # Private chats inherit the shared private-chat command menu. Clear
+        # legacy per-chat scopes once so stale ordering cannot mask /app.
+        self._private_command_scope_cleared: set[int] = set()
         # Lock per la registrazione sicura dei comandi nei forum supergroup
         self._forum_lock = asyncio.Lock()
         # Status indicator: when enabled, the bot's short description (the line
@@ -2210,6 +2247,12 @@ class TelegramAdapter(BasePlatformAdapter):
                 filters.TEXT & ~filters.COMMAND,
                 self._handle_text_message
             ))
+            web_app_data_filter = getattr(getattr(filters, "StatusUpdate", None), "WEB_APP_DATA", None)
+            if web_app_data_filter is not None:
+                self._app.add_handler(TelegramMessageHandler(
+                    web_app_data_filter,
+                    self._handle_web_app_data,
+                ))
             self._app.add_handler(TelegramMessageHandler(
                 filters.COMMAND,
                 self._handle_command
@@ -3769,10 +3812,27 @@ class TelegramAdapter(BasePlatformAdapter):
         page_info = f" ({start + 1}–{end} of {total})" if total_pages > 1 else ""
         return InlineKeyboardMarkup(rows), page_info
 
+    _reasoning_label = staticmethod(TelegramModelPickerMixin._reasoning_label)
+
+    async def _show_model_reasoning_step(self, query, state: dict, model_id: str) -> None:
+        await TelegramModelPickerMixin._show_model_reasoning_step(self, query, state, model_id)
+
+    async def _show_model_review(self, query, state: dict) -> None:
+        await TelegramModelPickerMixin._show_model_review(self, query, state)
+
+    async def _apply_model_picker_selection(self, query, state: dict, chat_id: str) -> None:
+        await TelegramModelPickerMixin._apply_model_picker_selection(self, query, state, chat_id)
+
     async def _handle_model_picker_callback(
         self, query, data: str, chat_id: str
     ) -> None:
-        """Handle model picker inline keyboard callbacks (mp:/mm:/mc:/mb:/mx:/mg:)."""
+        """Use the shared provider → model → reasoning → review workflow."""
+        return await TelegramModelPickerMixin._handle_model_picker_callback(
+            self, query, data, chat_id
+        )
+
+        # Legacy local branches remain temporarily for compatibility with
+        # downstream forks; the shared workflow above is the active path.
         state = self._model_picker_state.get(chat_id)
         if not state:
             await query.answer(text="Picker expired — use /model again.")
@@ -6062,18 +6122,29 @@ class TelegramAdapter(BasePlatformAdapter):
         return self._message_matches_mention_patterns(message)
 
     async def _ensure_forum_commands(self, message) -> None:
-        """Lazy-register bot commands for forum supergroups.
+        """Maintain chat-specific command scopes where Telegram requires them.
 
         Forum topics don't inherit AllGroupChats scope — Telegram resolves
         via BotCommandScopeChat(chat_id).  Register on first message so the
-        command menu works in topic views.
+        command menu works in topic views. Private chats remove legacy
+        per-chat scopes so they inherit the current AllPrivateChats menu.
         """
         async with self._forum_lock:
             try:
                 chat = getattr(message, "chat", None)
-                if not chat or not getattr(chat, "is_forum", False):
+                if not chat:
                     return
                 chat_id = int(chat.id)
+                if getattr(chat, "type", None) == "private":
+                    if chat_id in self._private_command_scope_cleared:
+                        return
+                    from telegram import BotCommandScopeChat
+                    await self._bot.delete_my_commands(scope=BotCommandScopeChat(chat_id=chat_id))
+                    self._private_command_scope_cleared.add(chat_id)
+                    logger.info("[%s] Cleared legacy command scope for private chat %s", self.name, chat_id)
+                    return
+                if not getattr(chat, "is_forum", False):
+                    return
                 if chat_id in self._forum_command_registered:
                     return
                 from telegram import BotCommand, BotCommandScopeChat
@@ -6117,6 +6188,177 @@ class TelegramAdapter(BasePlatformAdapter):
         await self._cache_replied_media(msg, event)
         event = self._apply_telegram_group_observe_attribution(event)
         self._enqueue_text_event(event)
+
+    async def _reset_current_work_session_chat(
+        self,
+        msg: Message,
+        *,
+        update_id: Optional[int] = None,
+    ) -> tuple[Optional[str], Optional[str]]:
+        """Synchronously start and resolve the chat linked to a Work Session."""
+        event = self._build_message_event(msg, MessageType.TEXT, update_id=update_id)
+        event.text = "/new"
+        event._trusted_destructive_slash = True  # type: ignore[attr-defined]
+        event._discard_empty_previous_session = True  # type: ignore[attr-defined]
+        event = self._apply_telegram_group_observe_attribution(event)
+
+        handler = getattr(self, "_message_handler", None)
+        if handler is not None:
+            try:
+                await handler(event)
+            except Exception:
+                logger.warning("[%s] Mini App session reset failed", self.name, exc_info=True)
+
+        store = getattr(self, "_session_store", None)
+        source = getattr(event, "source", None)
+        if store is None or source is None:
+            return None, None
+        try:
+            entry = store.get_or_create_session(source)
+            return getattr(entry, "session_id", None), getattr(entry, "session_key", None)
+        except Exception:
+            logger.debug("[%s] Could not resolve Mini App Hermes session id", self.name, exc_info=True)
+            return None, None
+
+    async def _handle_web_app_data(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Handle explicit resume/create actions from the private Mini App."""
+        msg = self._effective_update_message(update)
+        if not msg or not self._should_process_message(msg):
+            return
+        raw_data = getattr(getattr(msg, "web_app_data", None), "data", "")
+        try:
+            payload = json.loads(raw_data)
+        except (TypeError, ValueError):
+            await msg.reply_text("Action Mini App illisible.")
+            return
+        if not isinstance(payload, dict):
+            await msg.reply_text("Action Mini App invalide.")
+            return
+
+        action = str(payload.get("action") or "").strip().lower()
+
+        async def dispatch(command: str) -> None:
+            event = self._build_message_event(msg, MessageType.COMMAND, update_id=update.update_id)
+            event.text = command
+            event._telegram_message = msg  # type: ignore[attr-defined]
+            event = self._apply_telegram_group_observe_attribution(event)
+            await self.handle_message(event)
+
+        if action == "session.resume":
+            session_id = str(payload.get("session_id") or "").strip()
+            if not session_id:
+                await msg.reply_text("Session Hermes introuvable.")
+                return
+            await dispatch(f"/resume {shlex.quote(session_id)}")
+            return
+
+        if action not in {"work_session.create", "work_session.resume", "work_session.delete"}:
+            await msg.reply_text("Action Mini App inconnue.")
+            return
+
+        # Worker sessions are deliberately stored separately from chat
+        # transcripts. The linked Hermes session is resumed through the
+        # existing /resume command, preserving one normal Telegram thread.
+        from work_sessions import WorkSessionStore
+
+        try:
+            with WorkSessionStore() as store:
+                if action == "work_session.create":
+                    repo = str(payload.get("repo") or "").strip() or None
+                    objective = str(payload.get("objective") or "").strip() or None
+                    title = str(payload.get("title") or objective or repo or "Nouvelle session").strip()
+                    session = store.create_session(
+                        title=title,
+                        workflow="dashboard",
+                        origin_channel="telegram",
+                        repo=repo,
+                        objective=objective,
+                        metadata={
+                            "telegram_user_id": str(getattr(getattr(msg, "from_user", None), "id", "")),
+                            "telegram_chat_id": str(getattr(msg, "chat_id", "")),
+                        },
+                    )
+                    hermes_session_id, gateway_session_key = await self._reset_current_work_session_chat(
+                        msg,
+                        update_id=update.update_id,
+                    )
+                    if hermes_session_id or gateway_session_key:
+                        store.update_session(
+                            session["id"],
+                            hermes_session_id=hermes_session_id,
+                            gateway_session_key=gateway_session_key,
+                            status="active",
+                        )
+                    await msg.reply_text(
+                        f"Worker session créée : {session['title']}\n"
+                        "Envoie maintenant ton brief dans ce chat."
+                    )
+                    return
+
+                work_session_id = str(payload.get("work_session_id") or "").strip()
+                session = store.get_session(work_session_id)
+                if not session:
+                    await msg.reply_text("Worker session introuvable.")
+                    return
+
+                if action == "work_session.delete":
+                    store.delete_session(work_session_id)
+                    await msg.reply_text(f"Worker session supprimée : {session['title']}")
+                    return
+
+                linked_session_id = str(session.get("hermes_session_id") or "").strip()
+                if linked_session_id:
+                    await dispatch(f"/resume {shlex.quote(linked_session_id)}")
+                else:
+                    prompt = store.resume_prompt(work_session_id)
+                    if not prompt:
+                        await msg.reply_text("Paquet de reprise introuvable.")
+                        return
+                    await dispatch(prompt)
+                store.add_event(
+                    work_session_id,
+                    "session.resumed",
+                    role="user",
+                    content="Resumed from Telegram Mini App.",
+                )
+                next_actions = session.get("next_actions") or []
+                next_lines = "\n".join(f"• {item}" for item in next_actions if str(item).strip())
+                await msg.reply_text(
+                    "📌 Worker session active\n\n"
+                    f"{session['title']}\n"
+                    f"Repo : {session.get('repo') or 'non défini'}\n\n"
+                    f"État : {session.get('current_state') or session.get('summary') or 'non défini'}"
+                    + (f"\n\nProchaines actions\n{next_lines}" if next_lines else "")
+                )
+        except Exception:
+            logger.warning("[%s] Worker-session Mini App action failed", self.name, exc_info=True)
+            await msg.reply_text("Action Worker Session impossible côté Hermes.")
+
+    async def send_hermes_mini_app_shortcut(self, chat_id: str) -> None:
+        """Send the reply-keyboard WebApp control required by Telegram Desktop."""
+        from gateway.dashboard_links import hermes_mini_app_url
+
+        dashboard_url = hermes_mini_app_url("/sessions")
+        if not dashboard_url:
+            await self.send(
+                chat_id,
+                "Mini App indisponible : configure `dashboard.public_url` avec l'URL HTTPS privée du dashboard.",
+            )
+            return
+        if not self._bot or WebAppInfo is None:
+            await self.send(chat_id, f"Ouvre Hermes Sessions :\n{dashboard_url}")
+            return
+        keyboard = ReplyKeyboardMarkup(
+            [[KeyboardButton("Ouvrir Hermes Mini App", web_app=WebAppInfo(url=dashboard_url))]],
+            resize_keyboard=True,
+            one_time_keyboard=True,
+        )
+        await self._bot.send_message(
+            chat_id=int(chat_id),
+            text="Hermes Mini App\n\nConsulte une conversation, puis utilise « Reprendre dans Telegram ».",
+            reply_markup=keyboard,
+            **self._link_preview_kwargs(),
+        )
 
     async def _handle_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle incoming command messages."""

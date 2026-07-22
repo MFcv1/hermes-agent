@@ -50,7 +50,7 @@ def _symbol_record(path: Path, node: ast.FunctionDef | ast.AsyncFunctionDef, *, 
 
 
 def inventory_file(path: Path) -> dict[str, Any]:
-    source = path.read_text(errors="ignore")
+    source = path.read_text(encoding="utf-8", errors="ignore")
     tree = ast.parse(source, filename=str(path))
     symbols: list[dict[str, Any]] = []
     for node in tree.body:
@@ -105,7 +105,7 @@ def main() -> int:
     text = json.dumps(inventory, indent=2, ensure_ascii=False) + "\n" if args.json else _format_text(inventory)
     if args.output:
         Path(args.output).parent.mkdir(parents=True, exist_ok=True)
-        Path(args.output).write_text(text)
+        Path(args.output).write_text(text, encoding="utf-8")
     else:
         print(text, end="")
     return 0
