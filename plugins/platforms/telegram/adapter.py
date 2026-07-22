@@ -3656,6 +3656,7 @@ class TelegramAdapter(BasePlatformAdapter):
         current_provider: str,
         session_key: str,
         on_model_selected,
+        current_reasoning: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
         """Send an interactive inline-keyboard model picker.
@@ -3712,6 +3713,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 "on_model_selected": on_model_selected,
                 "current_model": current_model,
                 "current_provider": current_provider,
+                "current_reasoning": current_reasoning,
             }
 
             return SendResult(success=True, message_id=str(msg.message_id))
