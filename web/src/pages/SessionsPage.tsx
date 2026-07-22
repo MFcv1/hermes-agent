@@ -76,23 +76,12 @@ const SOURCE_CONFIG: Record<string, { icon: typeof Terminal; color: string }> =
     cron: { icon: Clock, color: "text-warning" },
   };
 
-declare global {
-  interface Window {
-    Telegram?: {
-      WebApp?: {
-        ready?: () => void;
-        close?: () => void;
-        sendData?: (data: string) => void;
-        openLink?: (url: string) => void;
-      };
-    };
-  }
-}
-
 function isTelegramMiniApp(): boolean {
-  return (
-    typeof window !== "undefined" &&
-    Boolean(window.Telegram?.WebApp?.sendData)
+  if (typeof window === "undefined") return false;
+  const webApp = window.Telegram?.WebApp;
+  return Boolean(
+    webApp?.sendData
+    && (webApp.initData || webApp.initDataUnsafe?.user?.id),
   );
 }
 

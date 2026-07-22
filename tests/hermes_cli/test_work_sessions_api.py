@@ -44,6 +44,13 @@ def test_work_sessions_api_create_resume_delete(tmp_path, monkeypatch):
 
     from hermes_cli import web_server
 
+    telegram_notifications = []
+
+    async def fake_resume_notification(session):
+        telegram_notifications.append(session["id"])
+
+    monkeypatch.setattr(web_server, "_send_work_session_resume_to_telegram", fake_resume_notification)
+
     previous_auth_required = getattr(web_server.app.state, "auth_required", None)
     web_server.app.state.auth_required = False
     client = TestClient(web_server.app)
@@ -57,6 +64,7 @@ def test_work_sessions_api_create_resume_delete(tmp_path, monkeypatch):
                 "origin_channel": "telegram",
                 "repo": "hermes-agent",
                 "objective": "Fix preview 502",
+                "metadata": {"telegram_chat_id": "12345"},
             },
         )
         assert created.status_code == 200
@@ -82,6 +90,11 @@ def test_work_sessions_api_create_resume_delete(tmp_path, monkeypatch):
         packet = client.get(f"/api/work-sessions/{session['id']}/resume-packet")
         assert packet.status_code == 200
         assert packet.json()["resume_packet"]["next_actions"] == ["check env", "redeploy"]
+
+        resumed = client.post(f"/api/work-sessions/{session['id']}/resume-in-telegram")
+        assert resumed.status_code == 200
+        assert resumed.json() == {"ok": True}
+        assert telegram_notifications == [session["id"]]
 
         deleted = client.delete(f"/api/work-sessions/{session['id']}")
         assert deleted.status_code == 200

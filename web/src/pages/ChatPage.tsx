@@ -75,9 +75,11 @@ function generateChannelId(scope?: string): string {
 }
 
 function isTelegramMiniApp(): boolean {
-  return (
-    typeof window !== "undefined" &&
-    Boolean(window.Telegram?.WebApp?.sendData)
+  if (typeof window === "undefined") return false;
+  const webApp = window.Telegram?.WebApp;
+  return Boolean(
+    webApp?.sendData
+    && (webApp.initData || webApp.initDataUnsafe?.user?.id),
   );
 }
 

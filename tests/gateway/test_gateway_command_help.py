@@ -61,6 +61,24 @@ async def test_app_command_prefers_dashboard_public_url(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_app_command_uses_native_telegram_mini_app_button(monkeypatch):
+    monkeypatch.setenv("HERMES_DASHBOARD_PUBLIC_URL", "https://hermes.tailnet.ts.net")
+    sent = []
+
+    class TelegramAdapter:
+        async def send_hermes_mini_app_shortcut(self, chat_id):
+            sent.append(chat_id)
+
+    runner = _make_runner()
+    runner.adapters = {Platform.TELEGRAM: TelegramAdapter()}
+
+    result = await runner._handle_app_command(_make_event("/app", Platform.TELEGRAM))
+
+    assert result == ""
+    assert sent == ["chat-1"]
+
+
+@pytest.mark.asyncio
 async def test_dashboard_command_uses_configured_public_url(monkeypatch):
     monkeypatch.setattr("gateway.dashboard_links.time.time", lambda: 1234)
     monkeypatch.setenv("HERMES_DASHBOARD_PUBLIC_URL", "https://hermes.example.com")
