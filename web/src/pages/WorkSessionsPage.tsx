@@ -28,7 +28,6 @@ interface WorkSession {
   origin_channel: string;
   repo?: string | null;
   provider?: string | null;
-  cockpit_task_id?: string | null;
   hermes_session_id?: string | null;
   gateway_session_key?: string | null;
   git_branch?: string | null;
@@ -224,7 +223,7 @@ export default function WorkSessionsPage() {
       action: "work_session.create",
       title: cleanTitle,
       repo: repoForCreation,
-      workflow: "libre",
+      workflow: "dashboard",
       origin_channel: telegram ? "telegram" : "dashboard",
       objective: objective.trim() || undefined,
       project_mode: projectMode,

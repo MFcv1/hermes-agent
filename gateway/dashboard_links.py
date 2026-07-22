@@ -26,28 +26,20 @@ def build_url(base: str, path: str = "/", **params: str | None) -> str:
 
 
 def hermes_mini_app_url(path: str = "/work-sessions", **params: str | None) -> str:
-    """Return the Hermes dashboard-backed Mini App URL.
-
-    Production should set ``dashboard.public_url`` on the VPS.  Until then,
-    fall back to the legacy Repo Cockpit webapp URL so Telegram keeps offering
-    a usable button during migration.
-    """
-    from gateway.repo_cockpit_client import cockpit_webapp_url
+    """Return the operator-configured Hermes Mini App URL."""
     from hermes_cli.dashboard_auth.prefix import resolve_public_url
 
     public_url = resolve_public_url()
-    if public_url:
-        return build_url(public_url, path, **params)
-    return cockpit_webapp_url(path, **params)
+    if not public_url:
+        return ""
+    return build_url(public_url, path, **params)
 
 
 def hermes_dashboard_url(path: str = "/sessions", **params: str | None) -> str:
     """Return the operator-configured full browser dashboard URL.
 
-    Unlike :func:`hermes_mini_app_url`, this helper deliberately has no
-    Repo Cockpit fallback: ``/dashboard`` must never present the Mini App as
-    if it were the full VPS dashboard.  An empty result tells the caller to
-    offer the private SSH-tunnel instructions instead.
+    An empty result tells the caller to offer private access instructions
+    instead of linking to an unrelated service.
     """
     from hermes_cli.dashboard_auth.prefix import resolve_public_url
 

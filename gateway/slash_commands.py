@@ -66,6 +66,11 @@ class GatewaySlashCommandsMixin:
         from gateway.dashboard_links import hermes_mini_app_url
 
         url = hermes_mini_app_url("/work-sessions")
+        if not url:
+            return (
+                "Mini App indisponible : configure `dashboard.public_url` "
+                "avec l'URL HTTPS privée du dashboard."
+            )
         if event.source and event.source.platform == Platform.TELEGRAM:
             return (
                 "Ouvre la Mini App Hermes ici :\n"
@@ -516,7 +521,7 @@ class GatewaySlashCommandsMixin:
             except Exception:
                 db_total_tokens = 0
 
-        # Resolve model/context for cockpit-style status. Prefer the live or
+        # Resolve model/context for the compact gateway status. Prefer the live or
         # cached agent because it carries the actual runtime route and context
         # compressor. Fall back to persisted SessionDB metadata plus the
         # SessionStore's last_prompt_tokens so /status remains useful between

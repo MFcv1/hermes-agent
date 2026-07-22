@@ -1,1 +1,0 @@
-{"category":"test_regression","injection":"simulated repair breaks a green test","expected":{"outcome":"worsened","rollback":true}}

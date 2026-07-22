@@ -37,15 +37,15 @@ def test_start_is_known_gateway_command():
 
 
 @pytest.mark.asyncio
-async def test_app_command_points_to_sessions_mini_app(monkeypatch):
-    monkeypatch.setenv("REPO_COCKPIT_URL", "https://cockpit.example/")
+async def test_app_command_requires_dashboard_public_url(monkeypatch):
+    monkeypatch.delenv("HERMES_DASHBOARD_PUBLIC_URL", raising=False)
 
     result = await _make_runner()._handle_app_command(
         _make_event("/app", Platform.TELEGRAM)
     )
 
-    assert "Mini App Hermes" in result
-    assert "https://cockpit.example/work-sessions?" in result
+    assert "Mini App indisponible" in result
+    assert "dashboard.public_url" in result
 
 
 @pytest.mark.asyncio

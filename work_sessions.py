@@ -1,9 +1,8 @@
-"""Persistent work-session store for Hermes/Codex workflows.
+"""Persistent work-session store for the Hermes Dashboard workflow.
 
-Work sessions are task-level records that sit above a chat transcript.  They
-bind a repo, workflow, Cockpit task, branch/PR, artifacts, and a compact resume
-packet so Telegram/Cockpit/Desktop clients can resume real work without relying
-on a long raw chat history.
+Work sessions are task-level records that sit above a chat transcript. They
+bind a repository, branch/PR, artifacts, and a compact resume packet so the
+Dashboard and Telegram can resume work without replaying a long raw history.
 """
 
 from __future__ import annotations
@@ -20,16 +19,8 @@ from hermes_constants import get_hermes_home
 
 
 _STATUSES = {"open", "active", "blocked", "done", "failed", "archived", "deleted"}
-_WORKFLOWS = {
-    "supervisor",
-    "pilote",
-    "autopilot",
-    "ask_review",
-    "libre",
-    "debug",
-    "deploy",
-}
-_CHANNELS = {"codex", "telegram", "cockpit", "cli", "dashboard", "api"}
+_WORKFLOWS = {"dashboard"}
+_CHANNELS = {"codex", "telegram", "cli", "dashboard", "api"}
 
 
 def _now() -> float:
@@ -89,11 +80,10 @@ class WorkSessionStore:
                 id TEXT PRIMARY KEY,
                 title TEXT NOT NULL,
                 status TEXT NOT NULL DEFAULT 'open',
-                workflow TEXT NOT NULL DEFAULT 'libre',
+                workflow TEXT NOT NULL DEFAULT 'dashboard',
                 origin_channel TEXT NOT NULL DEFAULT 'telegram',
                 repo TEXT,
                 provider TEXT,
-                cockpit_task_id TEXT,
                 hermes_session_id TEXT,
                 gateway_session_key TEXT,
                 git_branch TEXT,
@@ -122,9 +112,6 @@ class WorkSessionStore:
                 ON work_sessions(workflow);
             CREATE INDEX IF NOT EXISTS idx_work_sessions_origin
                 ON work_sessions(origin_channel);
-            CREATE INDEX IF NOT EXISTS idx_work_sessions_task
-                ON work_sessions(cockpit_task_id);
-
             CREATE TABLE IF NOT EXISTS work_session_events (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 work_session_id TEXT NOT NULL REFERENCES work_sessions(id) ON DELETE CASCADE,
@@ -150,6 +137,16 @@ class WorkSessionStore:
                 ON work_session_artifacts(work_session_id, created_at DESC);
             """
         )
+        columns = {
+            str(row[1])
+            for row in self._conn.execute("PRAGMA table_info(work_sessions)").fetchall()
+        }
+        if "cockpit_task_id" in columns:
+            self._conn.execute("DROP INDEX IF EXISTS idx_work_sessions_task")
+            self._conn.execute("ALTER TABLE work_sessions DROP COLUMN cockpit_task_id")
+        self._conn.execute(
+            "UPDATE work_sessions SET workflow = 'dashboard' WHERE workflow != 'dashboard'"
+        )
         self._conn.commit()
 
     def _row_to_dict(self, row: sqlite3.Row | None) -> dict[str, Any] | None:
@@ -164,18 +161,17 @@ class WorkSessionStore:
         self,
         *,
         title: str,
-        workflow: str = "libre",
+        workflow: str = "dashboard",
         origin_channel: str = "telegram",
         repo: str | None = None,
         provider: str | None = None,
-        cockpit_task_id: str | None = None,
         hermes_session_id: str | None = None,
         gateway_session_key: str | None = None,
         objective: str | None = None,
         metadata: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         work_session_id = new_work_session_id()
-        workflow = workflow if workflow in _WORKFLOWS else "libre"
+        workflow = workflow if workflow in _WORKFLOWS else "dashboard"
         origin_channel = origin_channel if origin_channel in _CHANNELS else "api"
         now = _now()
         clean_title = _clean(title, 180) or _clean(objective, 180) or "Nouvelle session"
@@ -185,9 +181,9 @@ class WorkSessionStore:
             """
             INSERT INTO work_sessions (
                 id, title, status, workflow, origin_channel, repo, provider,
-                cockpit_task_id, hermes_session_id, gateway_session_key,
+                hermes_session_id, gateway_session_key,
                 objective, metadata_json, created_at, updated_at
-            ) VALUES (?, ?, 'open', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, 'open', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 work_session_id,
@@ -196,7 +192,6 @@ class WorkSessionStore:
                 origin_channel,
                 _clean(repo, 260) or None,
                 _clean(provider, 120) or None,
-                _clean(cockpit_task_id, 120) or None,
                 _clean(hermes_session_id, 160) or None,
                 _clean(gateway_session_key, 260) or None,
                 _clean(objective, 4000) or None,
@@ -279,7 +274,7 @@ class WorkSessionStore:
     def update_session(self, work_session_id: str, **fields: Any) -> dict[str, Any] | None:
         allowed = {
             "title", "status", "workflow", "origin_channel", "repo", "provider",
-            "cockpit_task_id", "hermes_session_id", "gateway_session_key",
+            "hermes_session_id", "gateway_session_key",
             "git_branch", "pr_url", "preview_url", "live_url", "brief_path",
             "report_path", "screenshots_dir", "objective", "summary",
             "current_state",
@@ -316,11 +311,6 @@ class WorkSessionStore:
         )
         self._conn.commit()
         return self.get_session(work_session_id)
-
-    def attach_cockpit_task(self, work_session_id: str, task_id: str) -> dict[str, Any] | None:
-        session = self.update_session(work_session_id, cockpit_task_id=task_id)
-        self.add_event(work_session_id, "cockpit.task.attached", content=_clean(task_id, 120))
-        return session
 
     def add_event(
         self,
@@ -428,7 +418,6 @@ class WorkSessionStore:
             "origin_channel": session.get("origin_channel"),
             "repo": session.get("repo"),
             "provider": session.get("provider"),
-            "cockpit_task_id": session.get("cockpit_task_id"),
             "hermes_session_id": session.get("hermes_session_id"),
             "gateway_session_key": session.get("gateway_session_key"),
             "git_branch": session.get("git_branch"),

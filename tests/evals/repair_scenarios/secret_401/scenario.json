@@ -1,1 +1,0 @@
-{"category":"auth_failure","injection":"fake 401 API response","expected":{"repair":false,"decision":"ask_human"}}

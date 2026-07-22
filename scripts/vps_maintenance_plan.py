@@ -18,11 +18,8 @@ from typing import Any
 
 DEFAULT_USER = "hermes"
 DEFAULT_GATEWAY_UNIT = "hermes-gateway.service"
-DEFAULT_REPO_UNIT = "hermes-repo-cockpit.service"
-DEFAULT_SAFE_ROOTS = (
-    "/home/hermes/.hermes",
-    "/home/hermes/repo-cockpit",
-)
+DEFAULT_REPO_UNIT = "hermes-dashboard.service"
+DEFAULT_SAFE_ROOTS = ("/home/hermes/.hermes",)
 
 
 def _run(argv: list[str], *, timeout: float = 5) -> dict[str, Any]:

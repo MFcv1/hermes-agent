@@ -7237,11 +7237,10 @@ class BulkDeleteSessions(BaseModel):
 
 class WorkSessionCreate(BaseModel):
     title: Optional[str] = None
-    workflow: str = "libre"
+    workflow: str = "dashboard"
     origin_channel: str = "telegram"
     repo: Optional[str] = None
     provider: Optional[str] = None
-    cockpit_task_id: Optional[str] = None
     hermes_session_id: Optional[str] = None
     gateway_session_key: Optional[str] = None
     objective: Optional[str] = None
@@ -7256,7 +7255,6 @@ class WorkSessionUpdate(BaseModel):
     origin_channel: Optional[str] = None
     repo: Optional[str] = None
     provider: Optional[str] = None
-    cockpit_task_id: Optional[str] = None
     hermes_session_id: Optional[str] = None
     gateway_session_key: Optional[str] = None
     git_branch: Optional[str] = None
@@ -7444,7 +7442,6 @@ async def create_work_session(body: WorkSessionCreate):
             origin_channel=body.origin_channel,
             repo=body.repo,
             provider=body.provider,
-            cockpit_task_id=body.cockpit_task_id,
             hermes_session_id=body.hermes_session_id,
             gateway_session_key=body.gateway_session_key,
             objective=body.objective,

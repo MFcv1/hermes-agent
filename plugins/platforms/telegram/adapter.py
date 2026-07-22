@@ -47,10 +47,22 @@ except ImportError:
     Update = Any
     Bot = Any
     Message = Any
-    InlineKeyboardButton = Any
-    InlineKeyboardMarkup = Any
-    KeyboardButton = Any
-    ReplyKeyboardMarkup = Any
+    def _telegram_symbol(name: str):
+        """Resolve an SDK symbol lazily for partial/test Telegram installs."""
+        import telegram as telegram_module
+        return getattr(telegram_module, name)
+
+    def InlineKeyboardButton(*args, **kwargs):
+        return _telegram_symbol("InlineKeyboardButton")(*args, **kwargs)
+
+    def InlineKeyboardMarkup(*args, **kwargs):
+        return _telegram_symbol("InlineKeyboardMarkup")(*args, **kwargs)
+
+    def KeyboardButton(*args, **kwargs):
+        return _telegram_symbol("KeyboardButton")(*args, **kwargs)
+
+    def ReplyKeyboardMarkup(*args, **kwargs):
+        return _telegram_symbol("ReplyKeyboardMarkup")(*args, **kwargs)
     WebAppInfo = None
     LinkPreviewOptions = None
     Application = Any
@@ -59,8 +71,16 @@ except ImportError:
     TelegramMessageHandler = Any
     HTTPXRequest = Any
     filters = None
-    ParseMode = None
-    ChatType = None
+    class _TelegramConstantsProxy:
+        def __init__(self, name: str):
+            self._name = name
+
+        def __getattr__(self, attr: str):
+            from telegram import constants
+            return getattr(getattr(constants, self._name), attr)
+
+    ParseMode = _TelegramConstantsProxy("ParseMode")
+    ChatType = _TelegramConstantsProxy("ChatType")
 
     # Mock ContextTypes so type annotations using ContextTypes.DEFAULT_TYPE
     # don't crash during class definition when the library isn't installed.
@@ -6169,6 +6189,37 @@ class TelegramAdapter(BasePlatformAdapter):
         event = self._apply_telegram_group_observe_attribution(event)
         self._enqueue_text_event(event)
 
+    async def _reset_current_work_session_chat(
+        self,
+        msg: Message,
+        *,
+        update_id: Optional[int] = None,
+    ) -> tuple[Optional[str], Optional[str]]:
+        """Synchronously start and resolve the chat linked to a Work Session."""
+        event = self._build_message_event(msg, MessageType.TEXT, update_id=update_id)
+        event.text = "/new"
+        event._trusted_destructive_slash = True  # type: ignore[attr-defined]
+        event._discard_empty_previous_session = True  # type: ignore[attr-defined]
+        event = self._apply_telegram_group_observe_attribution(event)
+
+        handler = getattr(self, "_message_handler", None)
+        if handler is not None:
+            try:
+                await handler(event)
+            except Exception:
+                logger.warning("[%s] Mini App session reset failed", self.name, exc_info=True)
+
+        store = getattr(self, "_session_store", None)
+        source = getattr(event, "source", None)
+        if store is None or source is None:
+            return None, None
+        try:
+            entry = store.get_or_create_session(source)
+            return getattr(entry, "session_id", None), getattr(entry, "session_key", None)
+        except Exception:
+            logger.debug("[%s] Could not resolve Mini App Hermes session id", self.name, exc_info=True)
+            return None, None
+
     async def _handle_web_app_data(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle explicit resume/create actions from the private Mini App."""
         msg = self._effective_update_message(update)
@@ -6218,7 +6269,7 @@ class TelegramAdapter(BasePlatformAdapter):
                     title = str(payload.get("title") or objective or repo or "Nouvelle session").strip()
                     session = store.create_session(
                         title=title,
-                        workflow=str(payload.get("workflow") or "libre"),
+                        workflow="dashboard",
                         origin_channel="telegram",
                         repo=repo,
                         objective=objective,
@@ -6227,14 +6278,15 @@ class TelegramAdapter(BasePlatformAdapter):
                             "telegram_chat_id": str(getattr(msg, "chat_id", "")),
                         },
                     )
-                    await dispatch("/new")
-                    source = self._build_message_event(msg, MessageType.COMMAND, update_id=update.update_id).source
-                    entry = self._session_store.get_or_create_session(source) if source else None
-                    if entry:
+                    hermes_session_id, gateway_session_key = await self._reset_current_work_session_chat(
+                        msg,
+                        update_id=update.update_id,
+                    )
+                    if hermes_session_id or gateway_session_key:
                         store.update_session(
                             session["id"],
-                            hermes_session_id=getattr(entry, "session_id", None),
-                            gateway_session_key=getattr(entry, "session_key", None),
+                            hermes_session_id=hermes_session_id,
+                            gateway_session_key=gateway_session_key,
                             status="active",
                         )
                     await msg.reply_text(

@@ -25,7 +25,7 @@ def test_collect_plan_generates_write_safe_root_override(tmp_path, monkeypatch):
     )
     assert plan["expected_override_content"] == (
         "[Service]\n"
-        "Environment=HERMES_WRITE_SAFE_ROOTS=/home/hermes/.hermes:/home/hermes/repo-cockpit\n"
+        "Environment=HERMES_WRITE_SAFE_ROOTS=/home/hermes/.hermes\n"
     )
     assert any("vps_ops_preflight.py" in cmd for cmd in plan["apply_commands"])
     assert any("systemctl --user restart hermes-gateway.service" in cmd for cmd in plan["apply_commands"])
@@ -47,7 +47,7 @@ def test_collect_plan_detects_existing_matching_override(tmp_path, monkeypatch):
     override.parent.mkdir(parents=True)
     override.write_text(
         "[Service]\n"
-        "Environment=HERMES_WRITE_SAFE_ROOTS=/home/hermes/.hermes:/home/hermes/repo-cockpit\n"
+        "Environment=HERMES_WRITE_SAFE_ROOTS=/home/hermes/.hermes\n"
     )
 
     plan = vps_maintenance_plan.collect_plan()

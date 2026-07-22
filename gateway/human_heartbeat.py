@@ -32,7 +32,7 @@ class HumanHeartbeat:
 
 @dataclass(frozen=True)
 class AgentProgressView:
-    """Central user-facing progress model for chat and Repo Cockpit runs."""
+    """Central user-facing progress model for gateway runs."""
 
     elapsed_seconds: int
     phase_key: str = "analyse"
@@ -46,29 +46,6 @@ class AgentProgressView:
     repo: Optional[str] = None
     preview_url: Optional[str] = None
     severity: str = "working"
-
-
-_REPO_COCKPIT_PHASES: dict[str, tuple[str, str, str, int]] = {
-    "queued_plan": ("analyse", "Analyse", "je prepare le contexte et les garde-fous.", 1),
-    "running_quota": ("analyse", "Analyse", "je verifie les quotas avant de lancer une phase lourde.", 1),
-    "running_triage": ("analyse", "Analyse", "je classe la demande et les risques.", 1),
-    "running_plan": ("plan", "Plan", "je construis le plan d'execution.", 2),
-    "plan_ready": ("plan", "Plan", "le plan est pret pour la suite.", 2),
-    "waiting_plan_approval": ("waiting_approval", "Attente validation", "j'attends ta validation avant de continuer.", 2),
-    "running_gpt55": ("implementation", "Implementation", "j'implemente le plan dans le projet.", 3),
-    "running_review_remediation": ("implementation", "Implementation", "je corrige les points detectes par la review.", 3),
-    "running_tests": ("tests", "Tests", "je lance les controles et je verifie le comportement.", 4),
-    "blocked_tests": ("tests", "Tests", "les tests bloquent; je garde le diagnostic visible.", 4),
-    "running_independent_review": ("audit", "Audit", "je fais une review independante du resultat.", 5),
-    "running_pr": ("audit", "Audit", "je prepare la PR et les gates de validation.", 5),
-    "running_deploy_preview": ("deploy", "Deploy", "je deploie une preview testable.", 6),
-    "deployed_preview": ("deploy", "Deploy", "la preview est prete; je verifie le dernier etat.", 6),
-    "blocked_deploy": ("deploy", "Deploy", "le deploiement bloque; je garde la cause visible.", 6),
-    "blocked_smoke": ("deploy", "Deploy", "la preview existe mais le smoke test bloque.", 6),
-    "blocked_quota": ("quota", "Pause quota", "quota trop bas; j'ecris la reprise avant d'arreter.", 0),
-}
-
-_PHASE_TOTAL = 6
 
 
 def format_elapsed(seconds: int) -> str:
@@ -133,27 +110,6 @@ def classify_agent_status(activity: Optional[Mapping[str, object]]) -> tuple[str
     return "Analyse", "je traite ta demande."
 
 
-def classify_repo_cockpit_status(status: Optional[str], current_phase: Optional[str] = None) -> tuple[str, str, str, Optional[int], str]:
-    """Map Repo Cockpit task statuses to human phases."""
-
-    candidates = [str(status or "").strip(), str(current_phase or "").strip()]
-    for value in candidates:
-        if not value:
-            continue
-        mapped = _REPO_COCKPIT_PHASES.get(value)
-        if mapped:
-            key, label, sentence, step = mapped
-            severity = "blocked" if value.startswith("blocked") else "working"
-            if value == "deployed_preview":
-                severity = "success"
-            if value == "blocked_quota":
-                severity = "warning"
-            return key, label, sentence, step or None, severity
-        if value.startswith("blocked_"):
-            return "action_required", "Action requise", "une action ou une configuration bloque la suite.", None, "blocked"
-    return "analyse", "Analyse", "je lis l'etat de la tache.", 1, "working"
-
-
 def _safe_str(value: object, limit: int = 120) -> Optional[str]:
     text = str(value or "").strip()
     if not text:
@@ -178,38 +134,6 @@ def progress_from_activity(
         state_sentence=state,
         model_label=clean_model_label(model),
         mode=_safe_str(mode, 40),
-        severity=severity,
-    )
-
-
-def progress_from_autonomy(data: Optional[Mapping[str, object]], *, elapsed_seconds: int = 0) -> AgentProgressView:
-    payload: Mapping[str, object] = data or {}
-    raw_task = payload.get("task") if isinstance(payload, Mapping) else {}
-    task: Mapping[str, object] = raw_task if isinstance(raw_task, Mapping) else payload
-    status = _safe_str(task.get("status"))
-    current_phase = _safe_str(task.get("current_phase") or task.get("phase"))
-    phase_key, phase_label, sentence, step_current, severity = classify_repo_cockpit_status(status, current_phase)
-    preview = task.get("preview_url") or task.get("deployment_url")
-    model = (
-        task.get("model")
-        or task.get("model_label")
-        or task.get("active_model")
-        or task.get("plan_model")
-        or payload.get("model")
-        or payload.get("active_model")
-    )
-    return AgentProgressView(
-        elapsed_seconds=elapsed_seconds,
-        phase_key=phase_key,
-        phase_label=phase_label,
-        state_sentence=sentence,
-        mode=_safe_str(task.get("mode"), 40),
-        model_label=clean_model_label(_safe_str(model, 80)),
-        step_current=step_current,
-        step_total=_PHASE_TOTAL if step_current else None,
-        task_id=_safe_str(task.get("id") or payload.get("task_id"), 80),
-        repo=_safe_str(task.get("repo"), 120),
-        preview_url=_safe_str(preview, 240),
         severity=severity,
     )
 

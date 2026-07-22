@@ -1091,7 +1091,7 @@ _SLACK_PRIORITY_ALIASES = ("btw", "bg")
 #   - debug: the log/report upload surface; reached via /hermes debug on Slack.
 #   - app/dashboard: dashboard launchers; reached via /hermes on Slack.
 #   - platform/update/updatecheck/version/vps: low-frequency operator commands
-#     that became visible after the legacy Telegram cockpit commands were
+#     that became visible after the legacy Telegram commands were
 #     removed; they remain reachable through /hermes on Slack.
 _SLACK_VIA_HERMES_ONLY = frozenset({
     "credits", "billing", "debug", "app", "dashboard",

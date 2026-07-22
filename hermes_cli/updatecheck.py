@@ -332,7 +332,7 @@ def _collect_services() -> dict[str, Any]:
     systemctl = shutil.which("systemctl")
     if systemctl:
         out["available"] = True
-        for unit in ("hermes-gateway.service", "hermes-repo-cockpit.service"):
+        for unit in ("hermes-gateway.service", "hermes-dashboard.service"):
             result = _run([systemctl, "--user", "is-active", unit], timeout=3)
             value = result.stdout.strip() or result.stderr.strip()
             out["units"][unit] = {
@@ -345,7 +345,7 @@ def _collect_services() -> dict[str, Any]:
     if ss:
         result = _run([ss, "-ltnp"], timeout=3)
         if result.returncode == 0:
-            out["ports"]["8789"] = "127.0.0.1:8789" in result.stdout
+            out["ports"]["9119"] = "127.0.0.1:9119" in result.stdout
             out["ports"]["8765"] = "127.0.0.1:8765" in result.stdout
     return out
 
@@ -513,10 +513,6 @@ def collect_updatecheck(
                 report["ok"].append(f"{unit} is active")
             elif state and "No medium found" not in state:
                 report["warnings"].append(f"{unit} state is {state!r}")
-    ports = services.get("ports", {})
-    if isinstance(ports, dict) and ports.get("8789"):
-        report["issues"].append("unexpected Repo Cockpit dev port 8789 is listening")
-
     if report["issues"]:
         report["status"] = "red"
     elif report["warnings"]:

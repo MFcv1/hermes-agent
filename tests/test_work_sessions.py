@@ -1,3 +1,5 @@
+import sqlite3
+
 from work_sessions import WorkSessionStore
 
 
@@ -6,18 +8,17 @@ def test_work_session_create_filter_resume_and_delete(tmp_path):
     with WorkSessionStore(hermes_home=home) as store:
         session = store.create_session(
             title="Fix deploy preview",
-            workflow="supervisor",
+            workflow="dashboard",
             origin_channel="telegram",
             repo="hermes-agent",
             provider="cloudflare",
-            cockpit_task_id="op_123",
             objective="Fix the 502 preview deploy",
             metadata={"telegram_user_id": "42"},
         )
 
         assert session["id"].startswith("ws_")
         assert session["repo"] == "hermes-agent"
-        assert session["workflow"] == "supervisor"
+        assert session["workflow"] == "dashboard"
         assert session["metadata"]["telegram_user_id"] == "42"
 
         store.update_session(
@@ -105,3 +106,57 @@ def test_get_by_hermes_session_id_returns_linked_session(tmp_path):
         assert linked is not None
         assert linked["id"] == session["id"]
         assert store.get_by_hermes_session_id("missing") is None
+
+
+def test_migration_removes_legacy_cockpit_column_and_workflow(tmp_path):
+    db_path = tmp_path / "work_sessions.db"
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            """
+            CREATE TABLE work_sessions (
+                id TEXT PRIMARY KEY,
+                title TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'open',
+                workflow TEXT NOT NULL DEFAULT 'libre',
+                origin_channel TEXT NOT NULL DEFAULT 'telegram',
+                repo TEXT,
+                provider TEXT,
+                cockpit_task_id TEXT,
+                hermes_session_id TEXT,
+                gateway_session_key TEXT,
+                git_branch TEXT,
+                pr_url TEXT,
+                preview_url TEXT,
+                live_url TEXT,
+                brief_path TEXT,
+                report_path TEXT,
+                screenshots_dir TEXT,
+                objective TEXT,
+                summary TEXT,
+                current_state TEXT,
+                next_actions_json TEXT NOT NULL DEFAULT '[]',
+                metadata_json TEXT NOT NULL DEFAULT '{}',
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL,
+                closed_at REAL
+            )
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO work_sessions (
+                id, title, workflow, cockpit_task_id, created_at, updated_at
+            ) VALUES ('ws_legacy', 'Legacy session', 'pilote', 'op_123', 1, 1)
+            """
+        )
+
+    with WorkSessionStore(hermes_home=tmp_path, db_path=db_path) as store:
+        migrated = store.get_session("ws_legacy")
+        columns = {
+            row[1]
+            for row in store._conn.execute("PRAGMA table_info(work_sessions)").fetchall()
+        }
+
+    assert migrated is not None
+    assert migrated["workflow"] == "dashboard"
+    assert "cockpit_task_id" not in columns

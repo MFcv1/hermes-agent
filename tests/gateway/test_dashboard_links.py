@@ -18,14 +18,12 @@ def test_hermes_mini_app_uses_dashboard_public_url(monkeypatch):
     assert url == "https://hermes.tailnet.ts.net/work-sessions?v=1234"
 
 
-def test_hermes_mini_app_falls_back_to_repo_cockpit(monkeypatch):
+def test_hermes_mini_app_requires_dashboard_public_url(monkeypatch):
     monkeypatch.delenv("HERMES_DASHBOARD_PUBLIC_URL", raising=False)
-    monkeypatch.setenv("REPO_COCKPIT_URL", "https://cockpit.example/")
-    monkeypatch.setattr("gateway.repo_cockpit_client.time.time", lambda: 1234)
 
     url = hermes_mini_app_url("/work-sessions")
 
-    assert url == "https://cockpit.example/work-sessions?v=1234"
+    assert url == ""
 
 
 def test_hermes_dashboard_uses_public_url(monkeypatch):
@@ -37,6 +35,5 @@ def test_hermes_dashboard_uses_public_url(monkeypatch):
 
 def test_hermes_dashboard_has_no_mini_app_fallback(monkeypatch):
     monkeypatch.delenv("HERMES_DASHBOARD_PUBLIC_URL", raising=False)
-    monkeypatch.setenv("REPO_COCKPIT_URL", "https://cockpit.example/")
 
     assert hermes_dashboard_url() == ""

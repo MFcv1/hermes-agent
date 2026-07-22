@@ -53,7 +53,7 @@ def test_work_sessions_api_create_resume_delete(tmp_path, monkeypatch):
             "/api/work-sessions",
             json={
                 "title": "Fix deploy preview",
-                "workflow": "supervisor",
+                "workflow": "dashboard",
                 "origin_channel": "telegram",
                 "repo": "hermes-agent",
                 "objective": "Fix preview 502",
