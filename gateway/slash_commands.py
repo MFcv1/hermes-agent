@@ -112,6 +112,13 @@ class GatewaySlashCommandsMixin:
             "Configure `dashboard.public_url` pour publier un lien sécurisé."
         )
 
+    async def _handle_vps_command(self, event: MessageEvent) -> str:
+        """Show the read-only VPS desktop and organized Git projects."""
+        from hermes_cli.vps_status import collect_vps_overview, format_vps_projects_view
+
+        report = await asyncio.to_thread(collect_vps_overview)
+        return format_vps_projects_view(report)
+
     async def _handle_reset_command(self, event: MessageEvent) -> Union[str, EphemeralReply]:
         """Handle /new or /reset command."""
         source = event.source

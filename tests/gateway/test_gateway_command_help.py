@@ -87,6 +87,29 @@ async def test_dashboard_command_falls_back_to_private_tunnel_hint(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_vps_command_renders_project_inventory(monkeypatch):
+    monkeypatch.setattr(
+        "hermes_cli.vps_status.collect_vps_overview",
+        lambda: {
+            "disk": {"root": {"free_gb": 12.0, "used_percent": 52.0}},
+            "services": [],
+            "inventory": {
+                "system_repo": "/home/hermes/.hermes/hermes-agent",
+                "projects": [],
+                "unorganized": [],
+            },
+        },
+    )
+
+    result = await _make_runner()._handle_vps_command(
+        _make_event("/vps", Platform.TELEGRAM)
+    )
+
+    assert "VPS Hermes" in result
+    assert "Mes projets — 0" in result
+
+
+@pytest.mark.asyncio
 async def test_help_sanitizes_slash_command_mentions_for_telegram(monkeypatch):
     """Telegram help output must not expose invalid uppercase/hyphenated slashes."""
     monkeypatch.setattr(

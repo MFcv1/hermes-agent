@@ -241,7 +241,7 @@ COMMAND_REGISTRY: list[CommandDef] = [
                cli_only=True, aliases=("gateway",)),
     CommandDef("platform", "Pause, resume, or list a failing gateway platform", "Info",
                gateway_only=True, args_hint="<pause|resume|list> [name]"),
-    CommandDef("vps", "Show concise VPS, disk, cron, and service status", "Info",
+    CommandDef("vps", "Show the VPS system and cloned project folders", "Info",
                gateway_only=True, aliases=("vpsstatus",)),
     CommandDef("copy", "Copy the last assistant response to clipboard", "Info",
                cli_only=True, args_hint="[number]"),

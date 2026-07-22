@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
 import time
@@ -83,6 +84,103 @@ def _service_state(name: str) -> dict[str, Any]:
     }
 
 
+def _git_value(repo: Path, *args: str) -> str:
+    result = _run(["git", "-C", str(repo), *args], timeout=4)
+    return str(result.get("output") or "").strip() if result.get("ok") else ""
+
+
+def _remote_label(remote: str) -> str:
+    value = remote.strip().removesuffix(".git")
+    for prefix in ("https://github.com/", "http://github.com/", "git@github.com:"):
+        if value.startswith(prefix):
+            return value[len(prefix):]
+    return value
+
+
+def _git_repo_info(path: Path) -> dict[str, Any]:
+    branch = _git_value(path, "branch", "--show-current") or "detached"
+    remote = _git_value(path, "remote", "get-url", "origin")
+    dirty = bool(_git_value(path, "status", "--porcelain"))
+    return {
+        "name": path.name,
+        "path": str(path),
+        "branch": branch,
+        "remote": remote,
+        "remote_label": _remote_label(remote) if remote else "local only",
+        "dirty": dirty,
+        "state": "changes" if dirty else "ready",
+    }
+
+
+def _find_unorganized_repos(
+    user_home: Path,
+    *,
+    projects_root: Path,
+    system_repo: Path,
+) -> list[dict[str, Any]]:
+    """Find visible Git checkouts outside the system and projects roots.
+
+    The scan is deliberately shallow and prunes caches/dependencies so `/vps`
+    stays fast even on a long-lived server home directory.
+    """
+    ignored_top_level = {
+        ".cache", ".config", ".local", ".npm", ".pki", ".ssh",
+        ".supabase", ".hermes", "backups", projects_root.name,
+    }
+    ignored_nested = {
+        "node_modules", ".venv", "venv", "__pycache__", ".cache",
+    }
+    found: list[dict[str, Any]] = []
+    try:
+        children = sorted(user_home.iterdir(), key=lambda item: item.name.lower())
+    except OSError:
+        return found
+    for child in children:
+        if not child.is_dir() or child.name in ignored_top_level or child.name.startswith("."):
+            continue
+        for root, dirs, files in os.walk(child):
+            current = Path(root)
+            try:
+                depth = len(current.relative_to(child).parts)
+            except ValueError:
+                continue
+            if depth > 3:
+                dirs[:] = []
+                continue
+            if ".git" in dirs or ".git" in files:
+                if current != system_repo and not current.is_relative_to(projects_root):
+                    found.append(_git_repo_info(current))
+                dirs[:] = []
+                continue
+            dirs[:] = [name for name in dirs if name not in ignored_nested]
+    return found
+
+
+def _project_inventory(hermes_home: Path) -> dict[str, Any]:
+    user_home = hermes_home.parent
+    projects_root = user_home / "mes-projets"
+    system_repo = hermes_home / "hermes-agent"
+    projects: list[dict[str, Any]] = []
+    if projects_root.is_dir():
+        try:
+            candidates = sorted(projects_root.iterdir(), key=lambda item: item.name.lower())
+        except OSError:
+            candidates = []
+        for candidate in candidates:
+            if candidate.is_dir() and (candidate / ".git").exists():
+                projects.append(_git_repo_info(candidate))
+    return {
+        "root": str(projects_root),
+        "system_repo": str(system_repo),
+        "projects": projects,
+        "unorganized": _find_unorganized_repos(
+            user_home,
+            projects_root=projects_root,
+            system_repo=system_repo,
+        ),
+    }
+
+
 def collect_vps_overview(*, hermes_home: Path | None = None) -> dict[str, Any]:
     from hermes_constants import get_hermes_home
 
@@ -126,6 +224,7 @@ def collect_vps_overview(*, hermes_home: Path | None = None) -> dict[str, Any]:
         "uptime": uptime.get("output") or "",
         "issues": issues,
         "warnings": warnings,
+        "inventory": _project_inventory(home),
     }
 
 
@@ -182,3 +281,48 @@ def format_vps_overview_html(report: dict[str, Any]) -> str:
     return "<b>" + html.escape(lines[0]) + "</b>\n" + "\n".join(
         html.escape(line) for line in lines[1:]
     )
+
+
+def format_vps_projects_view(report: dict[str, Any]) -> str:
+    """Render the simple, read-only Telegram view of the VPS desktop."""
+    root_disk = ((report.get("disk") or {}).get("root") or {})
+    inventory = report.get("inventory") or {}
+    projects = inventory.get("projects") or []
+    unorganized = inventory.get("unorganized") or []
+    service_states = {
+        str(item.get("name") or "").removeprefix("hermes-"): str(item.get("state") or "unknown")
+        for item in report.get("services") or []
+    }
+
+    lines = [
+        "🖥 VPS Hermes",
+        (
+            f"Stockage : {root_disk.get('used_percent', '?')} % utilisé · "
+            f"{root_disk.get('free_gb', '?')} Go disponibles"
+        ),
+        "",
+        "⚙️ Système",
+        (
+            "└ Hermes Agent"
+            f" · Gateway {service_states.get('gateway', 'unknown')}"
+            f" · Dashboard {service_states.get('dashboard', 'unknown')}"
+        ),
+        f"  {inventory.get('system_repo', '?')}",
+        "",
+        f"📁 Mes projets — {len(projects)}",
+    ]
+    if not projects:
+        lines.append("└ Aucun projet cloné")
+    for index, project in enumerate(projects):
+        tree = "└" if index == len(projects) - 1 else "├"
+        state = "changements locaux" if project.get("dirty") else "prêt"
+        lines.extend([
+            f"{tree} {project.get('name', '?')} · {state}",
+            f"  GitHub : {project.get('remote_label', 'local only')}",
+            f"  Branche : {project.get('branch', '?')}",
+        ])
+
+    if unorganized:
+        lines.extend(["", "⚠️ Projets Git trouvés hors de mes-projets"])
+        lines.extend(f"- {item.get('path', '?')}" for item in unorganized)
+    return "\n".join(lines)

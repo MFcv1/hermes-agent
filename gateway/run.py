@@ -8183,6 +8183,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if canonical == "dashboard":
             return await self._handle_dashboard_command(event)
 
+        if canonical == "vps":
+            return await self._handle_vps_command(event)
+
         if canonical == "codex-runtime":
             return await self._handle_codex_runtime_command(event)
 
