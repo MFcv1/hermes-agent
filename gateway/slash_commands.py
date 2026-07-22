@@ -62,7 +62,7 @@ class GatewaySlashCommandsMixin:
         return getattr(adapter, "typed_command_prefix", "/") if adapter is not None else "/"
 
     async def _handle_app_command(self, event: MessageEvent) -> str:
-        """Handle /app when the platform did not render a native Mini App button."""
+        """Open the native Telegram Mini App, with a plain-link fallback."""
         from gateway.dashboard_links import hermes_mini_app_url
 
         url = hermes_mini_app_url("/work-sessions")
@@ -72,6 +72,11 @@ class GatewaySlashCommandsMixin:
                 "avec l'URL HTTPS privée du dashboard."
             )
         if event.source and event.source.platform == Platform.TELEGRAM:
+            adapter = self.adapters.get(Platform.TELEGRAM) if getattr(self, "adapters", None) else None
+            send_shortcut = getattr(adapter, "send_hermes_mini_app_shortcut", None)
+            if callable(send_shortcut):
+                await send_shortcut(event.source.chat_id)
+                return ""
             return (
                 "Ouvre la Mini App Hermes ici :\n"
                 f"{url}\n\n"

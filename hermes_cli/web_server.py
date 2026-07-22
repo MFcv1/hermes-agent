@@ -51,6 +51,7 @@ from hermes_cli.config import (
     clear_model_endpoint_credentials,
     get_config_path,
     get_env_path,
+    get_env_value,
     get_hermes_home,
     load_config,
     load_env,
@@ -7356,6 +7357,58 @@ def _open_work_session_store_for_profile(profile: Optional[str]):
     return WorkSessionStore(hermes_home=Path(home))
 
 
+def _work_session_telegram_chat_id(session: Dict[str, Any]) -> str:
+    metadata = session.get("metadata") or {}
+    if isinstance(metadata, dict):
+        chat_id = str(metadata.get("telegram_chat_id") or "").strip()
+        if re.fullmatch(r"-?\d+", chat_id):
+            return chat_id
+    gateway_key = str(session.get("gateway_session_key") or "")
+    match = re.search(r":telegram:(?:dm|group|channel):(-?\d+)(?::|$)", gateway_key)
+    return match.group(1) if match else ""
+
+
+async def _send_work_session_resume_to_telegram(session: Dict[str, Any]) -> None:
+    """Notify the linked Telegram chat with an authenticated resume button."""
+    chat_id = _work_session_telegram_chat_id(session)
+    if not chat_id:
+        raise HTTPException(
+            status_code=409,
+            detail="Cette session n'est liée à aucun chat Telegram. Ouvre-la depuis /app une première fois.",
+        )
+    token = str(get_env_value("TELEGRAM_BOT_TOKEN") or "").strip()
+    if not token:
+        raise HTTPException(status_code=503, detail="Le bot Telegram Hermes n'est pas configuré.")
+    callback_data = f"wsr:{session.get('id') or ''}"
+    if len(callback_data.encode("utf-8")) > 64:
+        raise HTTPException(status_code=400, detail="Identifiant de session trop long pour Telegram.")
+
+    try:
+        from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup
+
+        keyboard = InlineKeyboardMarkup([[
+            InlineKeyboardButton("Reprendre maintenant", callback_data=callback_data),
+        ]])
+        async with Bot(token=token) as bot:
+            await bot.send_message(
+                chat_id=int(chat_id),
+                text=(
+                    "Reprise demandée depuis le Dashboard Hermes\n\n"
+                    f"{session.get('title') or 'Session sans titre'}\n"
+                    f"Repo : {session.get('repo') or 'non défini'}"
+                ),
+                reply_markup=keyboard,
+            )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.warning("Telegram Work Session resume notification failed", exc_info=True)
+        raise HTTPException(
+            status_code=502,
+            detail="Impossible d'envoyer la demande de reprise à Telegram.",
+        ) from exc
+
+
 def _mini_app_public_api_enabled() -> bool:
     return cfg_get(load_config(), "dashboard", "mini_app_public_api", default=False) is True
 
@@ -7531,6 +7584,25 @@ async def get_work_session_resume_packet(work_session_id: str, profile: Optional
         if not packet:
             raise HTTPException(status_code=404, detail="Work session not found")
         return {"resume_packet": packet}
+    finally:
+        store.close()
+
+
+@app.post("/api/work-sessions/{work_session_id}/resume-in-telegram")
+async def resume_work_session_in_telegram(work_session_id: str, profile: Optional[str] = None):
+    store = _open_work_session_store_for_profile(profile)
+    try:
+        session = store.get_session(work_session_id)
+        if not session:
+            raise HTTPException(status_code=404, detail="Work session not found")
+        await _send_work_session_resume_to_telegram(session)
+        store.add_event(
+            work_session_id,
+            "telegram.resume_requested",
+            role="system",
+            content="Resume requested from the web dashboard.",
+        )
+        return {"ok": True}
     finally:
         store.close()
 

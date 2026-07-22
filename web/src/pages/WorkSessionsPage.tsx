@@ -66,19 +66,6 @@ interface ResumePacketResponse {
   resume_packet: Record<string, unknown>;
 }
 
-declare global {
-  interface Window {
-    Telegram?: {
-      WebApp?: {
-        ready?: () => void;
-        close?: () => void;
-        sendData?: (data: string) => void;
-        openLink?: (url: string) => void;
-      };
-    };
-  }
-}
-
 const STATUSES = ["", "open", "active", "blocked", "done", "failed", "archived"];
 const PROVIDERS = [
   { id: "cloudflare", label: "Cloudflare" },
@@ -86,7 +73,12 @@ const PROVIDERS = [
 ];
 
 function isTelegramMiniApp(): boolean {
-  return typeof window !== "undefined" && Boolean(window.Telegram?.WebApp?.sendData);
+  if (typeof window === "undefined") return false;
+  const webApp = window.Telegram?.WebApp;
+  return Boolean(
+    webApp?.sendData
+    && (webApp.initData || webApp.initDataUnsafe?.user?.id),
+  );
 }
 
 function sendTelegramAction(payload: Record<string, unknown>): boolean {
@@ -122,6 +114,7 @@ export default function WorkSessionsPage() {
   const [loading, setLoading] = useState(false);
   const [catalogLoading, setCatalogLoading] = useState(false);
   const [error, setError] = useState("");
+  const [notice, setNotice] = useState("");
   const [catalogError, setCatalogError] = useState("");
   const [repoFilter, setRepoFilter] = useState("");
   const [statusFilter, setStatusFilter] = useState("");
@@ -262,8 +255,20 @@ export default function WorkSessionsPage() {
     window.location.assign(url.toString());
   }
 
-  function resumeInTelegram(session: WorkSession) {
-    sendTelegramAction({ action: "work_session.resume", work_session_id: session.id });
+  async function resumeInTelegram(session: WorkSession) {
+    setError("");
+    setNotice("");
+    if (telegram && sendTelegramAction({ action: "work_session.resume", work_session_id: session.id })) {
+      return;
+    }
+    try {
+      await fetchJSON(`/api/work-sessions/${encodeURIComponent(session.id)}/resume-in-telegram`, {
+        method: "POST",
+      });
+      setNotice("Demande envoyée dans Telegram. Appuie sur « Reprendre maintenant » dans le chat Hermes.");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    }
   }
 
   async function setArchived(session: WorkSession, archived: boolean) {
@@ -416,6 +421,7 @@ export default function WorkSessionsPage() {
           <div className="max-h-[calc(100vh-31rem)] overflow-y-auto p-2 lg:max-h-[calc(100vh-34rem)]">
             {loading && <Spinner className="m-4" />}
             {error && <div className="p-3 text-sm text-destructive">{error}</div>}
+            {notice && <div className="p-3 text-sm text-success">{notice}</div>}
             {!loading && grouped.length === 0 && (
               <div className="p-3 text-sm text-text-secondary">Aucune discussion.</div>
             )}
@@ -465,8 +471,8 @@ export default function WorkSessionsPage() {
                       Ouvrir le chat
                     </Button>
                   )}
-                  {telegram && selected.status !== "archived" && (
-                    <Button onClick={() => resumeInTelegram(selected)} size="sm">
+                  {selected.status !== "archived" && (
+                    <Button onClick={() => void resumeInTelegram(selected)} size="sm">
                       <MessageCircle className="h-4 w-4" />
                       Reprendre dans Telegram
                     </Button>
