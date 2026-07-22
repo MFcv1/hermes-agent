@@ -291,9 +291,10 @@ async def test_windows_detached_restart_scrubs_gateway_marker(monkeypatch, tmp_p
 
 
 @pytest.mark.asyncio
-async def test_shutdown_notification_sent_to_active_sessions():
-    """Active sessions receive a notification when the gateway starts shutting down."""
+async def test_restart_notification_sent_to_active_sessions():
+    """Active sessions receive a notification when the gateway starts restarting."""
     runner, adapter = make_restart_runner()
+    runner._restart_requested = True
     source = make_restart_source(chat_id="999", chat_type="dm")
     session_key = f"agent:main:telegram:dm:999"
     runner._running_agents[session_key] = MagicMock()
@@ -301,7 +302,7 @@ async def test_shutdown_notification_sent_to_active_sessions():
     await runner._notify_active_sessions_of_shutdown()
 
     assert len(adapter.sent) == 1
-    assert "shutting down" in adapter.sent[0]
+    assert "restarting" in adapter.sent[0]
     assert "interrupted" in adapter.sent[0]
 
 
@@ -324,6 +325,7 @@ async def test_shutdown_notification_says_restarting_when_restart_requested():
 async def test_shutdown_notification_deduplicates_per_chat():
     """Multiple sessions in the same chat only get one notification."""
     runner, adapter = make_restart_runner()
+    runner._restart_requested = True
     # Two sessions (different users) in the same chat
     runner._running_agents["agent:main:telegram:group:chat1:u1"] = MagicMock()
     runner._running_agents["agent:main:telegram:group:chat1:u2"] = MagicMock()
@@ -406,6 +408,7 @@ async def test_shutdown_notification_home_channel_suppressed_when_flag_disabled(
 async def test_shutdown_notification_uses_persisted_origin_for_colon_ids():
     """Shutdown notifications should route from persisted origin, not reparsed keys."""
     runner, adapter = make_restart_runner()
+    runner._restart_requested = True
     adapter.send = AsyncMock()
     source = make_restart_source(chat_id="!room123:example.org", chat_type="group")
     source.platform = gateway_run.Platform.MATRIX
