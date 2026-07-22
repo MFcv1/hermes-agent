@@ -72,6 +72,34 @@ class TestTelegramModelPicker:
         assert "`model_1`" in sent["text"]
 
     @pytest.mark.asyncio
+    async def test_send_model_picker_accepts_and_preserves_current_reasoning(self):
+        adapter = _make_adapter()
+        adapter._bot.send_message = AsyncMock(
+            return_value=SimpleNamespace(message_id=102)
+        )
+
+        result = await adapter.send_model_picker(
+            chat_id="12345",
+            providers=[
+                {
+                    "slug": "openai-codex",
+                    "name": "OpenAI Codex",
+                    "total_models": 1,
+                    "is_current": True,
+                }
+            ],
+            current_model="gpt-5.6-terra",
+            current_provider="openai-codex",
+            session_key="s",
+            on_model_selected=AsyncMock(),
+            current_reasoning="medium",
+            metadata=None,
+        )
+
+        assert result.success is True
+        assert adapter._model_picker_state["12345"]["current_reasoning"] == "medium"
+
+    @pytest.mark.asyncio
     async def test_back_button_escapes_dynamic_provider_label(self):
         adapter = _make_adapter()
         adapter._model_picker_state["12345"] = {
